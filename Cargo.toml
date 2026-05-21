@@ -1,0 +1,52 @@
+[workspace]
+members = [
+	"crates/un-motion-core",
+	"crates/un-motion-capturer",
+	"crates/un-motion-profile-schema",
+	"crates/un-motion-interfaces",
+	"crates/un-motion-config",
+	"crates/un-motion-pipeline",
+	"crates/un-motion-mediapipe-native",
+	"crates/un-motion-engine-mediapipe-native",
+	"crates/un-motion-engine-mediapipe-post-process",
+	"crates/un-motion-engine-mediapipe-types",
+	"crates/un-motion-input-file-image",
+	"crates/un-motion-input-file-video",
+	"crates/un-motion-input-ifacialmocap",
+	"crates/un-motion-input-vmc",
+	"crates/un-motion-input-webcam-directshow",
+	"crates/un-motion-input-webcam-nokhwa",
+	"crates/un-motion-output-vmc",
+	"crates/un-motion-output-debug",
+	"crates/un-motion-record",
+	"crates/un-motion-runtime",
+	"crates/un-motion-core-client",
+	"crates/xtask",
+	"apps/un-motion-supervisor/src-tauri",
+]
+# `cargo build` / `cargo run` (引数なし) は Phase D 以降の推奨経路である
+# un-motion-supervisor を対象にする。Capturer は Supervisor が `target/`
+# 配下から自動検出して spawn する (見つからない場合は `cargo run -p
+# un-motion-capturer` に内部 fallback) ため、default-members には含めない。
+# Workspace 全体をビルドしたいときは `cargo build --workspace`、Capturer
+# を事前ビルドして fallback を避けたいときは `cargo build -p un-motion-capturer`。
+default-members = ["apps/un-motion-supervisor/src-tauri"]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+authors = ["usagi / USAGI.NETWORK"]
+license = "MIT"
+repository = "https://github.com/usagi/un-motion"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+thiserror = "2"
+toml = "0.8"
+winresource = "0.1"
+
+[patch.crates-io]
+ccap-rs = { path = "third_party/ccap-rs" }

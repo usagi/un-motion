@@ -1,0 +1,13 @@
+[package]
+name = "un-motion-config"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde = { workspace = true, features = ["derive"] }
+toml = "0.8"
+un-motion-pipeline = { path = "../un-motion-pipeline" }

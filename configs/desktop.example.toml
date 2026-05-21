@@ -1,0 +1,75 @@
+[desktop.runtime_selection]
+device = ""
+engine = "mediapipe-native"
+mediaPipeRunningMode = "live-stream"
+mediaPipeHolisticEnabled = true
+fps = 30
+resolution = "1280x720"
+zenohEnabled = true
+vmcEnabled = true
+vmcTargetAddr = "127.0.0.1:39539"
+vmcChestStabilizationEnabled = false
+vmcChestStabilizationStrength = 0.6
+zenohKeyExpr = "un-motion/frame"
+minimizeToTray = false
+
+[desktop.runtime_selection.modifier]
+headEnabled = true
+faceEnabled = true
+handsEnabled = true
+armsIkEnabled = true
+torsoEnabled = false
+legsEnabled = false
+feetEnabled = false
+cameraDiagonalViewAngleDeg = 70.0
+minLandmarkConfidence = 0.55
+mirrorMode = "normal"
+smoothingPreset = "adaptive"
+
+[desktop.runtime_selection.modifier.postProcessRules]
+headFromPose = true
+headFromFaceMatrix = true
+headReconcile = true
+neutralEyeFallback = true
+handCameraTarget = true
+handOrientation = true
+fingerDerived = true
+armFromPose = true
+armIkFromHands = true
+crossedHandHeuristic = true
+coordinateCorrection = true
+finalClamp = true
+
+[components.input]
+id = "input"
+kind = "webcam-directshow"
+
+[components.input_buffer]
+id = "input-buffer"
+kind = "latest"
+capacity = 1
+overflow = "replace-old"
+
+[components.engine]
+id = "engine"
+kind = "media-pipe-native"
+
+[components.post_process]
+id = "post-process"
+kind = "media-pipe-default"
+
+[components.output_buffer]
+id = "output-buffer"
+kind = "latest"
+capacity = 1
+overflow = "replace-old"
+
+[[components.outputs]]
+id = "vmc"
+kind = "vmc"
+enabled = true
+
+[[components.outputs]]
+id = "zenoh"
+kind = "zenoh"
+enabled = true

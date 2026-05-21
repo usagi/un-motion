@@ -1,0 +1,5 @@
+{"addr":"/VMC/Ext/Bone/Pos","args":[{"type":"string","value":"Head"},{"type":"float","value":-1.0715402E-09},{"type":"float","value":0.050500035},{"type":"float","value":0.00408566},{"type":"float","value":0.00014078617},{"type":"float","value":-9.775162E-06},{"type":"float","value":-4.839897E-05},{"type":"float","value":1.0}]}
+{"addr":"/VMC/Ext/Bone/Pos","args":[{"type":"string","value":"LeftHand"},{"type":"float","value":-0.183164},{"type":"float","value":-5.6266785E-05},{"type":"float","value":0.0047771595},{"type":"float","value":-0.30518007},{"type":"float","value":-0.31255093},{"type":"float","value":0.35481524},{"type":"float","value":0.82660943}]}
+{"addr":"/VMC/Ext/Blend/Val","args":[{"type":"string","value":"EyeBlinkLeft"},{"type":"float","value":0.0}]}
+{"addr":"/VMC/Ext/Blend/Val","args":[{"type":"string","value":"JawOpen"},{"type":"float","value":0.0}]}
+{"addr":"/VMC/Ext/Blend/Apply","args":[]}

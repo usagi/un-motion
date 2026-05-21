@@ -1,0 +1,15 @@
+[package]
+name = "un-motion-input-webcam-nokhwa"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+nokhwa = { version = "0.10", default-features = false, features = [
+ "input-native",
+ "decoding",
+] }
+un-motion-interfaces = { path = "../un-motion-interfaces" }

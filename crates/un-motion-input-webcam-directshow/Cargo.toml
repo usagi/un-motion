@@ -1,0 +1,25 @@
+[package]
+name = "un-motion-input-webcam-directshow"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+un-motion-interfaces = { path = "../un-motion-interfaces" }
+
+[target.'cfg(windows)'.dependencies]
+ccap = { package = "ccap-rs", version = "1.6" }
+windows = { version = "0.62", features = [
+ "Win32_Foundation",
+ "Win32_Graphics_Gdi",
+ "Win32_Media_DirectShow",
+ "Win32_Media_MediaFoundation",
+ "Win32_System_Com",
+ "Win32_System_Com_StructuredStorage",
+ "Win32_System_Ole",
+ "Win32_System_Variant",
+] }

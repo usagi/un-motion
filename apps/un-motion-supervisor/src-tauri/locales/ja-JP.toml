@@ -1,0 +1,261 @@
+_version = 1
+
+# UN Motion Supervisor の日本語 (ja-JP) リソース。
+# rust-i18n v4 が compile-time に読み込み、Tauri command 経由で
+# svelte-i18n にも同じデータを供給する (src/i18n.rs 参照)。
+#
+# プレースホルダーは rust-i18n の `%{name}` syntax で書く。Svelte 側へ
+# bridge する際に regex で `{name}` に変換される。
+#
+# キー命名規約: dot-separated lower_snake_case。
+#   sidebar.capturers / settings.app_behavior.title 等。
+
+[app]
+name = "UN Motion"
+subtitle = "Supervisor Console"
+stop_all = "全て停止"
+version_unknown = "(unknown)"
+
+[sidebar]
+capturers = "Capturers"
+profiles = "Profiles"
+logs = "Logs"
+settings = "Settings"
+
+[theme]
+system = "System"
+light = "Light"
+dark = "Dark"
+
+[language]
+label = "言語"
+system_option = "System"
+
+[settings.theme]
+label = "テーマ"
+
+[settings.app_behavior]
+title = "アプリの動作"
+enable_system_tray = "システムトレイを有効化"
+minimize_to_tray = "最小化時にトレイへ隠す"
+close_to_tray_while_running = "Capturer 動作中は閉じるボタンでトレイへ隠す"
+start_minimized_to_tray = "トレイへ最小化した状態で起動"
+stop_capturers_on_exit = "Supervisor Console 終了時に全 Capturer を停止"
+quick_launch_jump = "Quick Launch 後に Capturers タブへ自動遷移"
+api_worker_threads = "Capturer API worker threads"
+
+[settings.external_tools]
+title = "外部ツール"
+note = "FFmpeg は配布物に同梱しません。動画ファイル入力を使う場合は、ユーザー環境の ffmpeg 実行ファイルを指定してください。"
+ffmpeg_path = "ffmpeg 実行ファイル"
+
+[settings.calibration]
+title = "Calibration"
+start_delay = "Start delay"
+samples = "Samples"
+sound_volume = "Sound volume"
+countdown_sound = "Countdown sound"
+start_sound = "Start sound"
+
+[settings.hints]
+default = "設定項目にカーソルを合わせると、この領域に短いヒントを表示します。通常は既定値のまま使い、必要になった項目だけ調整してください。"
+app_behavior = "アプリの動作: Supervisor Console全体の表示、トレイ、終了時の挙動を設定します。"
+theme = "テーマ: SystemはOS設定に従います。配信作業中に見やすいLight/Darkへ固定することもできます。"
+system_tray = "システムトレイ: ウィンドウを閉じても常駐操作できるようにします。"
+minimize_to_tray = "最小化時にトレイへ隠す: 作業中にSupervisor Consoleを画面から退避しやすくします。"
+close_to_tray_while_running = "閉じるボタンでトレイへ隠す: Capturer動作中に誤って全体を閉じる事故を避けます。"
+start_minimized_to_tray = "最小化して起動: 常駐運用で、起動直後に画面を占有しないようにします。"
+stop_children_on_exit = "終了時に全Capturerを停止: Supervisor Consoleを閉じたとき、子プロセスを残さず止めます。"
+quick_launch_jump = "Quick Launch後にCapturersへ移動: Profilesから起動したあと、実行状態をすぐ確認できます。"
+api_worker_threads = "Capturer API worker threads: CapturerプロセスごとのHTTP APIワーカー数です。通常は2で十分です。"
+calibration = "Calibration: キャリブレーション開始までの待ち時間、採用サンプル数、通知音を調整します。"
+calibration_start_delay = "Start delay: ボタン操作後、姿勢を整えるための待ち時間です。"
+calibration_samples = "Samples: キャリブレーション姿勢から平均化するフレーム数です。多いほど安定しますが待ち時間が増えます。"
+calibration_sound_volume = "Sound volume: キャリブレーション通知音の音量です。0で無音、1で最大です。"
+calibration_countdown_sound = "Countdown sound: 開始前カウントダウンに使う音声ファイルです。空欄なら既定音を使います。"
+calibration_start_sound = "Start sound: サンプル採取開始時に鳴らす音声ファイルです。空欄なら既定音を使います。"
+external_tools = "外部ツール: 動画ファイル入力など、Supervisor Consoleが外部実行ファイルを必要とする機能の場所を指定します。"
+ffmpeg_path = "ffmpeg実行ファイル: 動画ファイル入力を使う場合に指定します。未指定なら動画入力は利用できません。"
+language = "言語: Supervisor Consoleの表示言語を切り替えます。"
+console_window = "Supervisor Consoleウィンドウ: 次回起動時の位置とサイズを調整します。空欄ならOS既定位置で開きます。"
+console_window_x = "X (outer): ウィンドウ外枠の左位置です。空欄ならOS既定です。"
+console_window_y = "Y (outer): ウィンドウ外枠の上位置です。空欄ならOS既定です。"
+console_window_width = "Width (inner): ウィンドウ内側の幅です。範囲外なら既定値へ戻ります。"
+console_window_height = "Height (inner): ウィンドウ内側の高さです。範囲外なら既定値へ戻ります。"
+about = "このアプリについて: アプリ名、バージョン、リポジトリ、ライセンスを表示します。"
+
+[settings.console_window]
+title = "Supervisor Console ウィンドウ"
+note = "前回終了時のウィンドウ位置とサイズ (DPI スケーリング前の論理 px)。空欄なら起動時に OS 既定位置で開きます。移動/リサイズすると自動的に値が更新され、終了時に保存されます。Width / Height は 820〜3840 / 620〜2160 の範囲、範囲外は既定値 (1190x620) にフォールバックします。"
+x_outer = "X (outer)"
+y_outer = "Y (outer)"
+width_inner = "Width (inner)"
+height_inner = "Height (inner)"
+placeholder_default = "(default)"
+
+[settings.language]
+title = "言語"
+note = "UI 表示言語を切り替えます。\"System\" を選択すると次回起動時に OS の言語設定から自動解決します (サポート外の言語の場合は日本語にフォールバック)。即時反映され、トレイメニューなどのネイティブ要素にも適用されます。"
+
+[settings.about]
+title = "このアプリについて"
+app = "App"
+app_value = "UN Motion Supervisor"
+version = "Version"
+repository = "Repository"
+license = "License"
+license_value = "MIT"
+repository_url = "https://github.com/usagi/un-motion"
+repository_label = "github.com/usagi/un-motion"
+
+[profiles]
+empty_workspace = "ワークスペース内にプロファイルがありません。"
+active_badge = "ACTIVE"
+field_name = "Name"
+field_note = "Note"
+
+[profiles.hints]
+default = "設定項目にカーソルを合わせると、この領域に短いヒントを表示します。迷った場合は既定値のまま使い、動作を見ながら必要な項目だけ調整してください。"
+
+[profiles.actions]
+new = "新規"
+quick_launch = "Quick Launch"
+quick_launch_hint = "選択中のプロファイルで Capturer を起動"
+duplicate = "複製"
+delete = "削除"
+delete_hold_hint = "長押しで削除"
+open_folder = "フォルダーを開く"
+active_label = "Active:"
+active_unset = "-"
+
+[profiles.editor]
+profile_setting_heading = "Profile Setting"
+select_or_create = "プロファイルを選択するか、上部のツールバーから新規作成してください。"
+change_icon = "アイコンを変更"
+browse = "参照"
+name = "名前"
+group = "グループ"
+icon = "アイコン"
+note = "メモ"
+default_icon = "既定の UN Motion アイコン"
+engine = "エンジン"
+runtime = "実行中"
+engine_type = "Engine Type"
+output_fps = "出力 FPS（未指定なら入力追従）"
+mediapipe_running_mode = "MediaPipe 実行モード"
+mediapipe_holistic = "MediaPipe Holistic（Body + Hands + Face）"
+mediapipe_delegate = "MediaPipe delegate"
+mediapipe_num_threads = "Delegate threads"
+mediapipe_flow_limiter = "Holistic FlowLimiter"
+mediapipe_flow_max_in_flight = "Max in flight"
+mediapipe_flow_max_in_queue = "Max queue"
+source = "入力ソース"
+source_type = "Source Type"
+camera_device = "カメラデバイス"
+camera_setting = "Camera setting"
+file_path = "ファイルパス"
+input_fps = "入力 FPS"
+input_fps_auto = "入力 FPS（自動）"
+loop_video = "動画をループ"
+vmc_listen = "VMC/UDP 受信アドレス"
+ifacialmocap_listen = "iFacialMocap/UDP 受信アドレス"
+modifier = "補正"
+pre_output = "出力前"
+filter_heading = "Filter"
+smoothing = "スムージング"
+mirror_mode = "ミラーモード"
+output = "出力"
+zenoh_heading = "UNMF/Z"
+zenoh_enable = "UNMF/Z publisher を有効化"
+key_expression = "UNMF/Z key expression"
+topic_mode = "Topic mode"
+stream_id = "Stream id（上書き）"
+producer_label = "Producer label"
+vmc_heading = "VMC/UDP"
+vmc_enable = "VMC/UDP sender を有効化"
+target_address = "送信先アドレス"
+
+[tray]
+open = "UN Motion を開く"
+stop_all = "全 Capturer を停止"
+quit = "終了"
+
+[capturers.toolbar]
+launch = "起動"
+no_profiles = "プロファイルがありません"
+pick_profile = "プロファイルを選択"
+stop = "停止"
+restart = "再起動"
+refresh = "更新"
+
+[capturers.empty]
+no_running = "起動中の Capturer プロセスはありません。"
+
+[capturers.columns]
+state = "状態"
+pid = "PID"
+profile = "プロファイル"
+source_fps = "Source"
+engine_fps = "Engine"
+performance = "Performance"
+output = "Output"
+unmf_fps = "UNMF/Z"
+vmc_pps = "VMC"
+actions = "操作"
+
+[capturers.columns.tooltip]
+source_fps = "Source ステージ: カメラや入力ソースから観測した fps"
+engine_fps = "Engine ステージ: 推論後に UNMotionFrame として出た処理 fps"
+unmf_fps = "UNMF/Z 出力: 1 秒あたりの送信フレーム数"
+vmc_pps = "VMC/UDP 出力: 1 秒あたりのパケット数 (1 パケット ≒ 1 OSC メッセージ)"
+
+[capturers.details]
+title = "選択中の Capturer"
+none_selected = "Capturer を起動するか一覧から選ぶと、プロセス詳細がここに表示されます。"
+state = "状態"
+pid = "PID"
+bind = "Bind"
+profile = "Profile"
+uptime = "Uptime"
+healthy = "Healthy"
+note = "Note"
+exit = "Exit"
+yes = "yes"
+no = "no"
+none = "-"
+
+[logs]
+title = "LOGS"
+
+[logs.toolbar]
+per_capturer = "Per capturer"
+unified = "Unified"
+capturer_label = "Capturer"
+all_capturers = "All capturers"
+filter = "Filter"
+filter_placeholder = "部分一致 (例: zenoh, vmc, error)"
+autoscroll = "Autoscroll"
+copy_all = "全コピー"
+copied = "コピー済み"
+copy_title = "全表示行を (Capturer をまたいで) クリップボードへコピー"
+save_txt = "Save .txt"
+save_title = "全表示行をテキストファイルへ保存。バグ報告にはこのファイルを添付してください"
+open_folder = "フォルダーを開く"
+open_folder_title = "保存したログファイルのフォルダーを開きます"
+reset_filters = "フィルター解除"
+reset_title = "フィルター選択を解除します (Capturer 毎の stderr リングバッファ自体は消えません)"
+
+[logs.body]
+empty_no_capturers = "Capturer がまだ起動していません。Capturers タブから 1 つ起動すると stderr ストリームがここに流れ始めます。"
+summary = "%{capturers} capturers · %{shown}/%{total} lines 表示"
+summary_filtered = "(filtered)"
+hint_buffer = "1 Capturer につき最大 800 行を保持。詳細トレースを取りたい場合は launch 前に %{env_var} を設定してください。"
+no_lines_filter = "(現在のフィルターに一致する行はありません)"
+no_stderr_yet = "(stderr はまだありません)"
+card_count = "%{shown}/%{total} lines"
+card_copy = "コピー"
+card_copy_title = "この Capturer の stderr バッファをクリップボードへコピー"
+
+[errors]
+label = "エラー"
+generic = "エラー: %{message}"

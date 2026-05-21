@@ -1,0 +1,12 @@
+[package]
+name = "un-motion-input-file-image"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+image = { version = "0.25", default-features = false, features = ["avif", "jpeg", "png", "webp"] }
+un-motion-interfaces = { path = "../un-motion-interfaces" }

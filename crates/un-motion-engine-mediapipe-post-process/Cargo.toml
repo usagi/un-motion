@@ -1,0 +1,14 @@
+[package]
+name = "un-motion-engine-mediapipe-post-process"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+un-motion-frame = "1.1.0"
+un-motion-engine-mediapipe-types = { path = "../un-motion-engine-mediapipe-types" }
+un-motion-interfaces = { path = "../un-motion-interfaces" }
+un-motion-mediapipe-native = { path = "../un-motion-mediapipe-native" }

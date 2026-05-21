@@ -1,0 +1,256 @@
+_version = 1
+
+# UN Motion Supervisor English (en-US) resources.
+# See ja-JP.toml for layout and conventions; this file mirrors keys 1:1
+# so missing keys fall back to the ja-JP default per rust-i18n's
+# `fallback = "ja-JP"` configuration.
+
+[app]
+name = "UN Motion"
+subtitle = "Supervisor Console"
+stop_all = "Stop All"
+version_unknown = "(unknown)"
+
+[sidebar]
+capturers = "Capturers"
+profiles = "Profiles"
+logs = "Logs"
+settings = "Settings"
+
+[theme]
+system = "System"
+light = "Light"
+dark = "Dark"
+
+[language]
+label = "Language"
+system_option = "System"
+
+[settings.theme]
+label = "Theme"
+
+[settings.app_behavior]
+title = "App Behavior"
+enable_system_tray = "Enable system tray"
+minimize_to_tray = "Minimize to system tray"
+close_to_tray_while_running = "Close button hides to tray while capturers are running"
+start_minimized_to_tray = "Start minimized to tray"
+stop_capturers_on_exit = "Stop all capturers on Supervisor Console exit"
+quick_launch_jump = "Switch to Capturers tab after Quick Launch"
+api_worker_threads = "Capturer API worker threads"
+
+[settings.external_tools]
+title = "External Tools"
+note = "FFmpeg is not bundled. Set the ffmpeg executable from the user's environment when video-file input is needed."
+ffmpeg_path = "ffmpeg executable"
+
+[settings.calibration]
+title = "Calibration"
+start_delay = "Start delay"
+samples = "Samples"
+sound_volume = "Sound volume"
+countdown_sound = "Countdown sound"
+start_sound = "Start sound"
+
+[settings.hints]
+default = "Hover a setting to show a short hint here. Keep defaults unless you need a specific adjustment."
+app_behavior = "App Behavior: controls Supervisor Console display, tray behavior, and shutdown behavior."
+theme = "Theme: System follows the OS setting. Choose Light or Dark when that is easier during streaming work."
+system_tray = "System tray: keeps the app available from the tray even when the window is closed."
+minimize_to_tray = "Minimize to tray: keeps the Supervisor Console out of the way while working."
+close_to_tray_while_running = "Close to tray while running: avoids accidentally closing active capturers."
+start_minimized_to_tray = "Start minimized: useful for always-on tray workflows."
+stop_children_on_exit = "Stop all capturers on exit: prevents child processes from being left behind."
+quick_launch_jump = "Jump after Quick Launch: opens Capturers so you can check the newly launched process."
+api_worker_threads = "Capturer API worker threads: HTTP API worker count per Capturer process. The default of 2 is usually enough."
+calibration = "Calibration: controls countdown delay, sample count, and calibration sounds."
+calibration_start_delay = "Start delay: time to prepare the pose after pressing the calibration button."
+calibration_samples = "Samples: number of frames averaged for the calibration pose. More samples are steadier but slower."
+calibration_sound_volume = "Sound volume: calibration sound volume. 0 is silent, 1 is maximum."
+calibration_countdown_sound = "Countdown sound: audio played before sampling starts. Leave blank to use the default."
+calibration_start_sound = "Start sound: audio played when sampling starts. Leave blank to use the default."
+external_tools = "External Tools: paths to external executables used by optional Supervisor Console features."
+ffmpeg_path = "ffmpeg executable: required for video-file input. Leave blank if unused."
+language = "Language: changes the Supervisor Console display language."
+console_window = "Supervisor Console Window: adjusts the next startup position and size. Blank values use OS defaults."
+console_window_x = "X (outer): left position of the window frame. Blank uses the OS default."
+console_window_y = "Y (outer): top position of the window frame. Blank uses the OS default."
+console_window_width = "Width (inner): inner window width. Out-of-range values fall back to defaults."
+console_window_height = "Height (inner): inner window height. Out-of-range values fall back to defaults."
+about = "About: app name, version, repository, and license."
+
+[settings.console_window]
+title = "Supervisor Console Window"
+note = "Window position and size at last shutdown (logical px before DPI scaling). Leave blank to use OS defaults on next launch. Values update automatically as you move or resize the window and are saved on exit. Width / Height must be 820-3840 / 620-2160 logical px; out-of-range values fall back to defaults (1190x620)."
+x_outer = "X (outer)"
+y_outer = "Y (outer)"
+width_inner = "Width (inner)"
+height_inner = "Height (inner)"
+placeholder_default = "(default)"
+
+[settings.language]
+title = "Language"
+note = "Switch the UI language. \"System\" follows the OS language at next startup (falling back to Japanese for unsupported locales). Changes apply immediately and also affect native elements such as tray menus."
+
+[settings.about]
+title = "About"
+app = "App"
+app_value = "UN Motion Supervisor"
+version = "Version"
+repository = "Repository"
+license = "License"
+license_value = "MIT"
+repository_url = "https://github.com/usagi/un-motion"
+repository_label = "github.com/usagi/un-motion"
+
+[profiles]
+empty_workspace = "No profiles found in workspace."
+active_badge = "ACTIVE"
+field_name = "Name"
+field_note = "Note"
+
+[profiles.hints]
+default = "Hover a setting to show a short hint here. Keep defaults first, then adjust only what you need after checking behavior."
+
+[profiles.actions]
+new = "New"
+quick_launch = "Quick Launch"
+quick_launch_hint = "Launch a Capturer running the selected profile"
+duplicate = "Duplicate"
+delete = "Delete"
+delete_hold_hint = "Hold to delete"
+open_folder = "Open Folder"
+active_label = "Active:"
+active_unset = "-"
+
+[profiles.editor]
+profile_setting_heading = "Profile Setting"
+select_or_create = "Select a profile or create a new one with the toolbar above."
+change_icon = "Change icon"
+browse = "Browse"
+name = "Name"
+group = "Group"
+icon = "Icon"
+note = "Note"
+default_icon = "Default UN Motion icon"
+engine = "Engine"
+runtime = "Runtime"
+engine_type = "Engine Type"
+output_fps = "Output FPS (follow input if unset)"
+mediapipe_running_mode = "MediaPipe running mode"
+mediapipe_holistic = "MediaPipe Holistic (Body + Hands + Face)"
+mediapipe_delegate = "MediaPipe delegate"
+mediapipe_num_threads = "Delegate threads"
+mediapipe_flow_limiter = "Holistic FlowLimiter"
+mediapipe_flow_max_in_flight = "Max in flight"
+mediapipe_flow_max_in_queue = "Max queue"
+source = "Source"
+source_type = "Source Type"
+camera_device = "Camera device"
+camera_setting = "Camera setting"
+file_path = "File path"
+input_fps = "Input FPS"
+input_fps_auto = "Input FPS (auto)"
+loop_video = "Loop video"
+vmc_listen = "VMC/UDP listen address"
+ifacialmocap_listen = "iFacialMocap/UDP listen address"
+modifier = "Modifier"
+pre_output = "Pre-output"
+filter_heading = "Filter"
+smoothing = "Smoothing"
+mirror_mode = "Mirror mode"
+output = "Output"
+zenoh_heading = "UNMF/Z"
+zenoh_enable = "Enable UNMF/Z publisher"
+key_expression = "UNMF/Z key expression"
+topic_mode = "Topic mode"
+stream_id = "Stream id (override)"
+producer_label = "Producer label"
+vmc_heading = "VMC/UDP"
+vmc_enable = "Enable VMC/UDP sender"
+target_address = "Target address"
+
+[tray]
+open = "Open UN Motion"
+stop_all = "Stop All Capturers"
+quit = "Quit"
+
+[capturers.toolbar]
+launch = "Launch"
+no_profiles = "No profiles found"
+pick_profile = "Select a profile"
+stop = "Stop"
+restart = "Restart"
+refresh = "Refresh"
+
+[capturers.empty]
+no_running = "No capturer processes are running."
+
+[capturers.columns]
+state = "State"
+pid = "PID"
+profile = "Profile"
+source_fps = "Source"
+engine_fps = "Engine"
+performance = "Performance"
+output = "Output"
+unmf_fps = "UNMF/Z"
+vmc_pps = "VMC"
+actions = "Actions"
+
+[capturers.columns.tooltip]
+source_fps = "Source stage: frames per second observed from the camera or input source"
+engine_fps = "Engine stage: processed frames per second emitted as UNMotionFrame after inference"
+unmf_fps = "UNMF/Z output: published frames per second"
+vmc_pps = "VMC/UDP output: packets per second (1 packet \u2248 1 OSC message)"
+
+[capturers.details]
+title = "Selected capturer"
+none_selected = "Launch a capturer or select one in the list to see process details here."
+state = "State"
+pid = "PID"
+bind = "Bind"
+profile = "Profile"
+uptime = "Uptime"
+healthy = "Healthy"
+note = "Note"
+exit = "Exit"
+yes = "yes"
+no = "no"
+none = "-"
+
+[logs]
+title = "LOGS"
+
+[logs.toolbar]
+per_capturer = "Per capturer"
+unified = "Unified"
+capturer_label = "Capturer"
+all_capturers = "All capturers"
+filter = "Filter"
+filter_placeholder = "substring match (e.g. zenoh, vmc, error)"
+autoscroll = "Autoscroll"
+copy_all = "Copy all"
+copied = "Copied"
+copy_title = "Copy all visible lines (across capturers) to clipboard"
+save_txt = "Save .txt"
+save_title = "Save all visible lines to a text file. Attach this file when filing a bug report."
+open_folder = "Open folder"
+open_folder_title = "Open the folder where saved log files are stored"
+reset_filters = "Reset filters"
+reset_title = "Clear filter selection (the per-capturer stderr ring buffers themselves are not cleared)"
+
+[logs.body]
+empty_no_capturers = "No capturers are running. Launch one from the Capturers tab to start seeing stderr stream here."
+summary = "%{capturers} capturers \u00b7 showing %{shown}/%{total} lines"
+summary_filtered = "(filtered)"
+hint_buffer = "Up to 800 lines retained per capturer. For verbose tracing set %{env_var} before launch."
+no_lines_filter = "(no lines match the current filter)"
+no_stderr_yet = "(no stderr yet)"
+card_count = "%{shown}/%{total} lines"
+card_copy = "Copy"
+card_copy_title = "Copy this capturer's stderr buffer to clipboard"
+
+[errors]
+label = "Error"
+generic = "Error: %{message}"

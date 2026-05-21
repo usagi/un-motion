@@ -1,0 +1,756 @@
+//! Camera provider for synchronous camera capture operations
+
+use crate::{error::*, frame::*, sys, types::*};
+use std::ffi::{CStr, CString};
+use std::ptr;
+use std::sync::Mutex;
+
+/// A wrapper around a raw pointer that can be safely shared between threads.
+/// This is used for storing callback pointers that we know are safe to share
+/// because the callback itself is `Send + Sync`.
+struct SendSyncPtr(*mut std::ffi::c_void);
+
+// SAFETY: The pointer stored here always points to a `Box<ErrorCallbackBox>`
+// where `ErrorCallbackBox = Box<dyn Fn(i32, &str) + Send + Sync>`.
+// The underlying callback is `Send + Sync`, so the pointer is safe to share.
+unsafe impl Send for SendSyncPtr {}
+unsafe impl Sync for SendSyncPtr {}
+
+// Global error callback storage - must be at module level to be shared between functions
+static GLOBAL_ERROR_CALLBACK: Mutex<Option<SendSyncPtr>> = Mutex::new(None);
+
+fn optional_c_string(value: Option<&str>, parameter_name: &str) -> Result<Option<CString>> {
+    value
+        .map(|text| {
+            CString::new(text).map_err(|_| {
+                CcapError::InvalidParameter(format!("{} contains null byte", parameter_name))
+            })
+        })
+        .transpose()
+}
+
+/// Type alias for the global error callback
+///
+/// # Thread Safety
+///
+/// `Provider` implements `Send` to allow moving the provider between threads.
+/// However, the underlying C++ implementation is **NOT thread-safe**.
+///
+/// **Important**: You must ensure that:
+/// - Only one thread accesses the `Provider` at a time
+/// - Use `Arc<Mutex<Provider>>` or similar synchronization if sharing between threads
+/// - If you need to integrate with an async runtime, wrap the `Provider` yourself (e.g. with a mutex and a dedicated worker thread)
+///
+/// # Example (Safe Multi-threaded Usage)
+///
+/// ```ignore
+/// use std::sync::{Arc, Mutex};
+/// use ccap::Provider;
+///
+/// let provider = Arc::new(Mutex::new(Provider::new()?));
+/// let provider_clone = Arc::clone(&provider);
+///
+/// std::thread::spawn(move || {
+///     let mut guard = provider_clone.lock().unwrap();
+///     // Safe: mutex ensures exclusive access
+///     guard.grab_frame(1000).ok();
+/// });
+/// ```
+pub struct Provider {
+    handle: *mut sys::CcapProvider,
+    is_opened: bool,
+    callback_ptr: Option<*mut std::ffi::c_void>,
+}
+
+// SAFETY: Provider is Send because:
+// 1. The handle is a raw pointer to C++ Provider, which can be safely moved between threads
+// 2. The callback_ptr ownership is properly tracked and cleaned up
+// 3. We document that users MUST synchronize access externally
+//
+// WARNING: The underlying C++ Provider is NOT thread-safe. Moving the Provider
+// to another thread is safe, but concurrent access from multiple threads is NOT.
+// Users must use external synchronization (e.g., Mutex) for multi-threaded access.
+unsafe impl Send for Provider {}
+
+impl Provider {
+    /// Create a new camera provider
+    pub fn new() -> Result<Self> {
+        let handle = unsafe { sys::ccap_provider_create() };
+        if handle.is_null() {
+            return Err(CcapError::DeviceOpenFailed);
+        }
+
+        Ok(Provider {
+            handle,
+            is_opened: false,
+            callback_ptr: None,
+        })
+    }
+
+    /// Create a provider with a specific device index
+    pub fn with_device(device_index: i32) -> Result<Self> {
+        Self::with_device_and_extra_info(device_index, None)
+    }
+
+    /// Create a provider with a specific device index and optional extra info.
+    ///
+    /// On Windows, `extra_info` can be used to force backend selection with values like
+    /// `"auto"`, `"msmf"`, `"dshow"`, or `"backend=<value>"`.
+    pub fn with_device_and_extra_info(device_index: i32, extra_info: Option<&str>) -> Result<Self> {
+        let extra_info = optional_c_string(extra_info, "extra info")?;
+        let handle = unsafe {
+            sys::ccap_provider_create_with_index(
+                device_index,
+                extra_info
+                    .as_ref()
+                    .map_or(ptr::null(), |value| value.as_ptr()),
+            )
+        };
+        if handle.is_null() {
+            return Err(CcapError::InvalidDevice(format!(
+                "device index {}",
+                device_index
+            )));
+        }
+
+        Ok(Provider {
+            handle,
+            // ccap C API contract: create_with_index opens the device.
+            // See `include/ccap_c.h`: "Create a camera provider and open device by index".
+            is_opened: true,
+            callback_ptr: None,
+        })
+    }
+
+    /// Create a provider with a specific device name
+    pub fn with_device_name<S: AsRef<str>>(device_name: S) -> Result<Self> {
+        Self::with_device_name_and_extra_info(device_name, None)
+    }
+
+    /// Create a provider with a specific device name and optional extra info.
+    ///
+    /// On Windows, `extra_info` can be used to force backend selection with values like
+    /// `"auto"`, `"msmf"`, `"dshow"`, or `"backend=<value>"`.
+    pub fn with_device_name_and_extra_info<S: AsRef<str>>(
+        device_name: S,
+        extra_info: Option<&str>,
+    ) -> Result<Self> {
+        let c_name = CString::new(device_name.as_ref()).map_err(|_| {
+            CcapError::InvalidParameter("device name contains null byte".to_string())
+        })?;
+        let extra_info = optional_c_string(extra_info, "extra info")?;
+
+        let handle = unsafe {
+            sys::ccap_provider_create_with_device(
+                c_name.as_ptr(),
+                extra_info
+                    .as_ref()
+                    .map_or(ptr::null(), |value| value.as_ptr()),
+            )
+        };
+        if handle.is_null() {
+            return Err(CcapError::InvalidDevice(device_name.as_ref().to_string()));
+        }
+
+        Ok(Provider {
+            handle,
+            // ccap C API contract: create_with_device opens the device.
+            // See `include/ccap_c.h`: "Create a camera provider and open specified device".
+            is_opened: true,
+            callback_ptr: None,
+        })
+    }
+
+    /// Get available camera devices
+    pub fn get_devices() -> Result<Vec<DeviceInfo>> {
+        // Create a temporary provider to query devices
+        let provider = Self::new()?;
+        let mut device_names_list = sys::CcapDeviceNamesList::default();
+
+        let success = unsafe {
+            sys::ccap_provider_find_device_names_list(provider.handle, &mut device_names_list)
+        };
+
+        if !success {
+            return Ok(Vec::new());
+        }
+
+        let mut devices = Vec::new();
+        for i in 0..device_names_list.deviceCount {
+            let name_bytes = &device_names_list.deviceNames[i];
+            let name = unsafe {
+                let cstr = CStr::from_ptr(name_bytes.as_ptr());
+                cstr.to_string_lossy().to_string()
+            };
+
+            // Try to get device info by creating provider with this device
+            if let Ok(device_provider) = Self::with_device_name(&name) {
+                if let Ok(device_info) = device_provider.get_device_info_direct() {
+                    devices.push(device_info);
+                } else {
+                    // Fallback: create minimal device info from just the name
+                    devices.push(DeviceInfo {
+                        name,
+                        supported_pixel_formats: Vec::new(),
+                        supported_resolutions: Vec::new(),
+                    });
+                }
+            }
+        }
+
+        Ok(devices)
+    }
+
+    /// Get device info directly from current provider
+    fn get_device_info_direct(&self) -> Result<DeviceInfo> {
+        let mut device_info = sys::CcapDeviceInfo::default();
+
+        let success = unsafe { sys::ccap_provider_get_device_info(self.handle, &mut device_info) };
+
+        if !success {
+            return Err(CcapError::DeviceOpenFailed);
+        }
+
+        let name = unsafe {
+            let cstr = CStr::from_ptr(device_info.deviceName.as_ptr());
+            cstr.to_string_lossy().to_string()
+        };
+
+        let mut formats = Vec::new();
+        for i in 0..device_info.pixelFormatCount {
+            if i < device_info.supportedPixelFormats.len() {
+                formats.push(PixelFormat::from(device_info.supportedPixelFormats[i]));
+            }
+        }
+
+        let mut resolutions = Vec::new();
+        for i in 0..device_info.resolutionCount {
+            if i < device_info.supportedResolutions.len() {
+                let res = &device_info.supportedResolutions[i];
+                resolutions.push(Resolution {
+                    width: res.width,
+                    height: res.height,
+                });
+            }
+        }
+
+        Ok(DeviceInfo {
+            name,
+            supported_pixel_formats: formats,
+            supported_resolutions: resolutions,
+        })
+    }
+
+    /// Open the camera device
+    pub fn open(&mut self) -> Result<()> {
+        if self.is_opened {
+            return Ok(());
+        }
+
+        let result = unsafe { sys::ccap_provider_open_by_index(self.handle, -1, false) };
+        if !result {
+            return Err(CcapError::DeviceOpenFailed);
+        }
+
+        self.is_opened = true;
+        Ok(())
+    }
+
+    /// Open device with optional device name and auto start
+    pub fn open_device(&mut self, device_name: Option<&str>, auto_start: bool) -> Result<()> {
+        self.open_device_with_extra_info(device_name, None, auto_start)
+    }
+
+    /// Open a device with optional device name, optional extra info, and optional auto start.
+    ///
+    /// On Windows, `extra_info` can be used to force backend selection with values like
+    /// `"auto"`, `"msmf"`, `"dshow"`, or `"backend=<value>"`.
+    pub fn open_device_with_extra_info(
+        &mut self,
+        device_name: Option<&str>,
+        extra_info: Option<&str>,
+        auto_start: bool,
+    ) -> Result<()> {
+        if let Some(name) = device_name {
+            let c_name = CString::new(name).map_err(|_| {
+                CcapError::InvalidParameter("device name contains null byte".to_string())
+            })?;
+            let extra_info = optional_c_string(extra_info, "extra info")?;
+
+            // Recreate provider with specific device
+            if !self.handle.is_null() {
+                // If the previous provider was running, stop it and detach callbacks
+                // before destroying the underlying handle.
+                let _ = self.stop_capture();
+                let _ = self.remove_new_frame_callback();
+                self.cleanup_callback();
+                unsafe {
+                    sys::ccap_provider_destroy(self.handle);
+                }
+                self.handle = ptr::null_mut();
+                self.is_opened = false;
+            } else {
+                self.cleanup_callback();
+            }
+
+            self.handle = unsafe {
+                sys::ccap_provider_create_with_device(
+                    c_name.as_ptr(),
+                    extra_info
+                        .as_ref()
+                        .map_or(ptr::null(), |value| value.as_ptr()),
+                )
+            };
+            if self.handle.is_null() {
+                return Err(CcapError::InvalidDevice(name.to_string()));
+            }
+            self.is_opened = true;
+            if !auto_start {
+                self.stop_capture()?;
+            }
+        } else if extra_info.is_some() {
+            return self.open_with_index_and_extra_info(-1, extra_info, auto_start);
+        } else {
+            self.open()?;
+        }
+        if auto_start {
+            self.start_capture()?;
+        }
+        Ok(())
+    }
+
+    /// Get device info for the current provider
+    pub fn device_info(&self) -> Result<DeviceInfo> {
+        self.get_device_info_direct()
+    }
+
+    /// Check if capture is started
+    pub fn is_started(&self) -> bool {
+        unsafe { sys::ccap_provider_is_started(self.handle) }
+    }
+
+    /// Start capture (alias for start_capture)
+    pub fn start(&mut self) -> Result<()> {
+        self.start_capture()
+    }
+
+    /// Stop capture (alias for stop_capture)  
+    pub fn stop(&mut self) -> Result<()> {
+        self.stop_capture()
+    }
+
+    /// Check if the camera is opened
+    pub fn is_opened(&self) -> bool {
+        self.is_opened
+    }
+
+    /// Set camera property
+    pub fn set_property(&mut self, property: PropertyName, value: f64) -> Result<()> {
+        let property_id: sys::CcapPropertyName = property.into();
+        let success = unsafe { sys::ccap_provider_set_property(self.handle, property_id, value) };
+
+        if !success {
+            return Err(CcapError::InvalidParameter(format!(
+                "property {:?}",
+                property
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Get camera property
+    pub fn get_property(&self, property: PropertyName) -> Result<f64> {
+        let property_id: sys::CcapPropertyName = property.into();
+        let value = unsafe { sys::ccap_provider_get_property(self.handle, property_id) };
+
+        Ok(value)
+    }
+
+    /// Set camera resolution
+    pub fn set_resolution(&mut self, width: u32, height: u32) -> Result<()> {
+        // Avoid leaving the device in a partially-updated state if only one property update
+        // succeeds (e.g. width succeeds but height fails).
+        let (old_w, old_h) = self.resolution()?;
+
+        self.set_property(PropertyName::Width, width as f64)?;
+        if let Err(e) = self.set_property(PropertyName::Height, height as f64) {
+            // Best-effort rollback.
+            let _ = self.set_property(PropertyName::Width, old_w as f64);
+            let _ = self.set_property(PropertyName::Height, old_h as f64);
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    /// Set camera frame rate
+    pub fn set_frame_rate(&mut self, fps: f64) -> Result<()> {
+        self.set_property(PropertyName::FrameRate, fps)
+    }
+
+    /// Set pixel format
+    pub fn set_pixel_format(&mut self, format: PixelFormat) -> Result<()> {
+        self.set_property(PropertyName::PixelFormatOutput, format.to_c_enum() as f64)
+    }
+
+    /// Grab a single frame with timeout
+    pub fn grab_frame(&mut self, timeout_ms: u32) -> Result<Option<VideoFrame>> {
+        if !self.is_opened {
+            return Err(CcapError::DeviceNotOpened);
+        }
+
+        let frame = unsafe { sys::ccap_provider_grab(self.handle, timeout_ms) };
+        if frame.is_null() {
+            return Ok(None);
+        }
+
+        Ok(Some(VideoFrame::from_c_ptr(frame)))
+    }
+
+    /// Start continuous capture
+    pub fn start_capture(&mut self) -> Result<()> {
+        if !self.is_opened {
+            return Err(CcapError::DeviceNotOpened);
+        }
+
+        let result = unsafe { sys::ccap_provider_start(self.handle) };
+        if !result {
+            return Err(CcapError::CaptureStartFailed);
+        }
+
+        Ok(())
+    }
+
+    /// Stop continuous capture
+    pub fn stop_capture(&mut self) -> Result<()> {
+        unsafe { sys::ccap_provider_stop(self.handle) };
+        Ok(())
+    }
+
+    /// Get library version
+    pub fn version() -> Result<String> {
+        let version_ptr = unsafe { sys::ccap_get_version() };
+        if version_ptr.is_null() {
+            return Err(CcapError::Unknown { code: -1 });
+        }
+
+        let version_cstr = unsafe { CStr::from_ptr(version_ptr) };
+        version_cstr
+            .to_str()
+            .map(|s| s.to_string())
+            .map_err(|_| CcapError::Unknown { code: -2 })
+    }
+
+    /// List device names (simple string list)
+    pub fn list_devices(&self) -> Result<Vec<String>> {
+        let device_infos = Self::get_devices()?;
+        Ok(device_infos.into_iter().map(|info| info.name).collect())
+    }
+
+    /// Find device names (alias for list_devices)
+    pub fn find_device_names(&self) -> Result<Vec<String>> {
+        self.list_devices()
+    }
+
+    /// Get current resolution (convenience getter)
+    pub fn resolution(&self) -> Result<(u32, u32)> {
+        let width = self.get_property(PropertyName::Width)? as u32;
+        let height = self.get_property(PropertyName::Height)? as u32;
+        Ok((width, height))
+    }
+
+    /// Get current pixel format (convenience getter)
+    pub fn pixel_format(&self) -> Result<PixelFormat> {
+        let format_val = self.get_property(PropertyName::PixelFormatOutput)? as u32;
+        Ok(PixelFormat::from_c_enum(format_val as sys::CcapPixelFormat))
+    }
+
+    /// Get current frame rate (convenience getter)
+    pub fn frame_rate(&self) -> Result<f64> {
+        self.get_property(PropertyName::FrameRate)
+    }
+
+    /// Set error callback for camera errors
+    ///
+    /// # Memory Safety
+    ///
+    /// This is a **global** callback that persists until replaced or cleared.
+    /// Calling this function multiple times will properly clean up the previous callback.
+    ///
+    /// **Important**: this callback is process-global (shared by all `Provider` instances).
+    /// The last one set wins.
+    ///
+    /// # Thread Safety
+    ///
+    /// The callback will be invoked from the camera capture thread. Ensure your
+    /// callback is thread-safe (`Send + Sync`).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// Provider::set_error_callback(|code, desc| {
+    ///     eprintln!("Camera error {}: {}", code, desc);
+    /// });
+    /// ```
+    pub fn set_error_callback<F>(callback: F)
+    where
+        F: Fn(i32, &str) + Send + Sync + 'static,
+    {
+        use std::os::raw::c_char;
+
+        type ErrorCallbackBox = Box<dyn Fn(i32, &str) + Send + Sync>;
+
+        unsafe extern "C" fn error_callback_wrapper(
+            error_code: sys::CcapErrorCode,
+            description: *const c_char,
+            user_data: *mut std::ffi::c_void,
+        ) {
+            if user_data.is_null() || description.is_null() {
+                return;
+            }
+
+            // SAFETY: user_data points to Box<ErrorCallbackBox> created below
+            let callback = &**(user_data as *const ErrorCallbackBox);
+            let desc_cstr = std::ffi::CStr::from_ptr(description);
+            if let Ok(desc_str) = desc_cstr.to_str() {
+                callback(error_code as i32, desc_str);
+            }
+        }
+
+        // Clean up old callback if exists (use module-level GLOBAL_ERROR_CALLBACK)
+        if let Ok(mut guard) = GLOBAL_ERROR_CALLBACK.lock() {
+            if let Some(SendSyncPtr(old_ptr)) = guard.take() {
+                unsafe {
+                    let _ = Box::from_raw(old_ptr as *mut ErrorCallbackBox);
+                }
+            }
+
+            // Store new callback - double box for stable pointer
+            let callback_box: ErrorCallbackBox = Box::new(callback);
+            let callback_ptr = Box::into_raw(Box::new(callback_box));
+
+            unsafe {
+                sys::ccap_set_error_callback(
+                    Some(error_callback_wrapper),
+                    callback_ptr as *mut std::ffi::c_void,
+                );
+            }
+
+            *guard = Some(SendSyncPtr(callback_ptr as *mut std::ffi::c_void));
+        }
+    }
+
+    /// Set the **global** error callback.
+    ///
+    /// This is an alias for [`Provider::set_error_callback`] to make the global scope explicit.
+    pub fn set_global_error_callback<F>(callback: F)
+    where
+        F: Fn(i32, &str) + Send + Sync + 'static,
+    {
+        Self::set_error_callback(callback)
+    }
+
+    /// Clear the global error callback
+    ///
+    /// This removes the error callback and frees associated memory.
+    pub fn clear_error_callback() {
+        type ErrorCallbackBox = Box<dyn Fn(i32, &str) + Send + Sync>;
+
+        // Use module-level GLOBAL_ERROR_CALLBACK (same as set_error_callback)
+        if let Ok(mut guard) = GLOBAL_ERROR_CALLBACK.lock() {
+            // Always clear the C-side callback even if we don't have a stored Rust callback.
+            unsafe {
+                sys::ccap_set_error_callback(None, ptr::null_mut());
+            }
+            if let Some(SendSyncPtr(old_ptr)) = guard.take() {
+                unsafe {
+                    let _ = Box::from_raw(old_ptr as *mut ErrorCallbackBox);
+                }
+            }
+        }
+    }
+
+    /// Clear the **global** error callback.
+    ///
+    /// This is an alias for [`Provider::clear_error_callback`] to make the global scope explicit.
+    pub fn clear_global_error_callback() {
+        Self::clear_error_callback()
+    }
+
+    /// Open device with index and auto start
+    pub fn open_with_index(&mut self, device_index: i32, auto_start: bool) -> Result<()> {
+        self.open_with_index_and_extra_info(device_index, None, auto_start)
+    }
+
+    /// Open device with index, optional extra info, and optional auto start.
+    ///
+    /// On Windows, `extra_info` can be used to force backend selection with values like
+    /// `"auto"`, `"msmf"`, `"dshow"`, or `"backend=<value>"`.
+    pub fn open_with_index_and_extra_info(
+        &mut self,
+        device_index: i32,
+        extra_info: Option<&str>,
+        auto_start: bool,
+    ) -> Result<()> {
+        let extra_info = optional_c_string(extra_info, "extra info")?;
+
+        // If the previous provider was running, stop it and detach callbacks
+        // before destroying the underlying handle.
+        if !self.handle.is_null() {
+            let _ = self.stop_capture();
+            let _ = self.remove_new_frame_callback();
+            self.cleanup_callback();
+            unsafe {
+                sys::ccap_provider_destroy(self.handle);
+            }
+            self.handle = ptr::null_mut();
+            self.is_opened = false;
+        } else {
+            // Clean up any stale callback allocation even if handle is null.
+            self.cleanup_callback();
+        }
+
+        // Create a new provider with the specified device index
+        self.handle = unsafe {
+            sys::ccap_provider_create_with_index(
+                device_index,
+                extra_info
+                    .as_ref()
+                    .map_or(ptr::null(), |value| value.as_ptr()),
+            )
+        };
+
+        if self.handle.is_null() {
+            return Err(CcapError::InvalidDevice(format!(
+                "device index {}",
+                device_index
+            )));
+        }
+
+        // ccap C API contract: create_with_index opens the device.
+        self.is_opened = true;
+        if !auto_start {
+            self.stop_capture()?;
+        }
+        if auto_start {
+            self.start_capture()?;
+        }
+        Ok(())
+    }
+
+    /// Set a callback for new frame notifications
+    ///
+    /// The callback receives a reference to the captured frame and returns `true`
+    /// to continue capturing or `false` to stop.
+    ///
+    /// # Thread Safety
+    ///
+    /// The callback will be invoked from the camera capture thread. Ensure your
+    /// callback is thread-safe (`Send + Sync`).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// provider.set_new_frame_callback(|frame| {
+    ///     println!("Got frame: {}x{}", frame.width(), frame.height());
+    ///     true // continue capturing
+    /// })?;
+    /// ```
+    pub fn set_new_frame_callback<F>(&mut self, callback: F) -> Result<()>
+    where
+        F: Fn(&VideoFrame) -> bool + Send + Sync + 'static,
+    {
+        use std::os::raw::c_void;
+
+        // Type alias for the boxed callback to ensure consistency
+        type CallbackBox = Box<dyn Fn(&VideoFrame) -> bool + Send + Sync>;
+
+        // Clean up old callback if exists
+        self.cleanup_callback();
+
+        unsafe extern "C" fn new_frame_callback_wrapper(
+            frame: *const sys::CcapVideoFrame,
+            user_data: *mut c_void,
+        ) -> bool {
+            if user_data.is_null() || frame.is_null() {
+                return false;
+            }
+
+            // SAFETY: user_data points to a Box<CallbackBox> that we created below
+            let callback = &**(user_data as *const CallbackBox);
+
+            // Create a temporary VideoFrame wrapper that doesn't own the frame
+            let video_frame = VideoFrame::from_c_ptr_ref(frame as *mut sys::CcapVideoFrame);
+            callback(&video_frame)
+        }
+
+        // Box the callback as a trait object, then box again to get a thin pointer
+        // This ensures we can safely convert to/from *mut c_void
+        let callback_box: CallbackBox = Box::new(callback);
+        let callback_ptr = Box::into_raw(Box::new(callback_box));
+
+        let success = unsafe {
+            sys::ccap_provider_set_new_frame_callback(
+                self.handle,
+                Some(new_frame_callback_wrapper),
+                callback_ptr as *mut c_void,
+            )
+        };
+
+        if success {
+            self.callback_ptr = Some(callback_ptr as *mut c_void);
+            Ok(())
+        } else {
+            // Clean up on failure
+            unsafe {
+                let _ = Box::from_raw(callback_ptr);
+            }
+            Err(CcapError::InvalidParameter(
+                "Failed to set frame callback".to_string(),
+            ))
+        }
+    }
+
+    /// Remove frame callback
+    pub fn remove_new_frame_callback(&mut self) -> Result<()> {
+        let success = unsafe {
+            sys::ccap_provider_set_new_frame_callback(self.handle, None, ptr::null_mut())
+        };
+
+        if success {
+            self.cleanup_callback();
+            Ok(())
+        } else {
+            Err(CcapError::CaptureStopFailed)
+        }
+    }
+
+    /// Clean up callback pointer
+    fn cleanup_callback(&mut self) {
+        // Type alias must match what we used in set_new_frame_callback
+        type CallbackBox = Box<dyn Fn(&VideoFrame) -> bool + Send + Sync>;
+
+        if let Some(callback_ptr) = self.callback_ptr.take() {
+            unsafe {
+                // SAFETY: callback_ptr was created with Box::into_raw(Box::new(callback_box))
+                // where callback_box is a CallbackBox
+                let _ = Box::from_raw(callback_ptr as *mut CallbackBox);
+            }
+        }
+    }
+}
+
+impl Drop for Provider {
+    fn drop(&mut self) {
+        // Clean up callback first
+        self.cleanup_callback();
+
+        if !self.handle.is_null() {
+            unsafe {
+                sys::ccap_provider_destroy(self.handle);
+            }
+            self.handle = ptr::null_mut();
+        }
+    }
+}

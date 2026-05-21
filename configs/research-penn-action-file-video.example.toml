@@ -1,0 +1,85 @@
+[desktop.runtime_selection]
+device = ""
+engine = "mediapipe-native"
+mediaPipeRunningMode = "video"
+mediaPipeHolisticEnabled = true
+fps = 30
+resolution = "640x480"
+zenohEnabled = false
+vmcEnabled = true
+vmcTargetAddr = "127.0.0.1:39539"
+vmcChestStabilizationEnabled = false
+vmcChestStabilizationStrength = 0.6
+zenohKeyExpr = "un-motion/frame"
+minimizeToTray = false
+
+[desktop.runtime_selection.modifier]
+headEnabled = true
+faceEnabled = true
+handsEnabled = true
+armsIkEnabled = true
+torsoEnabled = false
+legsEnabled = false
+feetEnabled = false
+cameraDiagonalViewAngleDeg = 70.0
+minLandmarkConfidence = 0.55
+mirrorMode = "normal"
+smoothingPreset = "adaptive"
+
+[desktop.runtime_selection.modifier.postProcessRules]
+headFromPose = true
+headFromFaceMatrix = true
+headReconcile = true
+neutralEyeFallback = true
+handCameraTarget = true
+handOrientation = true
+fingerDerived = true
+armFromPose = true
+armIkFromHands = true
+crossedHandHeuristic = true
+coordinateCorrection = true
+finalClamp = true
+
+[components.input]
+id = "penn-action-0001"
+kind = "file-video"
+
+[components.input.settings]
+path = "target/research/penn-action/videos/320w/0001.mp4"
+source_id = "penn-action:0001"
+source_label = "Penn Action 0001"
+fps = 30
+output_width = 640
+output_height = 480
+repeat = true
+ffmpeg_path = "target/tools/ffmpeg/ffmpeg.exe"
+
+[components.input_buffer]
+id = "input-ring"
+kind = "ring"
+capacity = 8
+overflow = "block-producer"
+
+[components.engine]
+id = "mp-native"
+kind = "media-pipe-native"
+
+[components.post_process]
+id = "mp-default"
+kind = "media-pipe-default"
+
+[components.output_buffer]
+id = "output-ring"
+kind = "ring"
+capacity = 8
+overflow = "block-producer"
+
+[[components.outputs]]
+id = "vmc"
+kind = "vmc"
+enabled = true
+
+[[components.outputs]]
+id = "zenoh"
+kind = "zenoh"
+enabled = false
