@@ -1,0 +1,29 @@
+[package]
+name = "un-motion-capturer"
+description = "UN Motion Capturer プロセス: MediaPipe Native / iFacialMocap 等の入力ソースを UNMotionFrame v1.1 (Zenoh) と VMC で配信する"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "un-motion-capturer"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+un-motion-core = { path = "../un-motion-core" }
+un-motion-interfaces = { path = "../un-motion-interfaces" }
+
+[target.'cfg(windows)'.dependencies]
+un-motion-input-webcam-directshow = { path = "../un-motion-input-webcam-directshow" }
+
+[build-dependencies]
+winresource.workspace = true

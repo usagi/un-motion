@@ -1,0 +1,52 @@
+[package]
+name = "un-motion-supervisor"
+description = "UN Motion Supervisor GUI"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "un_motion_supervisor_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "un-motion-supervisor"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.6.1", features = [] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[dependencies]
+anyhow.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rfd = "0.17"
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2.11.1", features = [
+ "tray-icon",
+ "image-ico",
+ "image-png",
+] }
+tauri-plugin-notification = "2.3.3"
+toml = "0.8"
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+un-motion-profile-schema = { path = "../../../crates/un-motion-profile-schema" }
+# i18n: 共有 crate `un-i18n` (<https://github.com/usagi/un-common>)。リリースブランチでは
+# git 依存に `rev` を付けてコミットをピン留めすること。
+un-i18n = { git = "https://github.com/usagi/un-common.git", branch = "main", package = "un-i18n" }
+rust-i18n = "4"
+
+# Windows-only: GUI dropdown 用に Webcam デバイス列挙を Supervisor 側で実行する
+# (DirectShow / MediaFoundation の両 backend に対応)。MediaFoundation backend は
+# 内部で `nokhwa` を使うが、GUI 上は "Webcam (MediaFoundation)" として表示し
+# 実装詳細をユーザーに見せない。
+[target.'cfg(target_os = "windows")'.dependencies]
+un-motion-input-webcam-directshow = { path = "../../../crates/un-motion-input-webcam-directshow" }
+un-motion-input-webcam-nokhwa = { path = "../../../crates/un-motion-input-webcam-nokhwa" }

@@ -1,0 +1,53 @@
+[mediapipe]
+repository = "https://github.com/google-ai-edge/mediapipe.git"
+tag = "v0.10.35"
+commit = "f8ef212d5c962c0e853db7e59d217056b187084b"
+license = "Apache-2.0"
+
+[model.pose_landmarker_lite]
+url = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
+path = "models/pose_landmarker_lite.task"
+license = "Apache-2.0"
+
+[model.pose_landmarker_full]
+url = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task"
+path = "models/pose_landmarker_full.task"
+license = "Apache-2.0"
+
+[model.pose_landmarker_heavy]
+url = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task"
+path = "models/pose_landmarker_heavy.task"
+license = "Apache-2.0"
+
+[model.face_landmarker]
+url = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
+path = "models/face_landmarker.task"
+license = "Apache-2.0"
+
+[model.hand_landmarker]
+url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
+path = "models/hand_landmarker.task"
+license = "Apache-2.0"
+
+[model.gesture_recognizer]
+url = "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/latest/gesture_recognizer.task"
+path = "models/gesture_recognizer.task"
+license = "Apache-2.0"
+
+[model.holistic_landmarker]
+url = "https://storage.googleapis.com/mediapipe-models/holistic_landmarker/holistic_landmarker/float16/latest/holistic_landmarker.task"
+path = "models/holistic_landmarker.task"
+license = "Apache-2.0"
+
+[build.bazelisk]
+version = "v1.28.1"
+windows_amd64_url = "https://github.com/bazelbuild/bazelisk/releases/download/v1.28.1/bazelisk-windows-amd64.exe"
+path = "tools/bazelisk/bazelisk.exe"
+
+[build.opencv]
+version = "3.4.10"
+world_version = "3410"
+windows_amd64_url = "https://github.com/opencv/opencv/releases/download/3.4.10/opencv-3.4.10-vc14_vc15.exe"
+installer_path = "tools/opencv/opencv-3.4.10-vc14_vc15.exe"
+extract_dir = "third_party/opencv"
+build_path = "third_party/opencv/opencv/build"

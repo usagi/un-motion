@@ -1,0 +1,7 @@
+{
+  "git": {
+    "sha1": "35c1c1e940af8a3b17de0b9571a314c0dae93c75",
+    "dirty": true
+  },
+  "path_in_vcs": "bindings/rust"
+}

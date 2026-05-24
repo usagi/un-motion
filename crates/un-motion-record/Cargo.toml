@@ -1,0 +1,13 @@
+[package]
+name = "un-motion-record"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rmp-serde = "1"
+un-motion-frame = "1.1.0"
+un-motion-interfaces = { path = "../un-motion-interfaces" }

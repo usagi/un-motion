@@ -1,0 +1,16 @@
+[package]
+name = "un-motion-profile-schema"
+description = "UN Motion: profile (TOML) schema + I/O のみを提供する軽量 crate。Capturer/Core/Supervisor が共有する。"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde = { workspace = true, features = ["derive"] }
+toml = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1"

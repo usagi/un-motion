@@ -1,0 +1,28 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+
+licenses(["notice"])
+
+cc_binary(
+    name = "un-motion-mediapipe.dll",
+    srcs = [
+        "un-motion-mediapipe-backend.cc",
+        "un-motion-mediapipe-ffi.h",
+    ],
+    linkshared = True,
+    visibility = ["//visibility:public"],
+    deps = [
+        "//mediapipe/framework/formats:image",
+        "//mediapipe/framework/formats:image_frame",
+        "//mediapipe/tasks/cc/core:base_options",
+        "//mediapipe/tasks/cc/vision/core:running_mode",
+        "//mediapipe/tasks/cc/vision/face_landmarker:face_landmarker",
+        "//mediapipe/tasks/cc/vision/face_landmarker:face_landmarker_result",
+        "//mediapipe/tasks/cc/vision/gesture_recognizer:gesture_recognizer",
+        "//mediapipe/tasks/cc/vision/hand_landmarker:hand_landmarker",
+        "//mediapipe/tasks/cc/vision/hand_landmarker:hand_landmarker_result",
+        "//mediapipe/tasks/cc/vision/holistic_landmarker:holistic_landmarker",
+        "//mediapipe/tasks/cc/vision/holistic_landmarker:holistic_landmarker_result",
+        "//mediapipe/tasks/cc/vision/pose_landmarker:pose_landmarker",
+        "//mediapipe/tasks/cc/vision/pose_landmarker:pose_landmarker_result",
+    ],
+)

@@ -1,0 +1,59 @@
+target/
+**/target/
+
+# Rust application/workspace lockfiles are intentionally tracked.
+
+# Local release artifacts.
+release-packages/
+
+# Local temporary backup/staging folders.
+__t_*/
+
+# Local research datasets and generated benchmark media.
+research-data/
+
+# Local desktop runtime state.
+conf.toml
+profiles/
+
+# Large vendored dependencies prepared locally.
+third_party/mediapipe/
+third_party/opencv/
+models/*.task
+tools/bazelisk/
+tools/ffmpeg/
+tools/opencv/
+tools/python3-shim/
+native/mediapipe/*.dll
+native/mediapipe/*.lib
+
+# Editor and tooling
+.vscode/
+.idea/
+*.code-workspace
+
+# Node / frontend build output
+node_modules/
+**/node_modules/
+apps/un-motion-supervisor/public/sounds/
+dist/
+**/dist/
+build/
+**/build/
+# Tauri generated permission manifests / schemas
+apps/*/src-tauri/gen/
+.svelte-kit/
+.vite/
+**/.vite/
+coverage/
+.playwright-cli/
+output/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS junk
+.DS_Store
+Thumbs.db

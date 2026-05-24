@@ -1,0 +1,33 @@
+[pipeline]
+stale_timeout_ns = 50000000
+hold_last_ticks = 2
+hold_decay_per_tick = 0.85
+priority_weight = 1000.0
+confidence_weight = 100.0
+freshness_weight = 1.0
+
+[pipeline.source_priority]
+camera = 10
+vmc = 20
+
+[pipeline.source_min_confidence]
+camera = 0.65
+vmc = 0.5
+
+[pipeline.source_stale_timeout_ns]
+vmc = 20000000
+
+[output.vmc]
+target_addr = "127.0.0.1:39539"
+send_ok_packet = true
+
+[output.vmc.blendshape_map]
+"head.yaw" = "HeadYaw"
+"head.roll" = "HeadRoll"
+
+[output.vmc.blendshape_map."head.pitch"]
+name = "HeadPitch"
+scale = 0.5
+offset = 0.1
+clamp_min = -1.0
+clamp_max = 1.0

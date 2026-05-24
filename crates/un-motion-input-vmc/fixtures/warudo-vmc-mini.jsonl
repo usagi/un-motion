@@ -1,0 +1,6 @@
+{"addr":"/VMC/Ext/Root/Pos","args":[{"type":"string","value":"root"},{"type":"float","value":0.0},{"type":"float","value":0.0},{"type":"float","value":0.0},{"type":"float","value":-0.0},{"type":"float","value":-0.0},{"type":"float","value":-0.0},{"type":"float","value":1.0}]}
+{"addr":"/VMC/Ext/Bone/Pos","args":[{"type":"string","value":"Head"},{"type":"float","value":-7.143601E-10},{"type":"float","value":0.050500154},{"type":"float","value":0.0040856637},{"type":"float","value":-0.010153498},{"type":"float","value":0.13846958},{"type":"float","value":0.22703552},{"type":"float","value":0.9639388}]}
+{"addr":"/VMC/Ext/Bone/Pos","args":[{"type":"string","value":"LeftHand"},{"type":"float","value":-0.18316424},{"type":"float","value":-5.6147575E-05},{"type":"float","value":0.0047771633},{"type":"float","value":0.08414156},{"type":"float","value":0.20295498},{"type":"float","value":-0.13365918},{"type":"float","value":0.96636677}]}
+{"addr":"/VMC/Ext/Blend/Val","args":[{"type":"string","value":"eyeBlinkLeft"},{"type":"float","value":0.0}]}
+{"addr":"/VMC/Ext/Blend/Val","args":[{"type":"string","value":"jawOpen"},{"type":"float","value":0.0006592618}]}
+{"addr":"/VMC/Ext/Blend/Apply","args":[]}

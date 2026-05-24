@@ -1,0 +1,21 @@
+[package]
+name = "un-motion-runtime"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+arc-swap = "1"
+rosc = "0.10"
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1"
+tracing = { workspace = true }
+un-motion-frame = "1.1.0"
+un-motion-input-ifacialmocap = { path = "../un-motion-input-ifacialmocap" }
+un-motion-input-vmc = { path = "../un-motion-input-vmc" }
+un-motion-output-vmc = { path = "../un-motion-output-vmc" }
+un-motion-record = { path = "../un-motion-record" }
+un-motion-frame-zenoh = "1.0"

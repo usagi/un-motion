@@ -1,0 +1,101 @@
+[[fixture]]
+file = "pose-1.png"
+kind = "front"
+max-abs-head-yaw = 0.15
+max-abs-head-pitch = 0.25
+max-abs-head-roll = 0.10
+
+[[fixture]]
+file = "pose-2.png"
+kind = "right-up-diagnostic"
+
+[[fixture]]
+file = "pose-3.png"
+kind = "right-up-diagnostic"
+
+[[fixture]]
+file = "pose-4.png"
+kind = "right-up-diagnostic"
+
+[[fixture]]
+file = "pose-5.png"
+kind = "front-fingers"
+max-abs-head-yaw = 0.15
+max-abs-head-pitch = 0.25
+max-abs-head-roll = 0.10
+
+[[fixture]]
+file = "pose-6.png"
+kind = "left-profile-limit"
+min-head-yaw = -1.00
+max-head-yaw = -0.60
+
+[[fixture]]
+file = "pose-7.png"
+kind = "front-palms-forward"
+max-abs-head-yaw = 0.25
+max-abs-head-pitch = 0.35
+max-abs-head-roll = 0.15
+min-left-palm-normal-z = 0.70
+min-right-palm-normal-z = 0.70
+min-left-hand-palm-z = 0.70
+min-right-hand-palm-z = 0.70
+max-abs-left-thumb-spread = 0.25
+max-abs-right-thumb-spread = 0.25
+
+[[fixture]]
+file = "pose-8.png"
+kind = "front-palms-inner-diagnostic"
+max-abs-head-yaw = 0.25
+max-abs-head-pitch = 0.35
+max-abs-head-roll = 0.15
+
+[[fixture]]
+file = "pose-9.png"
+kind = "front-palms-back"
+max-abs-head-yaw = 0.25
+max-abs-head-pitch = 0.35
+max-abs-head-roll = 0.15
+max-left-palm-normal-z = -0.70
+max-right-palm-normal-z = -0.70
+max-left-hand-palm-z = -0.70
+max-right-hand-palm-z = -0.70
+
+[[fixture]]
+file = "pose-10.png"
+kind = "front-palms-l-thumb-open"
+max-abs-head-yaw = 0.25
+max-abs-head-pitch = 0.35
+max-abs-head-roll = 0.15
+min-left-palm-normal-z = 0.70
+min-right-palm-normal-z = 0.70
+min-left-thumb-spread = 0.60
+min-right-thumb-spread = 0.60
+
+[[fixture]]
+file = "pose-I.png"
+kind = "front-calibration-i"
+max-abs-head-yaw = 0.15
+max-abs-head-pitch = 0.25
+max-abs-head-roll = 0.10
+
+[[fixture]]
+file = "pose-T.png"
+kind = "front-calibration-t"
+max-abs-head-yaw = 0.15
+max-abs-head-pitch = 0.25
+max-abs-head-roll = 0.10
+
+[[fixture]]
+file = "pose-T-wrist-front.png"
+kind = "front-calibration-t-wrist"
+max-abs-head-yaw = 0.15
+max-abs-head-pitch = 0.25
+max-abs-head-roll = 0.10
+
+[[fixture]]
+file = "pose-U.png"
+kind = "front-calibration-u"
+max-abs-head-yaw = 0.15
+max-abs-head-pitch = 0.25
+max-abs-head-roll = 0.10
