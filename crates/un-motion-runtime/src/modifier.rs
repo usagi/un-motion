@@ -1254,6 +1254,37 @@ impl ModifierStage for MirrorStage {
 				expr.name = swap_left_right_in_expression_name(&expr.name);
 			}
 		}
+		if self.bone_subset.hands_enabled {
+			if mirror_transforms {
+				mirror_hand_motion(frame.left_hand.as_mut());
+				mirror_hand_motion(frame.right_hand.as_mut());
+			}
+			std::mem::swap(&mut frame.left_hand, &mut frame.right_hand);
+		}
+	}
+}
+
+fn mirror_hand_motion(hand: Option<&mut HandMotion>) {
+	let Some(hand) = hand else {
+		return;
+	};
+	if let Some(wrist) = hand.wrist.as_mut() {
+		mirror_transform_sample(wrist);
+	}
+	for finger in &mut hand.fingers {
+		for joint in &mut finger.joints {
+			mirror_transform_sample(joint);
+		}
+	}
+}
+
+fn mirror_transform_sample(transform: &mut TransformSample) {
+	if let Some(t) = transform.translation.as_mut() {
+		t.x = -t.x;
+	}
+	if let Some(r) = transform.rotation.as_mut() {
+		r.y = -r.y;
+		r.z = -r.z;
 	}
 }
 
@@ -1520,7 +1551,7 @@ fn confidence_adjusted_min_cutoff(min_cutoff: f32, confidence: f32, enabled: boo
 mod tests {
 	use super::*;
 	use un_motion_frame::{
-		BodyMotion, BoneSample, ExpressionSample, FaceMotion, HumanoidPose, SampleState, TrackingState, TransformSample,
+		BodyMotion, BoneSample, ExpressionSample, FaceMotion, Finger, FingerPose, HumanoidPose, SampleState, TrackingState, TransformSample,
 	};
 
 	fn apply_modifier(frame: &mut UNMotionFrame, config: &ModifierConfig) {
@@ -2631,6 +2662,41 @@ mod tests {
 		frame
 	}
 
+	fn make_left_hand_motion() -> HandMotion {
+		HandMotion {
+			tracking_state: TrackingState::Valid,
+			confidence: 1.0,
+			wrist: Some(FrameTransform {
+				translation: Some(FrameVec3 { x: 0.25, y: 0.5, z: -0.1 }),
+				rotation: Some(FrameQuat {
+					x: 0.1,
+					y: 0.2,
+					z: -0.3,
+					w: 0.92736185,
+				}),
+				scale: None,
+				linear_velocity: None,
+				angular_velocity: None,
+			}),
+			fingers: vec![FingerPose {
+				finger: Finger::Index,
+				joints: vec![FrameTransform {
+					translation: Some(FrameVec3 { x: 0.4, y: 0.2, z: 0.1 }),
+					rotation: Some(FrameQuat {
+						x: 0.0,
+						y: 0.5,
+						z: 0.3,
+						w: 0.81240386,
+					}),
+					scale: None,
+					linear_velocity: None,
+					angular_velocity: None,
+				}],
+				confidence: 1.0,
+			}],
+		}
+	}
+
 	#[test]
 	fn mirror_stage_disabled_when_normal_mode() {
 		// MirrorMode::Normal は pipeline に入らない (from_config が None を返す)。
@@ -2685,6 +2751,70 @@ mod tests {
 		let rot = bones[0].transform.rotation.unwrap();
 		assert!((rot.y - 0.5).abs() < 1e-5);
 		assert!((rot.z - 0.3).abs() < 1e-5);
+	}
+
+	#[test]
+	fn mirror_output_swaps_top_level_hands_and_flips_finger_transforms() {
+		let mut frame = UNMotionFrame::new(1);
+		frame.left_hand = Some(make_left_hand_motion());
+		let mut pipeline = ModifierPipeline::from_config(&ModifierConfig {
+			mirror: MirrorConfig {
+				mode: MirrorMode::MirrorOutput,
+			},
+			..ModifierConfig::default()
+		});
+		pipeline.apply(&mut frame);
+
+		assert!(frame.left_hand.is_none(), "left hand should move to right hand");
+		let hand = frame.right_hand.expect("mirrored right hand");
+		let wrist = hand.wrist.expect("wrist");
+		let wrist_translation = wrist.translation.expect("wrist translation");
+		assert!((wrist_translation.x - -0.25).abs() < 1e-5);
+		assert!((wrist_translation.y - 0.5).abs() < 1e-5);
+		assert!((wrist_translation.z - -0.1).abs() < 1e-5);
+		let wrist_rotation = wrist.rotation.expect("wrist rotation");
+		assert!((wrist_rotation.x - 0.1).abs() < 1e-5);
+		assert!((wrist_rotation.y - -0.2).abs() < 1e-5);
+		assert!((wrist_rotation.z - 0.3).abs() < 1e-5);
+		assert!((wrist_rotation.w - 0.92736185).abs() < 1e-5);
+
+		let joint = &hand.fingers[0].joints[0];
+		let joint_translation = joint.translation.expect("joint translation");
+		assert!((joint_translation.x - -0.4).abs() < 1e-5);
+		assert!((joint_translation.y - 0.2).abs() < 1e-5);
+		let joint_rotation = joint.rotation.expect("joint rotation");
+		assert!((joint_rotation.x - 0.0).abs() < 1e-5);
+		assert!((joint_rotation.y - -0.5).abs() < 1e-5);
+		assert!((joint_rotation.z - -0.3).abs() < 1e-5);
+		assert!((joint_rotation.w - 0.81240386).abs() < 1e-5);
+	}
+
+	#[test]
+	fn mirror_swap_sides_swaps_top_level_hands_without_flipping_fingers() {
+		let mut frame = UNMotionFrame::new(1);
+		frame.left_hand = Some(make_left_hand_motion());
+		let mut pipeline = ModifierPipeline::from_config(&ModifierConfig {
+			mirror: MirrorConfig {
+				mode: MirrorMode::SwapSides,
+			},
+			..ModifierConfig::default()
+		});
+		pipeline.apply(&mut frame);
+
+		assert!(frame.left_hand.is_none(), "left hand should move to right hand");
+		let hand = frame.right_hand.expect("swapped right hand");
+		let wrist = hand.wrist.expect("wrist");
+		let wrist_translation = wrist.translation.expect("wrist translation");
+		assert!((wrist_translation.x - 0.25).abs() < 1e-5);
+		let wrist_rotation = wrist.rotation.expect("wrist rotation");
+		assert!((wrist_rotation.y - 0.2).abs() < 1e-5);
+		assert!((wrist_rotation.z - -0.3).abs() < 1e-5);
+		let joint = &hand.fingers[0].joints[0];
+		let joint_translation = joint.translation.expect("joint translation");
+		assert!((joint_translation.x - 0.4).abs() < 1e-5);
+		let joint_rotation = joint.rotation.expect("joint rotation");
+		assert!((joint_rotation.y - 0.5).abs() < 1e-5);
+		assert!((joint_rotation.z - 0.3).abs() < 1e-5);
 	}
 
 	#[test]
