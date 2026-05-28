@@ -6857,7 +6857,7 @@ dependencies = [
 
 [[package]]
 name = "un-motion-capturer"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -7088,7 +7088,7 @@ dependencies = [
 
 [[package]]
 name = "un-motion-profile-schema"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -7126,7 +7126,7 @@ dependencies = [
 
 [[package]]
 name = "un-motion-supervisor"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "reqwest 0.12.28",
@@ -8464,7 +8464,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "flate2",
