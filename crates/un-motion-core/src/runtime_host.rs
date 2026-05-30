@@ -32,6 +32,7 @@ const MAX_FPS: u32 = 240;
 const FOLLOW_INPUT_OUTPUT_FPS_CAP: u32 = MAX_FPS;
 const DEFAULT_VMC_TARGET: &str = "127.0.0.1:39539";
 const DEFAULT_VRC_OSC_TARGET: &str = "127.0.0.1:9000";
+const DEFAULT_VRC_OSC_PARAMETER_PREFIX: &str = "FT";
 const STALE_AFTER_NS: u64 = 500_000_000;
 const LOOP_MAX_SLEEP: Duration = Duration::from_millis(5);
 const FLOW_IDLE_SLEEP: Duration = Duration::from_millis(1);
@@ -552,7 +553,9 @@ fn parse_vrc_osc_output_config(runtime: Option<&ProfileRuntimeSettings>) -> anyh
 	let target_addr: SocketAddr = target
 		.parse()
 		.with_context(|| format!("invalid VRC OSC output target address: {target}"))?;
-	let parameter_prefix = runtime.and_then(|r| r.vrc_osc_parameter_prefix.clone()).unwrap_or_default();
+	let parameter_prefix = runtime
+		.and_then(|r| r.vrc_osc_parameter_prefix.clone())
+		.unwrap_or_else(|| DEFAULT_VRC_OSC_PARAMETER_PREFIX.to_string());
 	let send_only_when_vrchat_running = runtime.and_then(|r| r.vrc_osc_send_only_when_vrchat_running).unwrap_or(true);
 	let poll_secs = runtime
 		.and_then(|r| r.vrc_osc_process_poll_interval_secs)

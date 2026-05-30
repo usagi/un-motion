@@ -989,7 +989,7 @@ mod tests {
 			event,
 			VrcOscOutputEvent::Sent {
 				datagrams: 1,
-				packets: 1,
+				packets: 6,
 				..
 			}
 		));

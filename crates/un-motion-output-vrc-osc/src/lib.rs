@@ -25,7 +25,13 @@ impl Default for VrcOscOutputOptions {
 #[derive(Clone, Debug, PartialEq)]
 pub struct VrcOscParameter {
 	pub name: String,
-	pub value: f32,
+	pub value: VrcOscParameterValue,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VrcOscParameterValue {
+	Float(f32),
+	Bool(bool),
 }
 
 #[derive(Debug)]
@@ -72,9 +78,13 @@ pub fn vrc_osc_packets_for_frame(frame: &UNMotionFrame, options: &VrcOscOutputOp
 	vrc_osc_parameters_for_frame(frame, options)
 		.into_iter()
 		.map(|parameter| {
+			let arg = match parameter.value {
+				VrcOscParameterValue::Float(value) => OscType::Float(value),
+				VrcOscParameterValue::Bool(value) => OscType::Bool(value),
+			};
 			OscPacket::Message(OscMessage {
 				addr: format!("{AVATAR_PARAMETER_PREFIX}{}", parameter.name),
-				args: vec![OscType::Float(parameter.value)],
+				args: vec![arg],
 			})
 		})
 		.collect()
@@ -111,10 +121,15 @@ pub fn vrc_osc_parameters_for_frame(frame: &UNMotionFrame, options: &VrcOscOutpu
 			_ => {}
 		}
 	}
-	parameters
-		.into_iter()
-		.map(|(name, value)| VrcOscParameter { name, value })
-		.collect()
+	let mut output = Vec::new();
+	for (name, value) in parameters {
+		output.push(VrcOscParameter {
+			name: name.clone(),
+			value: VrcOscParameterValue::Float(value),
+		});
+		output.extend(binary_parameters_for(&name, value));
+	}
+	output
 }
 
 fn sample_state_is_usable(state: SampleState) -> bool {
@@ -127,7 +142,7 @@ fn map_expression_name(name: &str, value: f32, options: &VrcOscOutputOptions) ->
 	}
 	let normalized = normalize_input_name(name).to_ascii_lowercase();
 	let route = arkit_to_vrcft_route(&normalized)?;
-	let mut value = value;
+	let mut value = value * route.value_scale;
 	if route.invert_openness {
 		value = 0.75 * (1.0 - value.clamp(0.0, 1.0));
 	}
@@ -168,10 +183,35 @@ fn apply_parameter_prefix(parameter: &str, prefix: &str) -> String {
 	}
 }
 
+fn binary_parameters_for(parameter: &str, value: f32) -> Vec<VrcOscParameter> {
+	if !parameter.contains("/v2/") && !parameter.starts_with("v2/") {
+		return Vec::new();
+	}
+	let magnitude = value.abs().clamp(0.0, 1.0);
+	let quantized = if magnitude >= 0.99999 {
+		15
+	} else {
+		(magnitude * 15.0).floor() as u8
+	};
+	let mut parameters = Vec::with_capacity(5);
+	parameters.push(VrcOscParameter {
+		name: format!("{parameter}Negative"),
+		value: VrcOscParameterValue::Bool(value < 0.0),
+	});
+	for (bit, suffix) in [(0, "1"), (1, "2"), (2, "4"), (3, "8")] {
+		parameters.push(VrcOscParameter {
+			name: format!("{parameter}{suffix}"),
+			value: VrcOscParameterValue::Bool(((quantized >> bit) & 1) == 1),
+		});
+	}
+	parameters
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct VrcftRoute {
 	parameter: &'static str,
 	invert_openness: bool,
+	value_scale: f32,
 }
 
 impl VrcftRoute {
@@ -179,6 +219,15 @@ impl VrcftRoute {
 		Self {
 			parameter,
 			invert_openness: false,
+			value_scale: 1.0,
+		}
+	}
+
+	const fn signed(parameter: &'static str, value_scale: f32) -> Self {
+		Self {
+			parameter,
+			invert_openness: false,
+			value_scale,
 		}
 	}
 
@@ -186,6 +235,7 @@ impl VrcftRoute {
 		Self {
 			parameter,
 			invert_openness: true,
+			value_scale: 1.0,
 		}
 	}
 }
@@ -211,16 +261,18 @@ fn arkit_to_vrcft_route(name: &str) -> Option<VrcftRoute> {
 		"cheeksquintleft" => VrcftRoute::new("v2/CheekSquintLeft"),
 		"cheeksquintright" => VrcftRoute::new("v2/CheekSquintRight"),
 		"jawopen" => VrcftRoute::new("v2/JawOpen"),
-		"jawforward" => VrcftRoute::new("v2/JawZ"),
-		"jawleft" | "jawright" => VrcftRoute::new("v2/JawX"),
+		"jawforward" => VrcftRoute::new("v2/JawForward"),
+		"jawleft" => VrcftRoute::signed("v2/JawX", -1.0),
+		"jawright" => VrcftRoute::new("v2/JawX"),
 		"mouthclose" => VrcftRoute::new("v2/MouthClosed"),
 		"mouthfunnel" => VrcftRoute::new("v2/LipFunnel"),
 		"mouthpucker" => VrcftRoute::new("v2/LipPucker"),
-		"mouthleft" | "mouthright" => VrcftRoute::new("v2/MouthX"),
-		"mouthsmileleft" => VrcftRoute::new("v2/MouthSmileLeft"),
-		"mouthsmileright" => VrcftRoute::new("v2/MouthSmileRight"),
-		"mouthfrownleft" => VrcftRoute::new("v2/MouthSadLeft"),
-		"mouthfrownright" => VrcftRoute::new("v2/MouthSadRight"),
+		"mouthleft" => VrcftRoute::signed("v2/MouthX", -1.0),
+		"mouthright" => VrcftRoute::new("v2/MouthX"),
+		"mouthsmileleft" => VrcftRoute::new("v2/SmileFrownLeft"),
+		"mouthsmileright" => VrcftRoute::new("v2/SmileFrownRight"),
+		"mouthfrownleft" => VrcftRoute::signed("v2/SmileFrownLeft", -1.0),
+		"mouthfrownright" => VrcftRoute::signed("v2/SmileFrownRight", -1.0),
 		"mouthdimpleleft" => VrcftRoute::new("v2/MouthDimpleLeft"),
 		"mouthdimpleright" => VrcftRoute::new("v2/MouthDimpleRight"),
 		"mouthstretchleft" => VrcftRoute::new("v2/MouthStretchLeft"),
@@ -262,6 +314,7 @@ fn parameter_supports_negative(parameter: &str) -> bool {
 			| "EyeRightY"
 			| "EyeX" | "EyeY"
 			| "JawX" | "JawZ"
+			| "JawForward"
 			| "CheekPuffSuck"
 			| "CheekPuffSuckLeft"
 			| "CheekPuffSuckRight"
@@ -318,6 +371,16 @@ mod tests {
 		(&message.addr, value)
 	}
 
+	fn bool_packet_value(packet: &OscPacket) -> (&str, bool) {
+		let OscPacket::Message(message) = packet else {
+			panic!("packet should be message");
+		};
+		let OscType::Bool(value) = message.args[0] else {
+			panic!("arg should be bool");
+		};
+		(&message.addr, value)
+	}
+
 	#[test]
 	fn maps_arkit_expression_to_vrcft_avatar_parameter() {
 		let mut frame = UNMotionFrame::new(1);
@@ -330,7 +393,7 @@ mod tests {
 
 		let packets = vrc_osc_packets_for_frame(&frame, &VrcOscOutputOptions::default());
 
-		assert_eq!(packets.len(), 1);
+		assert_eq!(packets.len(), 6);
 		assert_eq!(packet_value(&packets[0]), ("/avatar/parameters/v2/JawOpen", 0.42));
 	}
 
@@ -348,7 +411,49 @@ mod tests {
 
 		assert_eq!(
 			packet_value(&packets[0]),
-			("/avatar/parameters/ExamplePrefix/v2/MouthSmileLeft", 0.6)
+			("/avatar/parameters/ExamplePrefix/v2/SmileFrownLeft", 0.6)
+		);
+	}
+
+	#[test]
+	fn emits_vrcft_binary_parameters_for_avatar_bool_setups() {
+		let mut frame = UNMotionFrame::new(1);
+		frame.signals.push(scalar("face.mouthSmileRight", 0.6));
+
+		let packets = vrc_osc_packets_for_frame(
+			&frame,
+			&VrcOscOutputOptions {
+				parameter_prefix: "FT".to_string(),
+			},
+		);
+
+		assert_eq!(packet_value(&packets[0]), ("/avatar/parameters/FT/v2/SmileFrownRight", 0.6));
+		assert_eq!(
+			bool_packet_value(&packets[1]),
+			("/avatar/parameters/FT/v2/SmileFrownRightNegative", false)
+		);
+		assert_eq!(bool_packet_value(&packets[2]), ("/avatar/parameters/FT/v2/SmileFrownRight1", true));
+		assert_eq!(bool_packet_value(&packets[3]), ("/avatar/parameters/FT/v2/SmileFrownRight2", false));
+		assert_eq!(bool_packet_value(&packets[4]), ("/avatar/parameters/FT/v2/SmileFrownRight4", false));
+		assert_eq!(bool_packet_value(&packets[5]), ("/avatar/parameters/FT/v2/SmileFrownRight8", true));
+	}
+
+	#[test]
+	fn emits_negative_binary_parameters_for_signed_shapes() {
+		let mut frame = UNMotionFrame::new(1);
+		frame.signals.push(scalar("face.mouthFrownLeft", 0.5));
+
+		let packets = vrc_osc_packets_for_frame(
+			&frame,
+			&VrcOscOutputOptions {
+				parameter_prefix: "FT".to_string(),
+			},
+		);
+
+		assert_eq!(packet_value(&packets[0]), ("/avatar/parameters/FT/v2/SmileFrownLeft", -0.5));
+		assert_eq!(
+			bool_packet_value(&packets[1]),
+			("/avatar/parameters/FT/v2/SmileFrownLeftNegative", true)
 		);
 	}
 

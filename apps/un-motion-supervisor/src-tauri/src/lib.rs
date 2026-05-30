@@ -1829,6 +1829,7 @@ fn new_profile_runtime_defaults() -> ProfileRuntimeSettings {
 		vrc_osc_target_addr: Some("127.0.0.1:9000".to_string()),
 		vrc_osc_send_only_when_vrchat_running: Some(true),
 		vrc_osc_process_poll_interval_secs: Some(10),
+		vrc_osc_parameter_prefix: Some("FT".to_string()),
 		zenoh_enabled: Some(true),
 		zenoh_key_expr: Some("un-motion/frame".to_string()),
 		zenoh_topic_mode: Some("frame".to_string()),

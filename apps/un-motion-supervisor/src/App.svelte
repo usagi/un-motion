@@ -5450,14 +5450,14 @@
                         />
                       </label>
                       <label
-                        data-hint="Parameter prefix: avatar側で標準以外のnamespaceを使う場合に指定します。空欄ならv2/...をそのまま送信します。"
+                        data-hint="Parameter prefix: avatar側のVRCFT namespaceに合わせます。一般的なVRCFT avatarではFTを使います。"
                       >
                         <span>Parameter prefix</span>
                         <input
                           type="text"
                           value={profileDetail.runtime.vrcOscParameterPrefix ??
                             ""}
-                          placeholder="(none)"
+                          placeholder="FT"
                           onchange={(event) =>
                             void updateProfileField(
                               "runtime_selection.vrc_osc_parameter_prefix",
