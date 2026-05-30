@@ -410,19 +410,21 @@ pub enum OutputComponentKind {
 	#[default]
 	Vmc,
 	Zenoh,
+	VrcOsc,
 	Debug,
 	Record,
 }
 
 impl OutputComponentKind {
 	pub const fn all() -> &'static [Self] {
-		&[Self::Vmc, Self::Zenoh, Self::Debug, Self::Record]
+		&[Self::Vmc, Self::Zenoh, Self::VrcOsc, Self::Debug, Self::Record]
 	}
 
 	pub const fn id(&self) -> &'static str {
 		match self {
 			Self::Vmc => "vmc",
 			Self::Zenoh => "zenoh",
+			Self::VrcOsc => "vrc-osc",
 			Self::Debug => "debug",
 			Self::Record => "record",
 		}
@@ -432,6 +434,7 @@ impl OutputComponentKind {
 		match self {
 			Self::Vmc => "VMC",
 			Self::Zenoh => "Zenoh",
+			Self::VrcOsc => "VRC (VRCFT) / OSC",
 			Self::Debug => "Debug",
 			Self::Record => "Record",
 		}

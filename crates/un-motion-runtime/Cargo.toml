@@ -17,5 +17,6 @@ un-motion-frame = "1.1.0"
 un-motion-input-ifacialmocap = { path = "../un-motion-input-ifacialmocap" }
 un-motion-input-vmc = { path = "../un-motion-input-vmc" }
 un-motion-output-vmc = { path = "../un-motion-output-vmc" }
+un-motion-output-vrc-osc = { path = "../un-motion-output-vrc-osc" }
 un-motion-record = { path = "../un-motion-record" }
 un-motion-frame-zenoh = "1.0"

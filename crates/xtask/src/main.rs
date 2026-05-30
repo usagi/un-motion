@@ -2566,6 +2566,10 @@ resolution = "{width}x{height}"
 zenohEnabled = false
 vmcEnabled = true
 vmcTargetAddr = "127.0.0.1:39539"
+vrcOscEnabled = false
+vrcOscTargetAddr = "127.0.0.1:9000"
+vrcOscSendOnlyWhenVrchatRunning = true
+vrcOscProcessPollIntervalSecs = 10
 vmcChestStabilizationEnabled = false
 vmcChestStabilizationStrength = 0.6
 zenohKeyExpr = "un-motion/frame"
@@ -2640,6 +2644,11 @@ enabled = true
 [[components.outputs]]
 id = "zenoh"
 kind = "zenoh"
+enabled = false
+
+[[components.outputs]]
+id = "vrc-osc"
+kind = "vrc-osc"
 enabled = false
 "#,
 		input_id = toml_string_value(input_id),

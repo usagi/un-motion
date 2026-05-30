@@ -8,6 +8,10 @@ resolution = "1280x720"
 zenohEnabled = true
 vmcEnabled = true
 vmcTargetAddr = "127.0.0.1:39539"
+vrcOscEnabled = false
+vrcOscTargetAddr = "127.0.0.1:9000"
+vrcOscSendOnlyWhenVrchatRunning = true
+vrcOscProcessPollIntervalSecs = 10
 vmcChestStabilizationEnabled = false
 vmcChestStabilizationStrength = 0.6
 zenohKeyExpr = "un-motion/frame"
@@ -73,3 +77,8 @@ enabled = true
 id = "zenoh"
 kind = "zenoh"
 enabled = true
+
+[[components.outputs]]
+id = "vrc-osc"
+kind = "vrc-osc"
+enabled = false
