@@ -81,7 +81,10 @@ UNMotionFrame
 [Output]
         +---- UNMF/Z  : UNMotionFrame を publish
         +---- VMC/UDP : 最後の境界で UNMotionFrame を OSC packet へ変換
+        +---- VRC (VRCFT) / OSC : Face signal を VRChat OSC Avatar Parameters へ変換
 ```
+
+VRC (VRCFT) / OSC output は issue-4 の範囲では Face signal のみを扱います。詳細は [VRC (VRCFT) / OSC Output](vrc-osc-output.md) に固定します。
 
 ## Web カメラ backend 方針
 
