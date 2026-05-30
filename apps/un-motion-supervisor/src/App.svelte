@@ -5469,7 +5469,7 @@
                       </label>
                       <label
                         class="checkbox-line"
-                        data-hint="VRChat.exeが起動している時だけ送信します。プロセス確認は下の間隔で行い、毎フレームの列挙はしません。"
+                        data-hint="VRChat OSCQueryからavatar parameterを取得できる時だけ送信します。確認は下の間隔で行います。"
                       >
                         <input
                           type="checkbox"
@@ -5484,9 +5484,9 @@
                         <span>Only while VRChat is running</span>
                       </label>
                       <label
-                        data-hint="VRChat process確認の間隔です。通常は10秒で十分です。"
+                        data-hint="VRChat OSCQueryとavatar parameter確認の間隔です。通常は10秒で十分です。"
                       >
-                        <span>Process poll interval</span>
+                        <span>OSCQuery poll interval</span>
                         <input
                           type="number"
                           min="1"

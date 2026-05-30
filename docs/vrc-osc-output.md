@@ -65,7 +65,7 @@ UNMF/Z、VMC/UDP、VRC (VRCFT) / OSC は同時出力可能です。各 output wo
 - `UNMotionFrame.signals` 内の Face / eye 系 scalar signal から VRCFaceTracking Unified Expressions parameter への変換。
 - OSC address `/avatar/parameters/<parameter>` への Float 送信。
 - 送信先 IP / port の profile 設定。
-- VRChat process 起動時のみ送信する option。
+- VRChat OSCQuery / avatar parameter が検出できる場合だけ送信する option。
 - UNMF/Z、VMC/UDP との同時出力。
 - runtime telemetry。
 - unit test と UDP receiver smoke test。
@@ -76,7 +76,7 @@ UNMF/Z、VMC/UDP、VRC (VRCFT) / OSC は同時出力可能です。各 output wo
 - VRChat input controller 送信。
 - VRChat chatbox 送信。
 - avatar OSC config JSON の自動生成や編集。
-- VRChat 側 OSC 有効状態、avatar load 状態、parameter 存在確認。
+- VRChat 側 OSC config JSON の生成や編集。
 - VRCFaceTracking アプリ本体への送信。
 
 ## 送信先
@@ -107,32 +107,31 @@ vrcOscParameterPrefix = "FT"
 
 - `vrcOscEnabled`: VRC (VRCFT) / OSC output を有効化します。
 - `vrcOscTargetAddr`: OSC datagram の送信先です。
-- `vrcOscSendOnlyWhenVrchatRunning`: VRChat process が見つかった場合だけ送信します。
-- `vrcOscProcessPollIntervalSecs`: process 一覧を再確認する間隔です。
+- `vrcOscSendOnlyWhenVrchatRunning`: VRChat OSCQuery から avatar parameter が読める場合だけ送信します。既存 profile 互換のため field 名は維持します。
+- `vrcOscProcessPollIntervalSecs`: OSCQuery / avatar parameter を再確認する間隔です。既存 profile 互換のため field 名は維持します。
 - `vrcOscParameterPrefix`: VRCFaceTracking parameter prefix です。既定は一般的な VRCFT avatar で使われる `FT` です。明示的に空文字を指定した場合は `v2/...` をそのまま送ります。
 
-`vrcOscSendOnlyWhenVrchatRunning` は既定 ON とします。VRChat は起動から avatar が動作する scene に到達するまで数十秒から数分かかることが多いため、10 秒間隔の polling で実用上十分です。毎 frame の process 列挙は禁止します。
+`vrcOscSendOnlyWhenVrchatRunning` は既定 ON とします。VRChat は起動から avatar が動作する scene に到達するまで数十秒から数分かかることが多いため、10 秒間隔の polling で実用上十分です。毎 frame の OSCQuery は行いません。
 
-## Process gate
+## OSCQuery gate
 
-`vrcOscSendOnlyWhenVrchatRunning = true` のとき、output worker は `vrcOscProcessPollIntervalSecs` ごとに VRChat process の存在を確認します。
+`vrcOscSendOnlyWhenVrchatRunning = true` のとき、output worker は `vrcOscProcessPollIntervalSecs` ごとに VRChat OSCQuery server を探し、`/avatar/parameters` を取得します。
 
-Windows では少なくとも次の process 名を検出対象にします。
+VRChat の OSCQuery HTTP server port は可変です。理想形は mDNS Service Discovery ですが、MVP 実装では Windows 上で VRChat process の localhost listen port を候補にし、`/avatar/parameters` が HTTP 200 を返す port を OSCQuery server とみなします。process 名だけで gate を開くことはしません。
 
-```text
-VRChat.exe
-VRChat
-```
-
-process が見つからない間は frame を破棄し、UDP 送信しません。これは無駄な localhost UDP traffic を抑えるための gate であり、VRChat が OSC input を受け付ける状態であることの保証ではありません。
+OSCQuery server が見つからない、または avatar parameter tree を取得できない間は frame を破棄し、UDP 送信しません。これは無駄な localhost UDP traffic を抑え、かつ avatar 側に存在しない Float / Bool parameter を送らないための gate です。
 
 検出できないもの:
 
 - VRChat の OSC が disabled。
 - VRChat の OSC input port が既定以外。
-- avatar が未ロード。
-- avatar に該当 expression parameter がない。
 - world / scene transition 中。
+
+検出して使うもの:
+
+- avatar が公開している Float parameter。
+- avatar が公開している Bool parameter。
+- `...1` / `...2` / `...4` / `...8` / `...Negative` の存在から決まる binary parameter bit 幅と sign。
 
 ## OSC packet
 
@@ -165,7 +164,7 @@ Bool(value) for <parameter>Negative / <parameter>1 / <parameter>2 / <parameter>4
 送信単位:
 
 - 1 frame の Face parameter 群を 1 OSC bundle または複数 message として 1 UDP datagram にまとめます。
-- 空の frame、Face disabled 後に送信対象がない frame、process gate で blocked の frame は送信しません。
+- 空の frame、Face disabled 後に送信対象がない frame、OSCQuery gate で blocked の frame は送信しません。
 
 ## Parameter prefix
 
@@ -191,13 +190,17 @@ prefix の前後 slash は実装側で正規化します。
 
 ## Mapping 方針
 
-実装は VMC output の blendshape map と同じ発想で、入力 signal 名から VRCFT parameter 名への route を持ちます。VRCFT avatar が Float parameter を持つ基礎項目は Float を主信号として送ります。一方で、VRCFT avatar には `TongueOut1/2/4`、`SmileFrownLeft1/2/4`、`CheekPuffLeft1/2/4` のように binary Bool 群だけで公開される項目があるため、既知の binary-only 互換項目には Bool 群も送ります。
+実装は VMC output の blendshape map と同じ発想で、入力 signal 名から VRCFT parameter 名への route を持ちます。VRCFT avatar が Float parameter を持つ基礎項目は Float を主信号として送ります。一方で、VRCFT avatar には `TongueOut1/2/4`、`SmileFrownLeft1/2/4`、`CheekPuffLeft1/2/4` のように binary Bool 群だけで公開される項目があるため、OSCQuery で実際に存在する Bool 群を見て Bool 出力を決めます。固定の 3bit / 4bit 決め打ちは fallback のみに限定します。
+
+`EyeSquintLeft` / `EyeSquintRight` は例外として、ARKit `eyeSquint` から binary Bool fallback を作りません。Webcam / MediaPipe 系の `eyeSquint` は頬上げと相関しやすく、VRCFT avatar 側では `EyeSquint*1/2/4` が強い閉眼として実装されていることがあるためです。avatar が `EyeSquint*1/2/4` しか持たない場合は、`EyeLidLeft` / `EyeLidRight` の閉眼量から Bool を作り、頬由来の squint を閉眼へ混ぜません。
 
 MVP の既定 mapping は次を優先します。
 
 1. 入力名が `v2/` を含む VRCFT parameter として扱える場合は pass-through。
 2. `face.<ARKitName>` または `<ARKitName>` を既知の Unified Expressions parameter へ mapping。
 3. `eye.left.yaw` / `eye.left.pitch` / `eye.right.yaw` / `eye.right.pitch` を `v2/EyeLeftX` などへ mapping。
+
+VRM / VMC の combined `Blink` は左右両方の `v2/EyeLidLeft` / `v2/EyeLidRight` へ展開します。`Blink_L` / `Blink_R` と ARKit `eyeBlinkLeft` / `eyeBlinkRight` は片側の `EyeLid` へ mapping します。
 
 初期候補:
 
@@ -227,7 +230,7 @@ crates/un-motion-output-vrc-osc
 
 - `UNMotionFrame` から VRC OSC packet list を生成する pure conversion。
 - VRCFT parameter mapping。
-- VRCFT Binary Bool parameter (`...Negative`, `...1`, `...2`, `...4`, `...8`)。Float がない avatar 互換項目の fallback として使う。
+- VRCFT Binary Bool parameter (`...Negative`, `...1`, `...2`, `...4`, `...8`)。OSCQuery の avatar parameter capability に合わせて bit 幅と sign を決める。
 - prefix 正規化。
 - value clamp。
 - unit tests。
@@ -263,7 +266,7 @@ spawn_vrc_osc_output_worker
 worker の責務:
 
 - UDP socket bind。
-- process gate。
+- OSCQuery gate / avatar parameter capability refresh。
 - Modifier 適用後 frame の受信。
 - VRC OSC packet 生成。
 - OSC encode。
@@ -332,8 +335,8 @@ Unit tests:
 Runtime tests:
 
 - UDP receiver に `/avatar/parameters/v2/JawOpen` が届く。
-- process gate disabled では VRChat process なしでも送信される。
-- process gate enabled かつ VRChat process なしでは送信されず skipped counter が増える。
+- OSCQuery gate disabled では VRChat OSCQuery なしでも送信される。
+- OSCQuery gate enabled かつ VRChat OSCQuery / avatar parameters が読めない場合は送信されず skipped counter が増える。
 - output worker stop event が出る。
 
 Integration / smoke:
@@ -343,7 +346,7 @@ Integration / smoke:
 
 ## 既知の制約
 
-- VRChat process の存在は OSC 受信可能性を保証しません。
-- avatar parameter が存在しない場合、VRChat 側で値は実質的に使われません。
+- Windows 版 MVP は OSCQuery port 発見時に VRChat process の localhost listen port を候補にします。mDNS Service Discovery は将来改善です。
+- avatar parameter が存在しない場合、その parameter は送信しません。
 - VRCFaceTracking documentation は更新される可能性があるため、既定 mapping は実装時と release 前に current documentation を再確認します。
 - issue-4 では Face output のみを完了条件とします。姿勢や tracker は別作業です。

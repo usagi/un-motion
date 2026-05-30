@@ -1,6 +1,6 @@
 use std::fs::{self, File};
-use std::io::BufWriter;
-use std::net::{SocketAddr, UdpSocket};
+use std::io::{BufWriter, Read, Write};
+use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{
@@ -15,7 +15,7 @@ use rosc::{OscBundle, OscMessage, OscPacket, OscTime, OscType, encoder};
 use tracing::{debug, info, warn};
 use un_motion_frame::UNMotionFrame;
 use un_motion_output_vmc::{vmc_packets_for_frame, vmc_packets_for_frame_without_ok};
-use un_motion_output_vrc_osc::{VrcOscOutputOptions, VrcOscOutputSink};
+use un_motion_output_vrc_osc::{VrcOscAvatarParameters, VrcOscOutputOptions, VrcOscOutputSink};
 use un_motion_record::MessagePackStreamRecorder;
 
 use crate::signal_enrich::{enrich_frame_with_signal_derived_motion, frame_needs_signal_derived_motion};
@@ -425,6 +425,7 @@ pub struct VrcOscOutputConfig {
 	pub send_only_when_vrchat_running: bool,
 	pub process_poll_interval: Duration,
 	pub modifier: ModifierConfig,
+	pub avatar_parameter_query_enabled: bool,
 }
 
 impl VrcOscOutputConfig {
@@ -435,6 +436,7 @@ impl VrcOscOutputConfig {
 			send_only_when_vrchat_running: true,
 			process_poll_interval: Duration::from_secs(10),
 			modifier: ModifierConfig::default(),
+			avatar_parameter_query_enabled: true,
 		}
 	}
 
@@ -451,6 +453,11 @@ impl VrcOscOutputConfig {
 
 	pub fn with_modifier(mut self, modifier: ModifierConfig) -> Self {
 		self.modifier = modifier;
+		self
+	}
+
+	pub fn with_avatar_parameter_query(mut self, enabled: bool) -> Self {
+		self.avatar_parameter_query_enabled = enabled;
 		self
 	}
 }
@@ -515,7 +522,7 @@ pub struct VrcOscOutputWorker {
 	modifier_pipeline: ModifierPipeline,
 	sink: VrcOscOutputSink,
 	stats: VrcOscOutputStats,
-	last_process_poll: Option<Instant>,
+	last_avatar_parameter_poll: Option<Instant>,
 	vrchat_detected: bool,
 }
 
@@ -530,7 +537,7 @@ impl VrcOscOutputWorker {
 			config,
 			sink,
 			stats: VrcOscOutputStats::default(),
-			last_process_poll: None,
+			last_avatar_parameter_poll: None,
 			vrchat_detected: false,
 		})
 	}
@@ -567,6 +574,7 @@ impl VrcOscOutputWorker {
 	}
 
 	fn send_unmotion_frame(&mut self, frame: &mut UNMotionFrame) -> anyhow::Result<VrcOscOutputEvent> {
+		self.refresh_avatar_parameters_if_due();
 		self.modifier_pipeline.apply(frame);
 		let (datagrams, packets) = self.sink.send(frame)?;
 		if datagrams == 0 || packets == 0 {
@@ -587,18 +595,52 @@ impl VrcOscOutputWorker {
 		})
 	}
 
+	fn refresh_avatar_parameters_if_due(&mut self) {
+		if !self.config.avatar_parameter_query_enabled {
+			if !self.config.send_only_when_vrchat_running {
+				self.vrchat_detected = true;
+			}
+			return;
+		}
+		let now = Instant::now();
+		if self
+			.last_avatar_parameter_poll
+			.is_some_and(|last| now.duration_since(last) < self.config.process_poll_interval)
+		{
+			return;
+		}
+		self.last_avatar_parameter_poll = Some(now);
+		let Some(port) = discover_vrchat_oscquery_port() else {
+			self.vrchat_detected = false;
+			return;
+		};
+		match fetch_vrchat_avatar_parameters(port) {
+			Ok(parameters) => {
+				self.sink.set_avatar_parameters(Some(parameters));
+				self.vrchat_detected = true;
+				debug!(
+					target: "un_motion_runtime::vrc_osc_output",
+					oscquery_port = port,
+					"VRC OSC avatar parameter capabilities refreshed",
+				);
+			}
+			Err(error) => {
+				self.vrchat_detected = false;
+				debug!(
+					target: "un_motion_runtime::vrc_osc_output",
+					oscquery_port = port,
+					error = %error,
+					"VRC OSC avatar parameter capability refresh failed",
+				);
+			}
+		}
+	}
+
 	fn process_gate_allows_send(&mut self) -> bool {
 		if !self.config.send_only_when_vrchat_running {
 			return true;
 		}
-		let now = Instant::now();
-		let should_poll = self
-			.last_process_poll
-			.is_none_or(|last| now.duration_since(last) >= self.config.process_poll_interval);
-		if should_poll {
-			self.vrchat_detected = vrchat_process_is_running();
-			self.last_process_poll = Some(now);
-		}
+		self.refresh_avatar_parameters_if_due();
 		self.vrchat_detected
 	}
 
@@ -709,23 +751,76 @@ fn run_vrc_osc_output_worker(
 	let _ = event_tx.send(worker.stopped_event());
 }
 
-fn vrchat_process_is_running() -> bool {
+fn fetch_vrchat_avatar_parameters(port: u16) -> anyhow::Result<VrcOscAvatarParameters> {
+	let response = http_get_loopback(port, "/avatar/parameters")?;
+	let value: serde_json::Value = serde_json::from_str(&response).context("VRChat OSCQuery avatar parameters JSON parse failed")?;
+	let mut parameters = VrcOscAvatarParameters::new();
+	collect_oscquery_avatar_parameters(&value, &mut parameters);
+	Ok(parameters)
+}
+
+fn collect_oscquery_avatar_parameters(value: &serde_json::Value, parameters: &mut VrcOscAvatarParameters) {
+	let full_path = value.get("FULL_PATH").and_then(serde_json::Value::as_str);
+	let parameter = full_path.and_then(|path| path.strip_prefix("/avatar/parameters/"));
+	let type_tag = value.get("TYPE").and_then(serde_json::Value::as_str);
+	if let (Some(parameter), Some(type_tag)) = (parameter, type_tag) {
+		match type_tag {
+			"f" => parameters.insert_float(parameter),
+			"T" | "F" => parameters.insert_bool(parameter),
+			_ => {}
+		}
+	}
+	if let Some(contents) = value.get("CONTENTS").and_then(serde_json::Value::as_object) {
+		for child in contents.values() {
+			collect_oscquery_avatar_parameters(child, parameters);
+		}
+	}
+}
+
+fn http_get_loopback(port: u16, path: &str) -> anyhow::Result<String> {
+	let mut stream = TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(250))
+		.with_context(|| format!("VRChat OSCQuery connect failed: 127.0.0.1:{port}"))?;
+	stream.set_read_timeout(Some(Duration::from_millis(750))).ok();
+	stream.set_write_timeout(Some(Duration::from_millis(250))).ok();
+	let request = format!("GET {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+	stream
+		.write_all(request.as_bytes())
+		.context("VRChat OSCQuery request write failed")?;
+	let mut response = String::new();
+	stream
+		.read_to_string(&mut response)
+		.context("VRChat OSCQuery response read failed")?;
+	let (headers, body) = response
+		.split_once("\r\n\r\n")
+		.context("VRChat OSCQuery response did not contain HTTP header terminator")?;
+	if !headers.starts_with("HTTP/1.1 200") && !headers.starts_with("HTTP/1.0 200") {
+		anyhow::bail!(
+			"VRChat OSCQuery returned non-200 response: {}",
+			headers.lines().next().unwrap_or(headers)
+		);
+	}
+	Ok(body.to_string())
+}
+
+fn discover_vrchat_oscquery_port() -> Option<u16> {
 	#[cfg(windows)]
 	{
-		let Ok(output) = Command::new("tasklist").args(["/FI", "IMAGENAME eq VRChat.exe", "/NH"]).output() else {
-			return false;
-		};
+		let script = r#"
+$p = Get-Process VRChat -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($null -eq $p) { exit 0 }
+Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+  Where-Object { $_.OwningProcess -eq $p.Id -and ($_.LocalAddress -eq '127.0.0.1' -or $_.LocalAddress -eq '0.0.0.0' -or $_.LocalAddress -eq '::1' -or $_.LocalAddress -eq '::') } |
+  Select-Object -ExpandProperty LocalPort
+"#;
+		let output = Command::new("powershell").args(["-NoProfile", "-Command", script]).output().ok()?;
 		String::from_utf8_lossy(&output.stdout)
 			.lines()
-			.any(|line| line.trim_start().to_ascii_lowercase().starts_with("vrchat.exe"))
+			.filter_map(|line| line.trim().parse::<u16>().ok())
+			.find(|port| http_get_loopback(*port, "/avatar/parameters").is_ok())
 	}
 	#[cfg(not(windows))]
 	{
-		Command::new("pgrep")
-			.args(["-x", "VRChat"])
-			.output()
-			.map(|output| output.status.success())
-			.unwrap_or(false)
+		None
 	}
 }
 
@@ -954,8 +1049,12 @@ mod tests {
 		let receiver = UdpSocket::bind("127.0.0.1:0").expect("receiver bind");
 		receiver.set_read_timeout(Some(Duration::from_millis(500))).expect("timeout");
 		let target = receiver.local_addr().expect("target");
-		let mut worker =
-			VrcOscOutputWorker::bind(VrcOscOutputConfig::new(target).with_process_gate(false, Duration::from_secs(10))).expect("worker");
+		let mut worker = VrcOscOutputWorker::bind(
+			VrcOscOutputConfig::new(target)
+				.with_process_gate(false, Duration::from_secs(10))
+				.with_avatar_parameter_query(false),
+		)
+		.expect("worker");
 
 		let mut frame = UNMotionFrame::new(1);
 		frame.face = Some(FaceMotion {
@@ -995,8 +1094,12 @@ mod tests {
 	fn vrc_osc_output_reports_skipped_empty_frame() {
 		let receiver = UdpSocket::bind("127.0.0.1:0").expect("receiver bind");
 		let target = receiver.local_addr().expect("target");
-		let mut worker =
-			VrcOscOutputWorker::bind(VrcOscOutputConfig::new(target).with_process_gate(false, Duration::from_secs(10))).expect("worker");
+		let mut worker = VrcOscOutputWorker::bind(
+			VrcOscOutputConfig::new(target)
+				.with_process_gate(false, Duration::from_secs(10))
+				.with_avatar_parameter_query(false),
+		)
+		.expect("worker");
 
 		let event = worker
 			.send_frame(VrcOscOutputFrame::UnmotionFrame(UNMotionFrame::new(1)))
