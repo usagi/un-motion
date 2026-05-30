@@ -5418,7 +5418,7 @@
                   <div class="subgroup">
                     <label
                       class="output-channel-heading"
-                      data-hint="VRC (VRCFT) / OSC: VRCFaceTracking互換のFaceパラメータをVRChat OSC Avatar Parametersへ送信します。"
+                      data-hint={$_("profiles.editor.hints.vrc_osc_sender")}
                     >
                       <input
                         type="checkbox"
@@ -5429,11 +5429,11 @@
                             (event.currentTarget as HTMLInputElement).checked,
                           )}
                       />
-                      <span>VRC (VRCFT) / OSC</span>
+                      <span>{$_("profiles.editor.vrc_osc_sender")}</span>
                     </label>
                     <div class="section-grid output-channel-fields">
                       <label
-                        data-hint="Target address: VRChat OSC inputの送信先です。通常は同じPCの127.0.0.1:9000です。"
+                        data-hint={$_("profiles.editor.hints.vrc_osc_target_address")}
                       >
                         <span>{$_("profiles.editor.target_address")}</span>
                         <input
@@ -5450,9 +5450,9 @@
                         />
                       </label>
                       <label
-                        data-hint="Parameter prefix: avatar側のVRCFT namespaceに合わせます。一般的なVRCFT avatarではFTを使います。"
+                        data-hint={$_("profiles.editor.hints.vrc_osc_parameter_prefix")}
                       >
-                        <span>Parameter prefix</span>
+                        <span>{$_("profiles.editor.parameter_prefix")}</span>
                         <input
                           type="text"
                           value={profileDetail.runtime.vrcOscParameterPrefix ??
@@ -5469,7 +5469,7 @@
                       </label>
                       <label
                         class="checkbox-line"
-                        data-hint="VRChat OSCQueryからavatar parameterを取得できる時だけ送信します。確認は下の間隔で行います。"
+                        data-hint={$_("profiles.editor.hints.vrc_osc_only_when_running")}
                       >
                         <input
                           type="checkbox"
@@ -5481,12 +5481,12 @@
                               (event.currentTarget as HTMLInputElement).checked,
                             )}
                         />
-                        <span>Only while VRChat is running</span>
+                        <span>{$_("profiles.editor.vrc_osc_only_when_running")}</span>
                       </label>
                       <label
-                        data-hint="VRChat OSCQueryとavatar parameter確認の間隔です。通常は10秒で十分です。"
+                        data-hint={$_("profiles.editor.hints.vrc_osc_poll_interval")}
                       >
-                        <span>OSCQuery poll interval</span>
+                        <span>{$_("profiles.editor.vrc_osc_poll_interval")}</span>
                         <input
                           type="number"
                           min="1"
