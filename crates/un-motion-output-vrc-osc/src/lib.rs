@@ -8,17 +8,20 @@ use un_motion_frame::{MotionSignalValue, SampleState, UNMotionFrame};
 
 const AVATAR_PARAMETER_PREFIX: &str = "/avatar/parameters/";
 const MAX_OSC_DATAGRAM_BYTES: usize = 4096;
+const BINARY_PARAMETER_DEADZONE: f32 = 0.15;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VrcOscOutputOptions {
 	pub parameter_prefix: String,
+	pub emit_binary_parameters: bool,
 }
 
 impl Default for VrcOscOutputOptions {
 	fn default() -> Self {
 		Self {
 			parameter_prefix: String::new(),
+			emit_binary_parameters: false,
 		}
 	}
 }
@@ -182,7 +185,9 @@ pub fn vrc_osc_parameters_for_frame(frame: &UNMotionFrame, options: &VrcOscOutpu
 			name: name.clone(),
 			value: VrcOscParameterValue::Float(value),
 		});
-		output.extend(binary_parameters_for(&name, value));
+		if options.emit_binary_parameters {
+			output.extend(binary_parameters_for(&name, value));
+		}
 	}
 	if face_is_live {
 		output.push(VrcOscParameter {
@@ -261,7 +266,9 @@ fn binary_parameters_for(parameter: &str, value: f32) -> Vec<VrcOscParameter> {
 		return Vec::new();
 	}
 	let magnitude = value.abs().clamp(0.0, 1.0);
-	let quantized = if magnitude >= 0.99999 {
+	let quantized = if magnitude < BINARY_PARAMETER_DEADZONE {
+		0
+	} else if magnitude >= 0.99999 {
 		15
 	} else {
 		(magnitude * 15.0).floor() as u8
@@ -269,7 +276,7 @@ fn binary_parameters_for(parameter: &str, value: f32) -> Vec<VrcOscParameter> {
 	let mut parameters = Vec::with_capacity(5);
 	parameters.push(VrcOscParameter {
 		name: format!("{parameter}Negative"),
-		value: VrcOscParameterValue::Bool(value < 0.0),
+		value: VrcOscParameterValue::Bool(value < 0.0 && quantized > 0),
 	});
 	for (bit, suffix) in [(0, "1"), (1, "2"), (2, "4"), (3, "8")] {
 		parameters.push(VrcOscParameter {
@@ -476,7 +483,7 @@ mod tests {
 
 		let packets = vrc_osc_packets_for_frame(&frame, &VrcOscOutputOptions::default());
 
-		assert_eq!(packets.len(), 10);
+		assert_eq!(packets.len(), 5);
 		assert_eq!(packet_value(&packets[0]), ("/avatar/parameters/v2/JawOpen", 0.42));
 	}
 
@@ -489,6 +496,7 @@ mod tests {
 			&frame,
 			&VrcOscOutputOptions {
 				parameter_prefix: "/ExamplePrefix/".to_string(),
+				..VrcOscOutputOptions::default()
 			},
 		);
 
@@ -507,6 +515,7 @@ mod tests {
 			&frame,
 			&VrcOscOutputOptions {
 				parameter_prefix: "FT".to_string(),
+				emit_binary_parameters: true,
 			},
 		);
 
@@ -564,6 +573,7 @@ mod tests {
 			&frame,
 			&VrcOscOutputOptions {
 				parameter_prefix: "FT".to_string(),
+				emit_binary_parameters: true,
 			},
 		);
 
@@ -572,6 +582,30 @@ mod tests {
 			bool_packet_value(&packets[1]),
 			("/avatar/parameters/FT/v2/SmileFrownLeftNegative", true)
 		);
+	}
+
+	#[test]
+	fn suppresses_low_level_binary_parameter_jitter() {
+		let mut frame = UNMotionFrame::new(1);
+		frame.signals.push(scalar("face.noseSneerLeft", 0.08));
+
+		let packets = vrc_osc_packets_for_frame(
+			&frame,
+			&VrcOscOutputOptions {
+				parameter_prefix: "FT".to_string(),
+				emit_binary_parameters: true,
+			},
+		);
+
+		assert_eq!(packet_value(&packets[0]), ("/avatar/parameters/FT/v2/NoseSneerLeft", 0.08));
+		assert_eq!(
+			bool_packet_value(&packets[1]),
+			("/avatar/parameters/FT/v2/NoseSneerLeftNegative", false)
+		);
+		assert_eq!(bool_packet_value(&packets[2]), ("/avatar/parameters/FT/v2/NoseSneerLeft1", false));
+		assert_eq!(bool_packet_value(&packets[3]), ("/avatar/parameters/FT/v2/NoseSneerLeft2", false));
+		assert_eq!(bool_packet_value(&packets[4]), ("/avatar/parameters/FT/v2/NoseSneerLeft4", false));
+		assert_eq!(bool_packet_value(&packets[5]), ("/avatar/parameters/FT/v2/NoseSneerLeft8", false));
 	}
 
 	#[test]

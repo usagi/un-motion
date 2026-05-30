@@ -523,6 +523,7 @@ impl VrcOscOutputWorker {
 	pub fn bind(config: VrcOscOutputConfig) -> anyhow::Result<Self> {
 		let sink = VrcOscOutputSink::new(config.target_addr)?.with_options(VrcOscOutputOptions {
 			parameter_prefix: config.parameter_prefix.clone(),
+			..VrcOscOutputOptions::default()
 		});
 		Ok(Self {
 			modifier_pipeline: ModifierPipeline::from_config(&config.modifier),
@@ -977,7 +978,7 @@ mod tests {
 			event,
 			VrcOscOutputEvent::Sent {
 				datagrams: 1,
-				packets: 10,
+				packets: 5,
 				..
 			}
 		));
