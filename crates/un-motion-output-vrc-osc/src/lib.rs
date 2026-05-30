@@ -125,8 +125,8 @@ fn map_expression_name(name: &str, value: f32, options: &VrcOscOutputOptions) ->
 	if let Some(parameter) = normalize_vrcft_parameter_name(name, options) {
 		return Some((parameter, clamp_for_parameter(name, value)));
 	}
-	let normalized = normalize_input_name(name);
-	let route = arkit_to_vrcft_route(normalized)?;
+	let normalized = normalize_input_name(name).to_ascii_lowercase();
+	let route = arkit_to_vrcft_route(&normalized)?;
 	let mut value = value;
 	if route.invert_openness {
 		value = 0.75 * (1.0 - value.clamp(0.0, 1.0));
@@ -192,50 +192,52 @@ impl VrcftRoute {
 
 fn arkit_to_vrcft_route(name: &str) -> Option<VrcftRoute> {
 	let route = match name {
-		"eyeBlinkLeft" => VrcftRoute::inverted_openness("v2/EyeLidLeft"),
-		"eyeBlinkRight" => VrcftRoute::inverted_openness("v2/EyeLidRight"),
-		"eyeLookOutLeft" | "eyeLookInRight" | "eye.left.yaw" => VrcftRoute::new("v2/EyeLeftX"),
-		"eyeLookInLeft" | "eyeLookOutRight" | "eye.right.yaw" => VrcftRoute::new("v2/EyeRightX"),
-		"eyeLookUpLeft" | "eye.left.pitch" => VrcftRoute::new("v2/EyeLeftY"),
-		"eyeLookUpRight" | "eye.right.pitch" => VrcftRoute::new("v2/EyeRightY"),
-		"eyeSquintLeft" => VrcftRoute::new("v2/EyeSquintLeft"),
-		"eyeSquintRight" => VrcftRoute::new("v2/EyeSquintRight"),
-		"browDownLeft" => VrcftRoute::new("v2/BrowLowererLeft"),
-		"browDownRight" => VrcftRoute::new("v2/BrowLowererRight"),
-		"browInnerUp" => VrcftRoute::new("v2/BrowInnerUp"),
-		"browOuterUpLeft" => VrcftRoute::new("v2/BrowOuterUpLeft"),
-		"browOuterUpRight" => VrcftRoute::new("v2/BrowOuterUpRight"),
-		"cheekPuff" => VrcftRoute::new("v2/CheekPuffSuck"),
-		"cheekSquintLeft" => VrcftRoute::new("v2/CheekSquintLeft"),
-		"cheekSquintRight" => VrcftRoute::new("v2/CheekSquintRight"),
-		"jawOpen" => VrcftRoute::new("v2/JawOpen"),
-		"jawForward" => VrcftRoute::new("v2/JawZ"),
-		"jawLeft" | "jawRight" => VrcftRoute::new("v2/JawX"),
-		"mouthClose" => VrcftRoute::new("v2/MouthClosed"),
-		"mouthFunnel" => VrcftRoute::new("v2/LipFunnel"),
-		"mouthPucker" => VrcftRoute::new("v2/LipPucker"),
-		"mouthLeft" | "mouthRight" => VrcftRoute::new("v2/MouthX"),
-		"mouthSmileLeft" => VrcftRoute::new("v2/MouthSmileLeft"),
-		"mouthSmileRight" => VrcftRoute::new("v2/MouthSmileRight"),
-		"mouthFrownLeft" => VrcftRoute::new("v2/MouthSadLeft"),
-		"mouthFrownRight" => VrcftRoute::new("v2/MouthSadRight"),
-		"mouthDimpleLeft" => VrcftRoute::new("v2/MouthDimpleLeft"),
-		"mouthDimpleRight" => VrcftRoute::new("v2/MouthDimpleRight"),
-		"mouthStretchLeft" => VrcftRoute::new("v2/MouthStretchLeft"),
-		"mouthStretchRight" => VrcftRoute::new("v2/MouthStretchRight"),
-		"mouthRollLower" => VrcftRoute::new("v2/LipSuckLower"),
-		"mouthRollUpper" => VrcftRoute::new("v2/LipSuckUpper"),
-		"mouthShrugLower" => VrcftRoute::new("v2/MouthRaiserLower"),
-		"mouthShrugUpper" => VrcftRoute::new("v2/MouthRaiserUpper"),
-		"mouthPressLeft" => VrcftRoute::new("v2/MouthPressLeft"),
-		"mouthPressRight" => VrcftRoute::new("v2/MouthPressRight"),
-		"mouthLowerDownLeft" => VrcftRoute::new("v2/MouthLowerDownLeft"),
-		"mouthLowerDownRight" => VrcftRoute::new("v2/MouthLowerDownRight"),
-		"mouthUpperUpLeft" => VrcftRoute::new("v2/MouthUpperUpLeft"),
-		"mouthUpperUpRight" => VrcftRoute::new("v2/MouthUpperUpRight"),
-		"noseSneerLeft" => VrcftRoute::new("v2/NoseSneerLeft"),
-		"noseSneerRight" => VrcftRoute::new("v2/NoseSneerRight"),
-		"tongueOut" => VrcftRoute::new("v2/TongueOut"),
+		"eyeblinkleft" | "blink_l" => VrcftRoute::inverted_openness("v2/EyeLidLeft"),
+		"eyeblinkright" | "blink_r" => VrcftRoute::inverted_openness("v2/EyeLidRight"),
+		"eyelookoutleft" | "eyelookinright" | "eye.left.yaw" => VrcftRoute::new("v2/EyeLeftX"),
+		"eyelookinleft" | "eyelookoutright" | "eye.right.yaw" => VrcftRoute::new("v2/EyeRightX"),
+		"eyelookupleft" | "eye.left.pitch" => VrcftRoute::new("v2/EyeLeftY"),
+		"eyelookupright" | "eye.right.pitch" => VrcftRoute::new("v2/EyeRightY"),
+		"eyesquintleft" => VrcftRoute::new("v2/EyeSquintLeft"),
+		"eyesquintright" => VrcftRoute::new("v2/EyeSquintRight"),
+		"eyewideleft" => VrcftRoute::new("v2/EyeWideLeft"),
+		"eyewideright" => VrcftRoute::new("v2/EyeWideRight"),
+		"browdownleft" => VrcftRoute::new("v2/BrowLowererLeft"),
+		"browdownright" => VrcftRoute::new("v2/BrowLowererRight"),
+		"browinnerup" => VrcftRoute::new("v2/BrowInnerUp"),
+		"browouterupleft" => VrcftRoute::new("v2/BrowOuterUpLeft"),
+		"browouterupright" => VrcftRoute::new("v2/BrowOuterUpRight"),
+		"cheekpuff" => VrcftRoute::new("v2/CheekPuffSuck"),
+		"cheeksquintleft" => VrcftRoute::new("v2/CheekSquintLeft"),
+		"cheeksquintright" => VrcftRoute::new("v2/CheekSquintRight"),
+		"jawopen" => VrcftRoute::new("v2/JawOpen"),
+		"jawforward" => VrcftRoute::new("v2/JawZ"),
+		"jawleft" | "jawright" => VrcftRoute::new("v2/JawX"),
+		"mouthclose" => VrcftRoute::new("v2/MouthClosed"),
+		"mouthfunnel" => VrcftRoute::new("v2/LipFunnel"),
+		"mouthpucker" => VrcftRoute::new("v2/LipPucker"),
+		"mouthleft" | "mouthright" => VrcftRoute::new("v2/MouthX"),
+		"mouthsmileleft" => VrcftRoute::new("v2/MouthSmileLeft"),
+		"mouthsmileright" => VrcftRoute::new("v2/MouthSmileRight"),
+		"mouthfrownleft" => VrcftRoute::new("v2/MouthSadLeft"),
+		"mouthfrownright" => VrcftRoute::new("v2/MouthSadRight"),
+		"mouthdimpleleft" => VrcftRoute::new("v2/MouthDimpleLeft"),
+		"mouthdimpleright" => VrcftRoute::new("v2/MouthDimpleRight"),
+		"mouthstretchleft" => VrcftRoute::new("v2/MouthStretchLeft"),
+		"mouthstretchright" => VrcftRoute::new("v2/MouthStretchRight"),
+		"mouthrolllower" => VrcftRoute::new("v2/LipSuckLower"),
+		"mouthrollupper" => VrcftRoute::new("v2/LipSuckUpper"),
+		"mouthshruglower" => VrcftRoute::new("v2/MouthRaiserLower"),
+		"mouthshrugupper" => VrcftRoute::new("v2/MouthRaiserUpper"),
+		"mouthpressleft" => VrcftRoute::new("v2/MouthPressLeft"),
+		"mouthpressright" => VrcftRoute::new("v2/MouthPressRight"),
+		"mouthlowerdownleft" => VrcftRoute::new("v2/MouthLowerDownLeft"),
+		"mouthlowerdownright" => VrcftRoute::new("v2/MouthLowerDownRight"),
+		"mouthupperupleft" => VrcftRoute::new("v2/MouthUpperUpLeft"),
+		"mouthupperupright" => VrcftRoute::new("v2/MouthUpperUpRight"),
+		"nosesneerleft" => VrcftRoute::new("v2/NoseSneerLeft"),
+		"nosesneerright" => VrcftRoute::new("v2/NoseSneerRight"),
+		"tongueout" => VrcftRoute::new("v2/TongueOut"),
 		_ => return None,
 	};
 	Some(route)
@@ -323,7 +325,7 @@ mod tests {
 			tracking_state: TrackingState::Valid,
 			confidence: 1.0,
 			head: None,
-			expressions: vec![expression("jawOpen", 0.42)],
+			expressions: vec![expression("JawOpen", 0.42)],
 		});
 
 		let packets = vrc_osc_packets_for_frame(&frame, &VrcOscOutputOptions::default());
@@ -363,7 +365,7 @@ mod tests {
 	#[test]
 	fn converts_blink_to_vrcft_eye_lid_openness() {
 		let mut frame = UNMotionFrame::new(1);
-		frame.signals.push(scalar("face.eyeBlinkLeft", 1.0));
+		frame.signals.push(scalar("Blink_L", 1.0));
 
 		let packets = vrc_osc_packets_for_frame(&frame, &VrcOscOutputOptions::default());
 
