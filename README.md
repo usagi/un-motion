@@ -66,7 +66,7 @@ U.N. Motion は Web カメラでアバターを動かしたり、他のアプリ
 ```sh
 cargo xtask verify
 cargo run
-cargo xtask make-release-package --version 1.0.1
+cargo xtask make-release-package --version 1.1.0
 ```
 
 MediaPipe Native DLL を更新する場合:

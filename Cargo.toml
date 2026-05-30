@@ -35,7 +35,7 @@ default-members = ["apps/un-motion-supervisor/src-tauri"]
 resolver = "2"
 
 [workspace.package]
-version = "1.0.1"
+version = "1.1.0"
 edition = "2024"
 authors = ["usagi / USAGI.NETWORK"]
 license = "MIT"

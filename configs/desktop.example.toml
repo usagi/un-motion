@@ -12,6 +12,7 @@ vrcOscEnabled = false
 vrcOscTargetAddr = "127.0.0.1:9000"
 vrcOscSendOnlyWhenVrchatRunning = true
 vrcOscProcessPollIntervalSecs = 10
+vrcOscParameterPrefix = "FT"
 vmcChestStabilizationEnabled = false
 vmcChestStabilizationStrength = 0.6
 zenohKeyExpr = "un-motion/frame"
