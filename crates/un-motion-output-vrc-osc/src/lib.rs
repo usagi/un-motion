@@ -21,7 +21,7 @@ impl Default for VrcOscOutputOptions {
 	fn default() -> Self {
 		Self {
 			parameter_prefix: String::new(),
-			emit_binary_parameters: false,
+			emit_binary_parameters: true,
 		}
 	}
 }
@@ -156,7 +156,7 @@ pub fn vrc_osc_parameters_for_frame(frame: &UNMotionFrame, options: &VrcOscOutpu
 				if sample_state_is_usable(expression.state)
 					&& let Some((name, value)) = map_expression_name(&expression.name, expression.value, options)
 				{
-					parameters.insert(name, value);
+					merge_parameter_value(&mut parameters, name, value);
 				}
 			}
 		}
@@ -168,12 +168,12 @@ pub fn vrc_osc_parameters_for_frame(frame: &UNMotionFrame, options: &VrcOscOutpu
 		match signal.value {
 			MotionSignalValue::Scalar(value) => {
 				if let Some((name, value)) = map_expression_name(&signal.name, value, options) {
-					parameters.entry(name).or_insert(value);
+					merge_parameter_value(&mut parameters, name, value);
 				}
 			}
 			MotionSignalValue::Bool(value) => {
 				if let Some(name) = normalize_vrcft_parameter_name(&signal.name, options) {
-					parameters.entry(name).or_insert(if value { 1.0 } else { 0.0 });
+					merge_parameter_value(&mut parameters, name, if value { 1.0 } else { 0.0 });
 				}
 			}
 			_ => {}
@@ -186,7 +186,7 @@ pub fn vrc_osc_parameters_for_frame(frame: &UNMotionFrame, options: &VrcOscOutpu
 			value: VrcOscParameterValue::Float(value),
 		});
 		if options.emit_binary_parameters {
-			output.extend(binary_parameters_for(&name, value));
+			output.extend(binary_parameters_for(&binary_parameter_name_for(&name), value));
 		}
 	}
 	if face_is_live {
@@ -208,6 +208,17 @@ pub fn vrc_osc_parameters_for_frame(frame: &UNMotionFrame, options: &VrcOscOutpu
 		});
 	}
 	output
+}
+
+fn merge_parameter_value(parameters: &mut BTreeMap<String, f32>, name: String, value: f32) {
+	parameters
+		.entry(name)
+		.and_modify(|current| {
+			if value.abs() > current.abs() {
+				*current = value;
+			}
+		})
+		.or_insert(value);
 }
 
 fn sample_state_is_usable(state: SampleState) -> bool {
@@ -262,7 +273,7 @@ fn apply_parameter_prefix(parameter: &str, prefix: &str) -> String {
 }
 
 fn binary_parameters_for(parameter: &str, value: f32) -> Vec<VrcOscParameter> {
-	if !parameter.contains("/v2/") && !parameter.starts_with("v2/") {
+	if !binary_parameter_is_supported(parameter) {
 		return Vec::new();
 	}
 	let magnitude = value.abs().clamp(0.0, 1.0);
@@ -285,6 +296,51 @@ fn binary_parameters_for(parameter: &str, value: f32) -> Vec<VrcOscParameter> {
 		});
 	}
 	parameters
+}
+
+fn binary_parameter_name_for(parameter: &str) -> String {
+	let Some((prefix, base)) = parameter.rsplit_once('/') else {
+		return parameter.to_string();
+	};
+	let binary_base = match base {
+		"BrowLowererLeft" | "BrowOuterUpLeft" | "BrowInnerUp" => "BrowExpressionLeft",
+		"BrowLowererRight" | "BrowOuterUpRight" => "BrowExpressionRight",
+		"CheekPuffSuck" | "CheekPuffSuckLeft" | "CheekPuffSuckRight" => "CheekPuffLeft",
+		"MouthLowerDownLeft" | "MouthLowerDownRight" => "MouthLowerDown",
+		"MouthUpperUpLeft" | "MouthUpperUpRight" => "MouthUpperUp",
+		"MouthPressLeft" | "MouthPressRight" => "MouthPress",
+		"NoseSneerLeft" | "NoseSneerRight" => "NoseSneer",
+		other => other,
+	};
+	format!("{prefix}/{binary_base}")
+}
+
+fn binary_parameter_is_supported(parameter: &str) -> bool {
+	let parameter = parameter.rsplit('/').next().unwrap_or(parameter);
+	matches!(
+		parameter,
+		"BrowExpressionLeft"
+			| "BrowExpressionRight"
+			| "CheekPuffLeft"
+			| "EyeSquintLeft"
+			| "EyeSquintRight"
+			| "JawForward"
+			| "JawX" | "LipFunnel"
+			| "LipPucker"
+			| "LipSuckLower"
+			| "LipSuckUpper"
+			| "MouthLowerDown"
+			| "MouthPress"
+			| "MouthRaiserLower"
+			| "MouthRaiserUpper"
+			| "MouthStretchLeft"
+			| "MouthStretchRight"
+			| "MouthX"
+			| "NoseSneer"
+			| "SmileFrownLeft"
+			| "SmileFrownRight"
+			| "TongueOut"
+	)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -531,6 +587,37 @@ mod tests {
 	}
 
 	#[test]
+	fn emits_binary_fallback_by_default_for_binary_only_vrcft_shapes() {
+		let mut frame = UNMotionFrame::new(1);
+		frame.signals.push(scalar("face.tongueOut", 0.42));
+		frame.signals.push(scalar("face.cheekPuff", 0.5));
+
+		let packets = vrc_osc_packets_for_frame(
+			&frame,
+			&VrcOscOutputOptions {
+				parameter_prefix: "FT".to_string(),
+				..VrcOscOutputOptions::default()
+			},
+		);
+
+		assert!(
+			packets
+				.iter()
+				.any(|packet| try_bool_packet_value(packet) == Some(("/avatar/parameters/FT/v2/TongueOut2", true)))
+		);
+		assert!(
+			packets
+				.iter()
+				.any(|packet| try_bool_packet_value(packet) == Some(("/avatar/parameters/FT/v2/CheekPuffLeft4", true)))
+		);
+		assert!(
+			packets
+				.iter()
+				.all(|packet| try_bool_packet_value(packet) != Some(("/avatar/parameters/FT/v2/JawOpen1", true)))
+		);
+	}
+
+	#[test]
 	fn emits_tracking_active_and_expression_enable_flags() {
 		let mut frame = UNMotionFrame::new(1);
 		frame.face = Some(FaceMotion {
@@ -600,12 +687,12 @@ mod tests {
 		assert_eq!(packet_value(&packets[0]), ("/avatar/parameters/FT/v2/NoseSneerLeft", 0.08));
 		assert_eq!(
 			bool_packet_value(&packets[1]),
-			("/avatar/parameters/FT/v2/NoseSneerLeftNegative", false)
+			("/avatar/parameters/FT/v2/NoseSneerNegative", false)
 		);
-		assert_eq!(bool_packet_value(&packets[2]), ("/avatar/parameters/FT/v2/NoseSneerLeft1", false));
-		assert_eq!(bool_packet_value(&packets[3]), ("/avatar/parameters/FT/v2/NoseSneerLeft2", false));
-		assert_eq!(bool_packet_value(&packets[4]), ("/avatar/parameters/FT/v2/NoseSneerLeft4", false));
-		assert_eq!(bool_packet_value(&packets[5]), ("/avatar/parameters/FT/v2/NoseSneerLeft8", false));
+		assert_eq!(bool_packet_value(&packets[2]), ("/avatar/parameters/FT/v2/NoseSneer1", false));
+		assert_eq!(bool_packet_value(&packets[3]), ("/avatar/parameters/FT/v2/NoseSneer2", false));
+		assert_eq!(bool_packet_value(&packets[4]), ("/avatar/parameters/FT/v2/NoseSneer4", false));
+		assert_eq!(bool_packet_value(&packets[5]), ("/avatar/parameters/FT/v2/NoseSneer8", false));
 	}
 
 	#[test]

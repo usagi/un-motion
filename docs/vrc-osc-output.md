@@ -191,7 +191,7 @@ prefix の前後 slash は実装側で正規化します。
 
 ## Mapping 方針
 
-実装は VMC output の blendshape map と同じ発想で、入力 signal 名から VRCFT parameter 名への route を持ちます。VRCFaceTracking と同じく Float parameter と Binary Bool parameter の両方を送ります。
+実装は VMC output の blendshape map と同じ発想で、入力 signal 名から VRCFT parameter 名への route を持ちます。VRCFT avatar が Float parameter を持つ基礎項目は Float を主信号として送ります。一方で、VRCFT avatar には `TongueOut1/2/4`、`SmileFrownLeft1/2/4`、`CheekPuffLeft1/2/4` のように binary Bool 群だけで公開される項目があるため、既知の binary-only 互換項目には Bool 群も送ります。
 
 MVP の既定 mapping は次を優先します。
 
@@ -227,7 +227,7 @@ crates/un-motion-output-vrc-osc
 
 - `UNMotionFrame` から VRC OSC packet list を生成する pure conversion。
 - VRCFT parameter mapping。
-- VRCFT Binary Bool parameter (`...Negative`, `...1`, `...2`, `...4`, `...8`)。
+- VRCFT Binary Bool parameter (`...Negative`, `...1`, `...2`, `...4`, `...8`)。Float がない avatar 互換項目の fallback として使う。
 - prefix 正規化。
 - value clamp。
 - unit tests。
