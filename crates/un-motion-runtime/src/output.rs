@@ -15,7 +15,7 @@ use rosc::{OscBundle, OscMessage, OscPacket, OscTime, OscType, encoder};
 use tracing::{debug, info, warn};
 use un_motion_frame::UNMotionFrame;
 use un_motion_output_vmc::{vmc_packets_for_frame, vmc_packets_for_frame_without_ok};
-use un_motion_output_vrc_osc::{VrcOscOutputOptions, vrc_osc_packets_for_frame};
+use un_motion_output_vrc_osc::{VrcOscOutputOptions, VrcOscOutputSink};
 use un_motion_record::MessagePackStreamRecorder;
 
 use crate::signal_enrich::{enrich_frame_with_signal_derived_motion, frame_needs_signal_derived_motion};
@@ -513,7 +513,7 @@ pub enum VrcOscOutputEvent {
 pub struct VrcOscOutputWorker {
 	config: VrcOscOutputConfig,
 	modifier_pipeline: ModifierPipeline,
-	socket: UdpSocket,
+	sink: VrcOscOutputSink,
 	stats: VrcOscOutputStats,
 	last_process_poll: Option<Instant>,
 	vrchat_detected: bool,
@@ -521,11 +521,13 @@ pub struct VrcOscOutputWorker {
 
 impl VrcOscOutputWorker {
 	pub fn bind(config: VrcOscOutputConfig) -> anyhow::Result<Self> {
-		let socket = UdpSocket::bind("0.0.0.0:0").context("VRC OSC output UDP socket bind failed")?;
+		let sink = VrcOscOutputSink::new(config.target_addr)?.with_options(VrcOscOutputOptions {
+			parameter_prefix: config.parameter_prefix.clone(),
+		});
 		Ok(Self {
 			modifier_pipeline: ModifierPipeline::from_config(&config.modifier),
 			config,
-			socket,
+			sink,
 			stats: VrcOscOutputStats::default(),
 			last_process_poll: None,
 			vrchat_detected: false,
@@ -565,13 +567,8 @@ impl VrcOscOutputWorker {
 
 	fn send_unmotion_frame(&mut self, frame: &mut UNMotionFrame) -> anyhow::Result<VrcOscOutputEvent> {
 		self.modifier_pipeline.apply(frame);
-		let packets = vrc_osc_packets_for_frame(
-			frame,
-			&VrcOscOutputOptions {
-				parameter_prefix: self.config.parameter_prefix.clone(),
-			},
-		);
-		if packets.is_empty() {
+		let (datagrams, packets) = self.sink.send(frame)?;
+		if datagrams == 0 || packets == 0 {
 			self.stats.skipped_frames = self.stats.skipped_frames.saturating_add(1);
 			return Ok(VrcOscOutputEvent::Skipped {
 				target_addr: self.config.target_addr,
@@ -579,21 +576,12 @@ impl VrcOscOutputWorker {
 				vrchat_detected: self.vrchat_detected,
 			});
 		}
-		let packet_count = packets.len() as u64;
-		let encoded = encoder::encode(&OscPacket::Bundle(OscBundle {
-			timetag: OscTime { seconds: 0, fractional: 1 },
-			content: packets,
-		}))
-		.context("VRC OSC encode failed")?;
-		self.socket
-			.send_to(&encoded, self.config.target_addr)
-			.with_context(|| format!("VRC OSC UDP send failed: {}", self.config.target_addr))?;
-		self.stats.sent_datagrams = self.stats.sent_datagrams.saturating_add(1);
-		self.stats.sent_packets = self.stats.sent_packets.saturating_add(packet_count);
+		self.stats.sent_datagrams = self.stats.sent_datagrams.saturating_add(datagrams);
+		self.stats.sent_packets = self.stats.sent_packets.saturating_add(packets);
 		Ok(VrcOscOutputEvent::Sent {
 			target_addr: self.config.target_addr,
-			datagrams: 1,
-			packets: packet_count,
+			datagrams,
+			packets,
 			vrchat_detected: self.vrchat_detected,
 		})
 	}

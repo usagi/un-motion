@@ -40,6 +40,7 @@ pub struct VrcOscOutputSink {
 	socket: UdpSocket,
 	target: SocketAddr,
 	options: VrcOscOutputOptions,
+	last_values: BTreeMap<String, VrcOscParameterValue>,
 }
 
 impl VrcOscOutputSink {
@@ -49,6 +50,7 @@ impl VrcOscOutputSink {
 			socket,
 			target,
 			options: VrcOscOutputOptions::default(),
+			last_values: BTreeMap::new(),
 		})
 	}
 
@@ -57,8 +59,8 @@ impl VrcOscOutputSink {
 		self
 	}
 
-	pub fn send(&self, frame: &UNMotionFrame) -> anyhow::Result<(u64, u64)> {
-		let packets = vrc_osc_packets_for_frame(frame, &self.options);
+	pub fn send(&mut self, frame: &UNMotionFrame) -> anyhow::Result<(u64, u64)> {
+		let packets = self.changed_packets_for_frame(frame);
 		if packets.is_empty() {
 			return Ok((0, 0));
 		}
@@ -71,6 +73,28 @@ impl VrcOscOutputSink {
 				.with_context(|| format!("VRC OSC UDP send failed: {}", self.target))?;
 		}
 		Ok((datagram_count, packet_count))
+	}
+
+	fn changed_packets_for_frame(&mut self, frame: &UNMotionFrame) -> Vec<OscPacket> {
+		let parameters = vrc_osc_parameters_for_frame(frame, &self.options);
+		let mut packets = Vec::new();
+		for parameter in parameters {
+			let old = self.last_values.get(&parameter.name).copied();
+			if old.is_some_and(|old| parameter_value_unchanged(old, parameter.value)) {
+				continue;
+			}
+			self.last_values.insert(parameter.name.clone(), parameter.value);
+			packets.push(vrc_osc_packet_for_parameter(parameter));
+		}
+		packets
+	}
+}
+
+fn parameter_value_unchanged(old: VrcOscParameterValue, new: VrcOscParameterValue) -> bool {
+	match (old, new) {
+		(VrcOscParameterValue::Bool(old), VrcOscParameterValue::Bool(new)) => old == new,
+		(VrcOscParameterValue::Float(old), VrcOscParameterValue::Float(new)) => (old - new).abs() < 0.0005,
+		_ => false,
 	}
 }
 
@@ -104,17 +128,19 @@ fn encode_bundle(content: Vec<OscPacket>) -> Result<Vec<u8>, rosc::OscError> {
 pub fn vrc_osc_packets_for_frame(frame: &UNMotionFrame, options: &VrcOscOutputOptions) -> Vec<OscPacket> {
 	vrc_osc_parameters_for_frame(frame, options)
 		.into_iter()
-		.map(|parameter| {
-			let arg = match parameter.value {
-				VrcOscParameterValue::Float(value) => OscType::Float(value),
-				VrcOscParameterValue::Bool(value) => OscType::Bool(value),
-			};
-			OscPacket::Message(OscMessage {
-				addr: format!("{AVATAR_PARAMETER_PREFIX}{}", parameter.name),
-				args: vec![arg],
-			})
-		})
+		.map(vrc_osc_packet_for_parameter)
 		.collect()
+}
+
+fn vrc_osc_packet_for_parameter(parameter: VrcOscParameter) -> OscPacket {
+	let arg = match parameter.value {
+		VrcOscParameterValue::Float(value) => OscType::Float(value),
+		VrcOscParameterValue::Bool(value) => OscType::Bool(value),
+	};
+	OscPacket::Message(OscMessage {
+		addr: format!("{AVATAR_PARAMETER_PREFIX}{}", parameter.name),
+		args: vec![arg],
+	})
 }
 
 pub fn vrc_osc_parameters_for_frame(frame: &UNMotionFrame, options: &VrcOscOutputOptions) -> Vec<VrcOscParameter> {
