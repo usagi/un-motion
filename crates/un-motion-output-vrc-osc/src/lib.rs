@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use un_motion_frame::{MotionSignalValue, SampleState, UNMotionFrame};
 
 const AVATAR_PARAMETER_PREFIX: &str = "/avatar/parameters/";
+const MAX_OSC_DATAGRAM_BYTES: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -62,16 +63,42 @@ impl VrcOscOutputSink {
 			return Ok((0, 0));
 		}
 		let packet_count = packets.len() as u64;
-		let encoded = encoder::encode(&OscPacket::Bundle(OscBundle {
-			timetag: OscTime { seconds: 0, fractional: 1 },
-			content: packets,
-		}))
-		.context("VRC OSC encode failed")?;
-		self.socket
-			.send_to(&encoded, self.target)
-			.with_context(|| format!("VRC OSC UDP send failed: {}", self.target))?;
-		Ok((1, packet_count))
+		let datagrams = encode_packet_chunks(packets)?;
+		let datagram_count = datagrams.len() as u64;
+		for encoded in datagrams {
+			self.socket
+				.send_to(&encoded, self.target)
+				.with_context(|| format!("VRC OSC UDP send failed: {}", self.target))?;
+		}
+		Ok((datagram_count, packet_count))
 	}
+}
+
+fn encode_packet_chunks(packets: Vec<OscPacket>) -> anyhow::Result<Vec<Vec<u8>>> {
+	let mut datagrams = Vec::new();
+	let mut chunk = Vec::<OscPacket>::new();
+	for packet in packets {
+		let mut candidate = chunk.clone();
+		candidate.push(packet.clone());
+		let encoded = encode_bundle(candidate).context("VRC OSC encode failed")?;
+		if encoded.len() <= MAX_OSC_DATAGRAM_BYTES || chunk.is_empty() {
+			chunk.push(packet);
+			continue;
+		}
+		datagrams.push(encode_bundle(std::mem::take(&mut chunk)).context("VRC OSC encode failed")?);
+		chunk.push(packet);
+	}
+	if !chunk.is_empty() {
+		datagrams.push(encode_bundle(chunk).context("VRC OSC encode failed")?);
+	}
+	Ok(datagrams)
+}
+
+fn encode_bundle(content: Vec<OscPacket>) -> Result<Vec<u8>, rosc::OscError> {
+	encoder::encode(&OscPacket::Bundle(OscBundle {
+		timetag: OscTime { seconds: 0, fractional: 1 },
+		content,
+	}))
 }
 
 pub fn vrc_osc_packets_for_frame(frame: &UNMotionFrame, options: &VrcOscOutputOptions) -> Vec<OscPacket> {
@@ -92,8 +119,10 @@ pub fn vrc_osc_packets_for_frame(frame: &UNMotionFrame, options: &VrcOscOutputOp
 
 pub fn vrc_osc_parameters_for_frame(frame: &UNMotionFrame, options: &VrcOscOutputOptions) -> Vec<VrcOscParameter> {
 	let mut parameters = BTreeMap::<String, f32>::new();
+	let mut face_is_live = false;
 	if let Some(face) = &frame.face {
 		if face.tracking_state != un_motion_frame::TrackingState::Lost {
+			face_is_live = true;
 			for expression in &face.expressions {
 				if sample_state_is_usable(expression.state)
 					&& let Some((name, value)) = map_expression_name(&expression.name, expression.value, options)
@@ -128,6 +157,24 @@ pub fn vrc_osc_parameters_for_frame(frame: &UNMotionFrame, options: &VrcOscOutpu
 			value: VrcOscParameterValue::Float(value),
 		});
 		output.extend(binary_parameters_for(&name, value));
+	}
+	if face_is_live {
+		output.push(VrcOscParameter {
+			name: "EyeTrackingActive".to_string(),
+			value: VrcOscParameterValue::Bool(true),
+		});
+		output.push(VrcOscParameter {
+			name: "ExpressionTrackingActive".to_string(),
+			value: VrcOscParameterValue::Bool(true),
+		});
+		output.push(VrcOscParameter {
+			name: "LipTrackingActive".to_string(),
+			value: VrcOscParameterValue::Bool(true),
+		});
+		output.push(VrcOscParameter {
+			name: "FacialExpressionsDisabled".to_string(),
+			value: VrcOscParameterValue::Bool(false),
+		});
 	}
 	output
 }
@@ -381,6 +428,16 @@ mod tests {
 		(&message.addr, value)
 	}
 
+	fn try_bool_packet_value(packet: &OscPacket) -> Option<(&str, bool)> {
+		let OscPacket::Message(message) = packet else {
+			return None;
+		};
+		let OscType::Bool(value) = message.args[0] else {
+			return None;
+		};
+		Some((&message.addr, value))
+	}
+
 	#[test]
 	fn maps_arkit_expression_to_vrcft_avatar_parameter() {
 		let mut frame = UNMotionFrame::new(1);
@@ -393,7 +450,7 @@ mod tests {
 
 		let packets = vrc_osc_packets_for_frame(&frame, &VrcOscOutputOptions::default());
 
-		assert_eq!(packets.len(), 6);
+		assert_eq!(packets.len(), 10);
 		assert_eq!(packet_value(&packets[0]), ("/avatar/parameters/v2/JawOpen", 0.42));
 	}
 
@@ -439,6 +496,40 @@ mod tests {
 	}
 
 	#[test]
+	fn emits_tracking_active_and_expression_enable_flags() {
+		let mut frame = UNMotionFrame::new(1);
+		frame.face = Some(FaceMotion {
+			tracking_state: TrackingState::Valid,
+			confidence: 1.0,
+			head: None,
+			expressions: vec![expression("JawOpen", 0.42)],
+		});
+
+		let packets = vrc_osc_packets_for_frame(&frame, &VrcOscOutputOptions::default());
+
+		assert!(
+			packets
+				.iter()
+				.any(|packet| try_bool_packet_value(packet) == Some(("/avatar/parameters/EyeTrackingActive", true)))
+		);
+		assert!(
+			packets
+				.iter()
+				.any(|packet| try_bool_packet_value(packet) == Some(("/avatar/parameters/ExpressionTrackingActive", true)))
+		);
+		assert!(
+			packets
+				.iter()
+				.any(|packet| try_bool_packet_value(packet) == Some(("/avatar/parameters/LipTrackingActive", true)))
+		);
+		assert!(
+			packets
+				.iter()
+				.any(|packet| try_bool_packet_value(packet) == Some(("/avatar/parameters/FacialExpressionsDisabled", false)))
+		);
+	}
+
+	#[test]
 	fn emits_negative_binary_parameters_for_signed_shapes() {
 		let mut frame = UNMotionFrame::new(1);
 		frame.signals.push(scalar("face.mouthFrownLeft", 0.5));
@@ -455,6 +546,22 @@ mod tests {
 			bool_packet_value(&packets[1]),
 			("/avatar/parameters/FT/v2/SmileFrownLeftNegative", true)
 		);
+	}
+
+	#[test]
+	fn chunks_large_vrcft_frames_under_datagram_limit() {
+		let mut packets = Vec::new();
+		for index in 0..300 {
+			packets.push(OscPacket::Message(OscMessage {
+				addr: format!("/avatar/parameters/FT/v2/TestParameter{index}"),
+				args: vec![OscType::Float(0.5)],
+			}));
+		}
+
+		let datagrams = encode_packet_chunks(packets).expect("encode chunks");
+
+		assert!(datagrams.len() > 1);
+		assert!(datagrams.iter().all(|datagram| datagram.len() <= MAX_OSC_DATAGRAM_BYTES));
 	}
 
 	#[test]
