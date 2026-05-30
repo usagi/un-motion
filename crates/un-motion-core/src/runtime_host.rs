@@ -20,8 +20,9 @@ use un_motion_profile_schema::{
 use un_motion_runtime::{
 	LatestMotionFrame, LatestMotionFrameStreamWorkerHandle, MirrorMode, ModifierConfig, ModifierPipeline, MotionFrameStreamConfig,
 	OutputCadence, OutputTelemetry, ProfileId, RuntimeSnapshot, RuntimeState, SmoothingPreset, StreamId, StreamState, VmcOutputConfig,
-	VmcOutputEvent, VmcOutputTelemetry, VmcOutputWorkerHandle, ZenohOutputConfig, ZenohOutputEvent, ZenohOutputTelemetry,
-	ZenohOutputWorkerHandle, spawn_latest_motion_frame_stream_worker, spawn_vmc_output_worker, spawn_zenoh_output_worker,
+	VmcOutputEvent, VmcOutputTelemetry, VmcOutputWorkerHandle, VrcOscOutputConfig, VrcOscOutputEvent, VrcOscOutputTelemetry,
+	VrcOscOutputWorkerHandle, ZenohOutputConfig, ZenohOutputEvent, ZenohOutputTelemetry, ZenohOutputWorkerHandle,
+	spawn_latest_motion_frame_stream_worker, spawn_vmc_output_worker, spawn_vrc_osc_output_worker, spawn_zenoh_output_worker,
 };
 
 use crate::unmotion_source::open_motion_frame_source;
@@ -30,6 +31,8 @@ const DEFAULT_FPS: u32 = 30;
 const MAX_FPS: u32 = 240;
 const FOLLOW_INPUT_OUTPUT_FPS_CAP: u32 = MAX_FPS;
 const DEFAULT_VMC_TARGET: &str = "127.0.0.1:39539";
+const DEFAULT_VRC_OSC_TARGET: &str = "127.0.0.1:9000";
+const DEFAULT_VRC_OSC_PARAMETER_PREFIX: &str = "FT";
 const STALE_AFTER_NS: u64 = 500_000_000;
 const LOOP_MAX_SLEEP: Duration = Duration::from_millis(5);
 const FLOW_IDLE_SLEEP: Duration = Duration::from_millis(1);
@@ -52,6 +55,7 @@ pub(crate) struct CoreRuntimeConfig {
 	pub active_profile_id: String,
 	pub fps: u32,
 	pub vmc_output: Option<CoreVmcOutputConfig>,
+	pub vrc_osc_output: Option<CoreVrcOscOutputConfig>,
 	pub zenoh_output: Option<CoreZenohOutputConfig>,
 	pub frame_streams: Vec<CoreMotionFrameStreamConfig>,
 }
@@ -62,6 +66,15 @@ pub(crate) struct CoreVmcOutputConfig {
 	/// Profile の `runtime_selection.modifier.*_enabled` から派生する Modifier 設定。
 	/// 正式経路では VMC 出力も post-process 済み `UNMotionFrame` を受け、Modifier
 	/// 適用後に OSC へ変換する。
+	pub modifier: ModifierConfig,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CoreVrcOscOutputConfig {
+	pub target_addr: SocketAddr,
+	pub parameter_prefix: String,
+	pub send_only_when_vrchat_running: bool,
+	pub process_poll_interval: Duration,
 	pub modifier: ModifierConfig,
 }
 
@@ -518,14 +531,43 @@ pub(crate) fn core_runtime_config_from_document(document: &CoreProfileDocument) 
 	} else {
 		None
 	};
+	let vrc_osc_output = parse_vrc_osc_output_config(runtime)?;
 	let zenoh_output = parse_zenoh_output_config(runtime, &profile.id);
 	Ok(CoreRuntimeConfig {
 		active_profile_id: profile.id.clone(),
 		fps,
 		vmc_output,
+		vrc_osc_output,
 		zenoh_output,
 		frame_streams,
 	})
+}
+
+fn parse_vrc_osc_output_config(runtime: Option<&ProfileRuntimeSettings>) -> anyhow::Result<Option<CoreVrcOscOutputConfig>> {
+	if !runtime.and_then(|r| r.vrc_osc_enabled).unwrap_or(false) {
+		return Ok(None);
+	}
+	let target = runtime
+		.and_then(|r| r.vrc_osc_target_addr.as_deref())
+		.unwrap_or(DEFAULT_VRC_OSC_TARGET);
+	let target_addr: SocketAddr = target
+		.parse()
+		.with_context(|| format!("invalid VRC OSC output target address: {target}"))?;
+	let parameter_prefix = runtime
+		.and_then(|r| r.vrc_osc_parameter_prefix.clone())
+		.unwrap_or_else(|| DEFAULT_VRC_OSC_PARAMETER_PREFIX.to_string());
+	let send_only_when_vrchat_running = runtime.and_then(|r| r.vrc_osc_send_only_when_vrchat_running).unwrap_or(true);
+	let poll_secs = runtime
+		.and_then(|r| r.vrc_osc_process_poll_interval_secs)
+		.unwrap_or(10)
+		.clamp(1, 3600);
+	Ok(Some(CoreVrcOscOutputConfig {
+		target_addr,
+		parameter_prefix,
+		send_only_when_vrchat_running,
+		process_poll_interval: Duration::from_secs(poll_secs),
+		modifier: modifier_config_from_runtime(runtime),
+	}))
 }
 
 fn parse_zenoh_output_config(runtime: Option<&ProfileRuntimeSettings>, profile_id: &str) -> Option<CoreZenohOutputConfig> {
@@ -897,6 +939,7 @@ fn run_core_runtime(
 	tracing::info!(
 		frame_streams = config.frame_streams.len(),
 		vmc_output = workers.vmc_output.is_some(),
+		vrc_osc_output = workers.vrc_osc_output.is_some(),
 		zenoh_output = workers.zenoh_output.is_some(),
 		"UNMotionFrame runtime route selected"
 	);
@@ -944,6 +987,7 @@ fn run_core_runtime(
 		collect_pending_neutral_calibration(&mut neutral_calibration, &latest_states);
 		collect_pending_face_pose_model(&mut face_pose_model, &latest_unmotion_frame);
 		drain_output_messages(&workers.output_event_rx, &mut health, &mut output_telemetry);
+		drain_vrc_osc_output_messages(&workers.vrc_osc_event_rx, &mut health, &mut output_telemetry);
 		drain_zenoh_output_messages(&workers.zenoh_event_rx, &mut health, &mut output_telemetry);
 
 		let now = Instant::now();
@@ -951,26 +995,20 @@ fn run_core_runtime(
 		if cadence.mark_due(now) {
 			if let Some(frame) = select_latest_unsent_frame(&workers.frame_streams, &mut last_output_sequences) {
 				frame_count = frame_count.saturating_add(1);
-				match (&workers.vmc_output, &workers.zenoh_output) {
-					(Some(vmc_output), Some(zenoh_output)) => {
-						if vmc_output.send(frame.clone()).is_err() {
-							health = "output disconnected".to_string();
-						}
-						if zenoh_output.send(frame).is_err() {
-							health = "zenoh output disconnected".to_string();
-						}
-					}
-					(Some(vmc_output), None) => {
-						if vmc_output.send(frame).is_err() {
-							health = "output disconnected".to_string();
-						}
-					}
-					(None, Some(zenoh_output)) => {
-						if zenoh_output.send(frame).is_err() {
-							health = "zenoh output disconnected".to_string();
-						}
-					}
-					(None, None) => {}
+				if let Some(vmc_output) = &workers.vmc_output
+					&& vmc_output.send(frame.clone()).is_err()
+				{
+					health = "output disconnected".to_string();
+				}
+				if let Some(vrc_osc_output) = &workers.vrc_osc_output
+					&& vrc_osc_output.send(frame.clone()).is_err()
+				{
+					health = "vrc osc output disconnected".to_string();
+				}
+				if let Some(zenoh_output) = &workers.zenoh_output
+					&& zenoh_output.send(frame).is_err()
+				{
+					health = "zenoh output disconnected".to_string();
 				}
 				sent = true;
 				workers.refresh_source_telemetry(&mut output_telemetry);
@@ -1761,11 +1799,54 @@ fn drain_zenoh_output_messages(output_rx: &Receiver<ZenohOutputEvent>, health: &
 	}
 }
 
+fn drain_vrc_osc_output_messages(output_rx: &Receiver<VrcOscOutputEvent>, health: &mut String, output_telemetry: &mut OutputTelemetry) {
+	loop {
+		match output_rx.try_recv() {
+			Ok(VrcOscOutputEvent::Sent {
+				datagrams,
+				packets,
+				vrchat_detected,
+				..
+			}) => {
+				if let Some(vrc_osc) = output_telemetry.vrc_osc.as_mut() {
+					vrc_osc.vrchat_detected = vrchat_detected;
+					vrc_osc.sent_datagrams = vrc_osc.sent_datagrams.saturating_add(datagrams);
+					vrc_osc.sent_packets = vrc_osc.sent_packets.saturating_add(packets);
+				}
+			}
+			Ok(VrcOscOutputEvent::Skipped {
+				process_gate_blocked,
+				vrchat_detected,
+				..
+			}) => {
+				if let Some(vrc_osc) = output_telemetry.vrc_osc.as_mut() {
+					vrc_osc.vrchat_detected = vrchat_detected;
+					vrc_osc.skipped_frames = vrc_osc.skipped_frames.saturating_add(1);
+					if process_gate_blocked {
+						vrc_osc.process_gate_blocked_frames = vrc_osc.process_gate_blocked_frames.saturating_add(1);
+					}
+				}
+			}
+			Ok(VrcOscOutputEvent::Error { message, .. }) => {
+				*health = format!("VRC OSC output failed: {message}");
+				if let Some(vrc_osc) = output_telemetry.vrc_osc.as_mut() {
+					vrc_osc.error_count = vrc_osc.error_count.saturating_add(1);
+					vrc_osc.last_error = Some(message);
+				}
+			}
+			Ok(VrcOscOutputEvent::Stopped { .. }) => {}
+			Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+		}
+	}
+}
+
 struct CoreRuntimeWorkers {
 	frame_streams: Vec<LatestMotionFrameStreamWorkerHandle>,
 	frame_stream_errors: Vec<(StreamId, String)>,
 	vmc_output: Option<VmcOutputWorkerHandle>,
 	output_event_rx: Receiver<VmcOutputEvent>,
+	vrc_osc_output: Option<VrcOscOutputWorkerHandle>,
+	vrc_osc_event_rx: Receiver<VrcOscOutputEvent>,
 	zenoh_output: Option<ZenohOutputWorkerHandle>,
 	zenoh_event_rx: Receiver<ZenohOutputEvent>,
 }
@@ -1783,6 +1864,10 @@ impl CoreRuntimeWorkers {
 			vmc: self.vmc_output.as_ref().map(|handle| VmcOutputTelemetry {
 				target_addr: Some(handle.target_addr.to_string()),
 				..VmcOutputTelemetry::default()
+			}),
+			vrc_osc: self.vrc_osc_output.as_ref().map(|handle| VrcOscOutputTelemetry {
+				target_addr: Some(handle.target_addr.to_string()),
+				..VrcOscOutputTelemetry::default()
 			}),
 			sources: Vec::new(),
 		};
@@ -1845,6 +1930,21 @@ impl CoreRuntimeWorkers {
 			})
 			.transpose()?;
 
+		let (vrc_osc_tx, vrc_osc_event_rx) = mpsc::channel();
+		let vrc_osc_output = config
+			.vrc_osc_output
+			.as_ref()
+			.map(|output| {
+				spawn_vrc_osc_output_worker(
+					VrcOscOutputConfig::new(output.target_addr)
+						.with_parameter_prefix(output.parameter_prefix.clone())
+						.with_process_gate(output.send_only_when_vrchat_running, output.process_poll_interval)
+						.with_modifier(output.modifier.clone()),
+					vrc_osc_tx,
+				)
+			})
+			.transpose()?;
+
 		let (zenoh_tx, zenoh_event_rx) = mpsc::channel();
 		let zenoh_output = match config.zenoh_output.as_ref() {
 			Some(zenoh) => {
@@ -1876,6 +1976,8 @@ impl CoreRuntimeWorkers {
 			frame_stream_errors,
 			vmc_output,
 			output_event_rx,
+			vrc_osc_output,
+			vrc_osc_event_rx,
 			zenoh_output,
 			zenoh_event_rx,
 		})
@@ -1886,6 +1988,9 @@ impl CoreRuntimeWorkers {
 			let _ = stream.join();
 		}
 		if let Some(output) = self.vmc_output {
+			let _ = output.join();
+		}
+		if let Some(output) = self.vrc_osc_output {
 			let _ = output.join();
 		}
 		if let Some(output) = self.zenoh_output {
@@ -2490,6 +2595,7 @@ mod tests {
 			active_profile_id: "waidayo".to_string(),
 			fps: 90,
 			vmc_output: None,
+			vrc_osc_output: None,
 			zenoh_output: None,
 			frame_streams: vec![test_frame_stream_config("mediapipe-main")],
 		};
@@ -2520,6 +2626,7 @@ mod tests {
 			active_profile_id: "unmotion-profile".to_string(),
 			fps: 90,
 			vmc_output: None,
+			vrc_osc_output: None,
 			zenoh_output: None,
 			frame_streams: vec![test_frame_stream_config("mediapipe-main")],
 		};
@@ -2701,6 +2808,50 @@ mod tests {
 		assert!(health.starts_with("Zenoh output failed:"));
 	}
 
+	#[test]
+	fn drain_vrc_osc_output_messages_accumulates_sent_skipped_and_error() {
+		let (tx, rx) = mpsc::channel::<VrcOscOutputEvent>();
+		let target_addr: SocketAddr = "127.0.0.1:9000".parse().expect("addr");
+		let mut telemetry = OutputTelemetry {
+			vrc_osc: Some(VrcOscOutputTelemetry {
+				target_addr: Some(target_addr.to_string()),
+				..VrcOscOutputTelemetry::default()
+			}),
+			..OutputTelemetry::default()
+		};
+		let mut health = String::new();
+
+		tx.send(VrcOscOutputEvent::Sent {
+			target_addr,
+			datagrams: 1,
+			packets: 3,
+			vrchat_detected: true,
+		})
+		.expect("send sent");
+		tx.send(VrcOscOutputEvent::Skipped {
+			target_addr,
+			process_gate_blocked: true,
+			vrchat_detected: false,
+		})
+		.expect("send skipped");
+		tx.send(VrcOscOutputEvent::Error {
+			target_addr,
+			message: "send failed".to_string(),
+		})
+		.expect("send err");
+
+		drain_vrc_osc_output_messages(&rx, &mut health, &mut telemetry);
+
+		let vrc_osc = telemetry.vrc_osc.expect("vrc osc telemetry");
+		assert_eq!(vrc_osc.sent_datagrams, 1);
+		assert_eq!(vrc_osc.sent_packets, 3);
+		assert_eq!(vrc_osc.skipped_frames, 1);
+		assert_eq!(vrc_osc.process_gate_blocked_frames, 1);
+		assert_eq!(vrc_osc.error_count, 1);
+		assert_eq!(vrc_osc.last_error.as_deref(), Some("send failed"));
+		assert!(health.starts_with("VRC OSC output failed:"));
+	}
+
 	/// `RuntimeSnapshot` を構築するときに `output_telemetry` が forwarding されていることを
 	/// 確認するスモークテスト。Supervisor から GUI まで届くために必須。
 	#[test]
@@ -2710,6 +2861,7 @@ mod tests {
 			fps: 30,
 			frame_streams: Vec::new(),
 			vmc_output: None,
+			vrc_osc_output: None,
 			zenoh_output: None,
 		};
 		let telemetry = OutputTelemetry {
@@ -2724,6 +2876,12 @@ mod tests {
 				sent_packets: 30,
 				..VmcOutputTelemetry::default()
 			}),
+			vrc_osc: Some(VrcOscOutputTelemetry {
+				target_addr: Some("127.0.0.1:9000".to_string()),
+				sent_datagrams: 4,
+				sent_packets: 12,
+				..VrcOscOutputTelemetry::default()
+			}),
 			sources: Vec::new(),
 		};
 
@@ -2736,6 +2894,10 @@ mod tests {
 		assert_eq!(vmc.sent_datagrams, 10);
 		assert_eq!(vmc.sent_packets, 30);
 		assert_eq!(vmc.target_addr.as_deref(), Some("127.0.0.1:39539"));
+		let vrc_osc = snapshot.output_telemetry.vrc_osc.expect("vrc osc telemetry");
+		assert_eq!(vrc_osc.sent_datagrams, 4);
+		assert_eq!(vrc_osc.sent_packets, 12);
+		assert_eq!(vrc_osc.target_addr.as_deref(), Some("127.0.0.1:9000"));
 	}
 
 	#[test]

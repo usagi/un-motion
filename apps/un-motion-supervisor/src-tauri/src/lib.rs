@@ -411,6 +411,8 @@ struct TelemetrySample {
 	sampled_at: Instant,
 	vmc_datagrams: u64,
 	vmc_packets: u64,
+	vrc_osc_datagrams: u64,
+	vrc_osc_packets: u64,
 	zenoh_frames: u64,
 	/// `stream_id → (kind, source_id, raw_received, frames_emitted)`。
 	sources: std::collections::BTreeMap<String, SourceSampleEntry>,
@@ -484,6 +486,10 @@ pub struct CapturerOutputFps {
 	pub vmc_datagrams_per_sec: f32,
 	/// VMC/UDP 出力: OSC packet / sec (`/VMC/Ext/Bone/Pos` 等の論理 message 単位)。
 	pub vmc_packets_per_sec: f32,
+	/// VRC (VRCFT) / OSC 出力: UDP datagram / sec。
+	pub vrc_osc_datagrams_per_sec: f32,
+	/// VRC (VRCFT) / OSC 出力: OSC packet / sec。
+	pub vrc_osc_packets_per_sec: f32,
 	/// UNMF/Z 出力: 完成 frame / sec。
 	pub zenoh_frames_per_sec: f32,
 	/// 各 source stage の受信 / emit レート。
@@ -1819,6 +1825,11 @@ fn new_profile_runtime_defaults() -> ProfileRuntimeSettings {
 	ProfileRuntimeSettings {
 		engine: Some("mediapipe-native".to_string()),
 		vmc_enabled: Some(false),
+		vrc_osc_enabled: Some(false),
+		vrc_osc_target_addr: Some("127.0.0.1:9000".to_string()),
+		vrc_osc_send_only_when_vrchat_running: Some(true),
+		vrc_osc_process_poll_interval_secs: Some(10),
+		vrc_osc_parameter_prefix: Some("FT".to_string()),
 		zenoh_enabled: Some(true),
 		zenoh_key_expr: Some("un-motion/frame".to_string()),
 		zenoh_topic_mode: Some("frame".to_string()),
@@ -2673,6 +2684,11 @@ pub struct ProfileRuntimeView {
 	pub fps: Option<u32>,
 	pub vmc_enabled: Option<bool>,
 	pub vmc_target_addr: Option<String>,
+	pub vrc_osc_enabled: Option<bool>,
+	pub vrc_osc_target_addr: Option<String>,
+	pub vrc_osc_send_only_when_vrchat_running: Option<bool>,
+	pub vrc_osc_process_poll_interval_secs: Option<u64>,
+	pub vrc_osc_parameter_prefix: Option<String>,
 	pub zenoh_enabled: Option<bool>,
 	pub zenoh_key_expr: Option<String>,
 	pub zenoh_topic_mode: Option<String>,
@@ -2807,6 +2823,11 @@ impl From<&ProfileRuntimeSettings> for ProfileRuntimeView {
 			fps: settings.fps,
 			vmc_enabled: settings.vmc_enabled,
 			vmc_target_addr: settings.vmc_target_addr.clone(),
+			vrc_osc_enabled: settings.vrc_osc_enabled,
+			vrc_osc_target_addr: settings.vrc_osc_target_addr.clone(),
+			vrc_osc_send_only_when_vrchat_running: settings.vrc_osc_send_only_when_vrchat_running,
+			vrc_osc_process_poll_interval_secs: settings.vrc_osc_process_poll_interval_secs,
+			vrc_osc_parameter_prefix: settings.vrc_osc_parameter_prefix.clone(),
 			zenoh_enabled: settings.zenoh_enabled,
 			zenoh_key_expr: settings.zenoh_key_expr.clone(),
 			zenoh_topic_mode: settings.zenoh_topic_mode.clone(),
@@ -3008,6 +3029,11 @@ fn apply_runtime_field(runtime: &mut ProfileRuntimeSettings, field: &str, value:
 		"fps" => runtime.fps = opt_u32(&value, field)?,
 		"vmc_enabled" => runtime.vmc_enabled = opt_bool(&value, field)?,
 		"vmc_target_addr" => runtime.vmc_target_addr = opt_string(&value, field)?,
+		"vrc_osc_enabled" => runtime.vrc_osc_enabled = opt_bool(&value, field)?,
+		"vrc_osc_target_addr" => runtime.vrc_osc_target_addr = opt_string(&value, field)?,
+		"vrc_osc_send_only_when_vrchat_running" => runtime.vrc_osc_send_only_when_vrchat_running = opt_bool(&value, field)?,
+		"vrc_osc_process_poll_interval_secs" => runtime.vrc_osc_process_poll_interval_secs = opt_u64(&value, field)?,
+		"vrc_osc_parameter_prefix" => runtime.vrc_osc_parameter_prefix = opt_string(&value, field)?,
 		"zenoh_enabled" => runtime.zenoh_enabled = opt_bool(&value, field)?,
 		"zenoh_key_expr" => runtime.zenoh_key_expr = opt_string(&value, field)?,
 		"zenoh_topic_mode" => runtime.zenoh_topic_mode = opt_string(&value, field)?,
@@ -3206,6 +3232,16 @@ fn opt_u32(value: &serde_json::Value, field: &str) -> Result<Option<u32>, String
 			return Err(format!("field `{field}` exceeds u32 range"));
 		}
 		return Ok(Some(n as u32));
+	}
+	Err(format!("field `{field}` must be a non-negative integer or null"))
+}
+
+fn opt_u64(value: &serde_json::Value, field: &str) -> Result<Option<u64>, String> {
+	if value.is_null() {
+		return Ok(None);
+	}
+	if let Some(n) = value.as_u64() {
+		return Ok(Some(n));
 	}
 	Err(format!("field `{field}` must be a non-negative integer or null"))
 }
@@ -3418,12 +3454,18 @@ fn extract_telemetry_sample(snapshot: &serde_json::Value) -> Option<TelemetrySam
 		sampled_at: Instant::now(),
 		vmc_datagrams: 0,
 		vmc_packets: 0,
+		vrc_osc_datagrams: 0,
+		vrc_osc_packets: 0,
 		zenoh_frames: 0,
 		sources: std::collections::BTreeMap::new(),
 	};
 	if let Some(vmc) = telemetry.get("vmc").and_then(|v| v.as_object()) {
 		sample.vmc_datagrams = vmc.get("sent_datagrams").and_then(|v| v.as_u64()).unwrap_or(0);
 		sample.vmc_packets = vmc.get("sent_packets").and_then(|v| v.as_u64()).unwrap_or(0);
+	}
+	if let Some(vrc_osc) = telemetry.get("vrc_osc").and_then(|v| v.as_object()) {
+		sample.vrc_osc_datagrams = vrc_osc.get("sent_datagrams").and_then(|v| v.as_u64()).unwrap_or(0);
+		sample.vrc_osc_packets = vrc_osc.get("sent_packets").and_then(|v| v.as_u64()).unwrap_or(0);
 	}
 	if let Some(zenoh) = telemetry.get("zenoh").and_then(|v| v.as_object()) {
 		sample.zenoh_frames = zenoh.get("sent_frames").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -3479,6 +3521,8 @@ fn compute_fps_from_samples(prev: &TelemetrySample, cur: &TelemetrySample) -> Op
 		interval_secs: dt as f32,
 		vmc_datagrams_per_sec: per_sec(prev.vmc_datagrams, cur.vmc_datagrams),
 		vmc_packets_per_sec: per_sec(prev.vmc_packets, cur.vmc_packets),
+		vrc_osc_datagrams_per_sec: per_sec(prev.vrc_osc_datagrams, cur.vrc_osc_datagrams),
+		vrc_osc_packets_per_sec: per_sec(prev.vrc_osc_packets, cur.vrc_osc_packets),
 		zenoh_frames_per_sec: per_sec(prev.zenoh_frames, cur.zenoh_frames),
 		sources,
 	})
@@ -3897,6 +3941,10 @@ mod tests {
 		assert_eq!(runtime.zenoh_key_expr.as_deref(), Some("un-motion/frame"));
 		assert_eq!(runtime.zenoh_topic_mode.as_deref(), Some("frame"));
 		assert_eq!(runtime.vmc_enabled, Some(false));
+		assert_eq!(runtime.vrc_osc_enabled, Some(false));
+		assert_eq!(runtime.vrc_osc_target_addr.as_deref(), Some("127.0.0.1:9000"));
+		assert_eq!(runtime.vrc_osc_send_only_when_vrchat_running, Some(true));
+		assert_eq!(runtime.vrc_osc_process_poll_interval_secs, Some(10));
 		assert_eq!(runtime.media_pipe_delegate.as_deref(), Some("xnnpack"));
 		assert_eq!(runtime.media_pipe_num_threads, Some(2));
 		assert_eq!(runtime.media_pipe_holistic_flow_limiter_enabled, Some(true));

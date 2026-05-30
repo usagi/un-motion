@@ -17,6 +17,7 @@ members = [
 	"crates/un-motion-input-webcam-directshow",
 	"crates/un-motion-input-webcam-nokhwa",
 	"crates/un-motion-output-vmc",
+	"crates/un-motion-output-vrc-osc",
 	"crates/un-motion-output-debug",
 	"crates/un-motion-record",
 	"crates/un-motion-runtime",

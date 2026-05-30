@@ -176,6 +176,7 @@ producer_label = "Producer label"
 vmc_heading = "VMC/UDP"
 vmc_enable = "Enable VMC/UDP sender"
 target_address = "Target address"
+parameter_prefix = "Parameter prefix"
 input_denoise_temporal_iir = "Temporal IIR input denoise"
 input_denoise_temporal_iir_cutoff = "Temporal IIR cutoff"
 mediapipe_post_process = "MediaPipe Post-process"
@@ -190,6 +191,10 @@ face_head_model_unavailable = "This item is available only when MediaPipe, Head 
 face_head_model_warning = "Without a created model, Face-derived Head pitch accuracy may be lower."
 unmfz_publisher = "UNMF/Z Publisher"
 vmc_udp_sender = "VMC/UDP Sender"
+vrc_osc_sender = "VRC (VRCFT) / OSC"
+vrc_osc_only_when_running = "Only while VRChat is running"
+vrc_osc_head_tracker = "Head tracker"
+vrc_osc_poll_interval = "OSCQuery poll interval"
 
 [profiles.editor.hints]
 input_denoise = "Input denoise: applies an input filter to the RGB image immediately before MediaPipe inference. Use it to reduce webcam shimmer caused by temporal or spatial image noise."
@@ -202,6 +207,12 @@ head_source_blend = "Smooths discontinuities when Head estimation switches betwe
 face_head_model = "Face Head personal correction model: when Face-tracking Head is enabled, this uses a performer-specific frontal face model to correct Face-derived Head pitch. It is a personal correction model, not the Head source switch. Enabling it without a model starts model creation for this profile."
 unmfz_publisher = "UNMF/Z Publisher: sends UNMotionFrame over Zenoh. This is the standard output for UNAvatar and other UNMF/Z apps. Usually keep it on."
 vmc_udp_sender = "VMC/UDP Sender: use this for compatibility output to VMC receivers. Turn it off when UNMF/Z is enough."
+vrc_osc_sender = "VRC (VRCFT) / OSC: sends VRCFaceTracking-compatible Face parameters to VRChat OSC Avatar Parameters."
+vrc_osc_target_address = "Target address: destination for VRChat OSC input. Usually 127.0.0.1:9000 on the same PC."
+vrc_osc_parameter_prefix = "Parameter prefix: matches the VRCFT namespace used by the avatar. Most VRCFT avatars use FT."
+vrc_osc_only_when_running = "Send only when VRChat OSCQuery can provide avatar parameters. The check runs at the interval below."
+vrc_osc_head_tracker = "Head tracker: experimental Head control through VRChat OSC tracker input. This is outside the issue-4 completion scope."
+vrc_osc_poll_interval = "Interval for checking VRChat OSCQuery and avatar parameters. 10 seconds is usually enough."
 
 [tray]
 open = "Open UN Motion"

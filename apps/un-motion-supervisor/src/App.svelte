@@ -71,6 +71,8 @@
     intervalSecs: number;
     vmcDatagramsPerSec: number;
     vmcPacketsPerSec: number;
+    vrcOscDatagramsPerSec: number;
+    vrcOscPacketsPerSec: number;
     zenohFramesPerSec: number;
     sources: CapturerSourceFps[];
   }
@@ -122,6 +124,11 @@
     fps: number | null;
     vmcEnabled: boolean | null;
     vmcTargetAddr: string | null;
+    vrcOscEnabled: boolean | null;
+    vrcOscTargetAddr: string | null;
+    vrcOscSendOnlyWhenVrchatRunning: boolean | null;
+    vrcOscProcessPollIntervalSecs: number | null;
+    vrcOscParameterPrefix: string | null;
     zenohEnabled: boolean | null;
     zenohKeyExpr: string | null;
     zenohTopicMode: string | null;
@@ -3292,6 +3299,16 @@
                       error_count?: number | null;
                       last_error?: string | null;
                     } | null;
+                    vrc_osc?: {
+                      target_addr?: string | null;
+                      vrchat_detected?: boolean | null;
+                      sent_datagrams?: number | null;
+                      sent_packets?: number | null;
+                      skipped_frames?: number | null;
+                      process_gate_blocked_frames?: number | null;
+                      error_count?: number | null;
+                      last_error?: string | null;
+                    } | null;
                   }
                 | undefined}
               {@const diagnosticSnapshot = selectedRuntime?.snapshot as Record<
@@ -3653,6 +3670,28 @@
                       ?.vmc?.sent_packets ?? 0} packets</small
                   >
                 </dd>
+                <dt>VRC (VRCFT) / OSC out</dt>
+                <dd>{booleanSettingLabel(runtime?.vrcOscEnabled)}</dd>
+                <dt>VRC OSC target</dt>
+                <dd>
+                  {textSettingLabel(
+                    runtime?.vrcOscTargetAddr ?? telemetry?.vrc_osc?.target_addr,
+                  )}
+                </dd>
+                <dt>VRChat detected</dt>
+                <dd>{booleanSettingLabel(telemetry?.vrc_osc?.vrchat_detected)}</dd>
+                <dt>VRC OSC sent</dt>
+                <dd>
+                  {formatTelemetryWithUnit(
+                    selectedRuntime?.fps?.vrcOscPacketsPerSec ?? null,
+                    "pkt/s",
+                  )}
+                  <small
+                    >{telemetry?.vrc_osc?.sent_datagrams ?? 0} datagrams / {telemetry
+                      ?.vrc_osc?.sent_packets ?? 0} packets · skipped {telemetry
+                      ?.vrc_osc?.skipped_frames ?? 0}</small
+                  >
+                </dd>
                 {#if selectedRuntime?.fps?.sources.length}
                   {#each selectedRuntime.fps.sources as src (src.streamId)}
                     <dt>Source ({src.kind})</dt>
@@ -3678,6 +3717,10 @@
                 {#if telemetry?.vmc?.last_error}
                   <dt>VMC last error</dt>
                   <dd class="bad">{telemetry.vmc.last_error}</dd>
+                {/if}
+                {#if telemetry?.vrc_osc?.last_error}
+                  <dt>VRC OSC last error</dt>
+                  <dd class="bad">{telemetry.vrc_osc.last_error}</dd>
                 {/if}
               </dl>
             {:else}
@@ -5230,12 +5273,12 @@
                 </section>
 
                 <!-- ============================================================
-                     Output: UNMF/Z と VMC/UDP の 2 経路をサブグループ
-                     として束ねる。Modifier 適用後の姿勢が両方へ送出される。
+                     Output: Modifier 適用後のフレームを複数 output worker へ
+                     同時送出する。
                      ============================================================ -->
                 <section
                   class="editor-section"
-                  data-hint="Output: Modifier後のUNMotionFrameをUNMF/ZまたはVMC/UDPへ送出します。"
+                  data-hint="Output: Modifier後のUNMotionFrameをUNMF/Z、VMC/UDP、VRC OSCへ送出します。"
                 >
                   <div class="section-title-row">
                     <h3>{$_("profiles.editor.output")}</h3>
@@ -5364,6 +5407,97 @@
                             void updateProfileField(
                               "runtime_selection.vmc_target_addr",
                               emptyStringToNull(
+                                (event.currentTarget as HTMLInputElement).value,
+                              ),
+                            )}
+                        />
+                      </label>
+                    </div>
+                  </div>
+
+                  <div class="subgroup">
+                    <label
+                      class="output-channel-heading"
+                      data-hint={$_("profiles.editor.hints.vrc_osc_sender")}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={profileDetail.runtime.vrcOscEnabled ?? false}
+                        onchange={(event) =>
+                          void updateProfileField(
+                            "runtime_selection.vrc_osc_enabled",
+                            (event.currentTarget as HTMLInputElement).checked,
+                          )}
+                      />
+                      <span>{$_("profiles.editor.vrc_osc_sender")}</span>
+                    </label>
+                    <div class="section-grid output-channel-fields">
+                      <label
+                        data-hint={$_("profiles.editor.hints.vrc_osc_target_address")}
+                      >
+                        <span>{$_("profiles.editor.target_address")}</span>
+                        <input
+                          type="text"
+                          value={profileDetail.runtime.vrcOscTargetAddr ?? ""}
+                          placeholder="127.0.0.1:9000"
+                          onchange={(event) =>
+                            void updateProfileField(
+                              "runtime_selection.vrc_osc_target_addr",
+                              emptyStringToNull(
+                                (event.currentTarget as HTMLInputElement).value,
+                              ),
+                            )}
+                        />
+                      </label>
+                      <label
+                        data-hint={$_("profiles.editor.hints.vrc_osc_parameter_prefix")}
+                      >
+                        <span>{$_("profiles.editor.parameter_prefix")}</span>
+                        <input
+                          type="text"
+                          value={profileDetail.runtime.vrcOscParameterPrefix ??
+                            ""}
+                          placeholder="FT"
+                          onchange={(event) =>
+                            void updateProfileField(
+                              "runtime_selection.vrc_osc_parameter_prefix",
+                              emptyStringToNull(
+                                (event.currentTarget as HTMLInputElement).value,
+                              ),
+                            )}
+                        />
+                      </label>
+                      <label
+                        class="checkbox-line"
+                        data-hint={$_("profiles.editor.hints.vrc_osc_only_when_running")}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={profileDetail.runtime
+                            .vrcOscSendOnlyWhenVrchatRunning ?? true}
+                          onchange={(event) =>
+                            void updateProfileField(
+                              "runtime_selection.vrc_osc_send_only_when_vrchat_running",
+                              (event.currentTarget as HTMLInputElement).checked,
+                            )}
+                        />
+                        <span>{$_("profiles.editor.vrc_osc_only_when_running")}</span>
+                      </label>
+                      <label
+                        data-hint={$_("profiles.editor.hints.vrc_osc_poll_interval")}
+                      >
+                        <span>{$_("profiles.editor.vrc_osc_poll_interval")}</span>
+                        <input
+                          type="number"
+                          min="1"
+                          max="3600"
+                          step="1"
+                          value={profileDetail.runtime
+                            .vrcOscProcessPollIntervalSecs ?? 10}
+                          onchange={(event) =>
+                            void updateProfileField(
+                              "runtime_selection.vrc_osc_process_poll_interval_secs",
+                              Number(
                                 (event.currentTarget as HTMLInputElement).value,
                               ),
                             )}

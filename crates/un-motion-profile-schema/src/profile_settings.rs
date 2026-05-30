@@ -24,6 +24,16 @@ pub struct ProfileRuntimeSettings {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub vmc_target_addr: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub vrc_osc_enabled: Option<bool>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub vrc_osc_target_addr: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub vrc_osc_send_only_when_vrchat_running: Option<bool>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub vrc_osc_process_poll_interval_secs: Option<u64>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub vrc_osc_parameter_prefix: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub zenoh_enabled: Option<bool>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub zenoh_key_expr: Option<String>,
@@ -377,11 +387,18 @@ mod tests {
 			fps: Some(60),
 			vmc_enabled: Some(true),
 			vmc_target_addr: Some("127.0.0.1:39539".to_string()),
+			vrc_osc_enabled: Some(true),
+			vrc_osc_target_addr: Some("127.0.0.1:9000".to_string()),
+			vrc_osc_send_only_when_vrchat_running: Some(true),
+			vrc_osc_process_poll_interval_secs: Some(10),
+			vrc_osc_parameter_prefix: Some("ExamplePrefix".to_string()),
 			..Default::default()
 		};
 		let json = serde_json::to_string(&settings).expect("serialize json");
 		assert!(json.contains("\"fps\":60"));
 		assert!(json.contains("\"vmcEnabled\":true"));
+		assert!(json.contains("\"vrcOscEnabled\":true"));
+		assert!(json.contains("\"vrcOscTargetAddr\":\"127.0.0.1:9000\""));
 		let parsed: ProfileRuntimeSettings = serde_json::from_str(&json).expect("parse json");
 		assert_eq!(parsed, settings);
 	}

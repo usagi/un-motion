@@ -24,7 +24,8 @@ pub use modifier::{
 pub use output::{
 	FileOutputCommand, FileOutputConfig, FileOutputEvent, FileOutputFormat, FileOutputStats, FileOutputWorker, FileOutputWorkerHandle,
 	VmcOutputCommand, VmcOutputConfig, VmcOutputEvent, VmcOutputFrame, VmcOutputStats, VmcOutputWorker, VmcOutputWorkerHandle,
-	spawn_file_output_worker, spawn_vmc_output_worker,
+	VrcOscOutputCommand, VrcOscOutputConfig, VrcOscOutputEvent, VrcOscOutputFrame, VrcOscOutputStats, VrcOscOutputWorker,
+	VrcOscOutputWorkerHandle, spawn_file_output_worker, spawn_vmc_output_worker, spawn_vrc_osc_output_worker,
 };
 pub use unmotion::{
 	LatestMotionFrame, LatestMotionFrameSlot, LatestMotionFrameStreamWorkerHandle, MotionFrameSource, MotionFrameStreamConfig,
@@ -123,6 +124,8 @@ pub struct OutputTelemetry {
 	pub zenoh: Option<ZenohOutputTelemetry>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub vmc: Option<VmcOutputTelemetry>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub vrc_osc: Option<VrcOscOutputTelemetry>,
 	/// 各 source / engine ステージから集めた累積カウンタ。Capturer の runtime loop
 	/// は `refresh_source_telemetry()` で `Arc<SourceStageAtomics>` を `load(Relaxed)`
 	/// するだけなので、source 側 worker と排他にならない (ロックフリー)。Supervisor 側
@@ -348,6 +351,26 @@ pub struct VmcOutputTelemetry {
 	#[serde(default)]
 	pub error_count: u64,
 	/// 直近の send エラー文字列 (任意)。
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct VrcOscOutputTelemetry {
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub target_addr: Option<String>,
+	#[serde(default)]
+	pub vrchat_detected: bool,
+	#[serde(default)]
+	pub sent_datagrams: u64,
+	#[serde(default)]
+	pub sent_packets: u64,
+	#[serde(default)]
+	pub skipped_frames: u64,
+	#[serde(default)]
+	pub process_gate_blocked_frames: u64,
+	#[serde(default)]
+	pub error_count: u64,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub last_error: Option<String>,
 }

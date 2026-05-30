@@ -35,6 +35,7 @@ iFacialMocap input -> iFacialMocap decoder -> UNMotionFrame -> Modifier -> Outpu
 - Output は Modifier 適用後の `UNMotionFrame` だけを読みます。
 - UNMF/Z は Modifier 適用後の `UNMotionFrame` を publish します。
 - VMC/UDP は最後の境界で Modifier 適用後の `UNMotionFrame` を VMC OSC へ変換します。
+- VRC (VRCFT) / OSC は最後の境界で Modifier 適用後の `UNMotionFrame` の Face signal を VRChat OSC Avatar Parameters へ変換します。
 
 ## 禁止する実装
 
@@ -43,6 +44,7 @@ iFacialMocap input -> iFacialMocap decoder -> UNMotionFrame -> Modifier -> Outpu
 - Output が MediaPipe raw output や post-process 専用データを直接読む。
 - VMC が `UNMotionFrame` を迂回して送信される。
 - `UNMF/Z` を `UNMotionFrame` とは別の内部 branch として扱う。
+- VRC (VRCFT) / OSC が MediaPipe raw blendshape や VMC packet を直接読む。
 - bone subset、smoothing、mirror、calibration を Modifier より前で UNMF/Z と VMC に別々に適用する。
 - 通常の Capturer 経路に runtime mux / fusion state を戻す。
 

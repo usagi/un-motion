@@ -87,6 +87,7 @@ npm run tauri dev
 
 - [Architecture](docs/architecture.md): 現行設計、crate の役割、入出力境界
 - [Capturer Pipeline](docs/capturer-pipeline.md): `Input -> Engine -> UNMotionFrame -> Modifier -> Output` の正式経路
+- [VRC (VRCFT) / OSC Output](docs/vrc-osc-output.md): VRChat OSC へ VRCFT 互換 Face parameter を送る出力仕様
 - [Release Readiness](docs/release-readiness.md): v1 の境界、既定値、リリース前確認
 - [MediaPipe Native Requirements](docs/media-pipe-native-requirements.md): Native DLL、delegate、performance、Windows GPU delegate の扱い
 - [Development Guidelines](docs/development-guidelines.md): 開発時の確認方針

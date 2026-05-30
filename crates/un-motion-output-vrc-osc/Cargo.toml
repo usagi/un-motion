@@ -1,0 +1,13 @@
+[package]
+name = "un-motion-output-vrc-osc"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rosc = "0.10"
+serde = { workspace = true, features = ["derive"] }
+un-motion-frame = "1.1.0"
