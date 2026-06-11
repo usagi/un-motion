@@ -1,28 +1,26 @@
 {
- "$schema": "https://schema.tauri.app/config/2",
- "productName": "UN Motion",
- "identifier": "network.usagi.un-motion",
- "build": {
-  "beforeDevCommand": "npm run dev",
-  "devUrl": "http://127.0.0.1:1421",
-  "beforeBuildCommand": "npm run build",
-  "frontendDist": "../dist"
- },
- "app": {
-  "windows": [],
-  "security": {
-   "csp": null
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "UN Motion",
+  "identifier": "network.usagi.un-motion",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1421",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
   },
-  "trayIcon": {
-   "iconPath": "icons/icon.ico",
-   "iconAsTemplate": false
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    },
+    "trayIcon": {
+      "iconPath": "icons/icon.ico",
+      "iconAsTemplate": false
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.ico"]
   }
- },
- "bundle": {
-  "active": true,
-  "targets": "all",
-  "icon": [
-   "icons/icon.ico"
-  ]
- }
 }

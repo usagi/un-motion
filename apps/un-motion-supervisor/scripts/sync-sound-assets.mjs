@@ -11,7 +11,7 @@ const targetDir = join(appDir, "public", "sounds");
 mkdirSync(targetDir, { recursive: true });
 
 for (const entry of readdirSync(sourceDir, { withFileTypes: true })) {
-  if (!entry.isFile()) continue;
-  if (!/\.(flac|ogg|wav)$/i.test(entry.name)) continue;
-  copyFileSync(join(sourceDir, entry.name), join(targetDir, entry.name));
+	if (!entry.isFile()) continue;
+	if (!/\.(flac|ogg|wav)$/i.test(entry.name)) continue;
+	copyFileSync(join(sourceDir, entry.name), join(targetDir, entry.name));
 }
