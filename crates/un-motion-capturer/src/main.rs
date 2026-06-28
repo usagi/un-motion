@@ -12,10 +12,14 @@
 //! Phase E で named pipe IPC に切り替える可能性もあるが、HTTP/SSE は既存資産で十分
 //! 機能するためまずは HTTP で揃える。
 
+use std::backtrace::Backtrace;
 use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::panic;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use clap::Parser;
@@ -113,6 +117,7 @@ struct FlickerTestSummary {
 }
 
 fn main() -> anyhow::Result<()> {
+	install_panic_log_hook("un-motion-capturer");
 	// `UN_MOTION_LOG` 環境変数で log filter を上書き可能。
 	// 既定は `info,un_motion_runtime=debug` で、Phase E e2e Step B のために
 	// Zenoh / VMC output worker の送信頻度 (`un_motion_runtime::{vmc,zenoh}_output`) を
@@ -222,6 +227,29 @@ fn main() -> anyhow::Result<()> {
 		run_api_server(api_config, state).await
 	})?;
 	Ok(())
+}
+
+fn install_panic_log_hook(process_name: &'static str) {
+	let previous = panic::take_hook();
+	panic::set_hook(Box::new(move |info| {
+		let pid = std::process::id();
+		let timestamp_ms = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.map(|duration| duration.as_millis())
+			.unwrap_or_default();
+		let log_dir = user_config_dir().join("logs");
+		let path = log_dir.join(format!("{process_name}-panic-{pid}-{timestamp_ms}.log"));
+		if fs::create_dir_all(&log_dir).is_ok()
+			&& let Ok(mut file) = OpenOptions::new().create_new(true).write(true).open(&path)
+		{
+			let _ = writeln!(file, "process={process_name}");
+			let _ = writeln!(file, "pid={pid}");
+			let _ = writeln!(file, "timestamp_ms={timestamp_ms}");
+			let _ = writeln!(file, "panic={info}");
+			let _ = writeln!(file, "backtrace={:?}", Backtrace::force_capture());
+		}
+		previous(info);
+	}));
 }
 
 /// `--with-tray` 時に組み立てる TrayOptions。

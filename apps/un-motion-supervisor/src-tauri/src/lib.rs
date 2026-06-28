@@ -14,14 +14,17 @@
 //! * Profile 一覧 / 切替 (D4-b) は次の commit で追加。
 //! * Svelte UI 骨組み (D4-c) も次の commit で UN Avatar から移植。
 
+use std::backtrace::Backtrace;
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+use std::panic;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use std::env;
 
@@ -2576,6 +2579,7 @@ fn stop_all_capturers(state: State<'_, Mutex<SupervisorState>>) -> Result<(), St
 
 /// Tauri アプリのエントリポイント。`main.rs` から呼ばれる。
 pub fn run() {
+	install_panic_log_hook("un-motion-supervisor");
 	// tracing 出力を有効化 (cargo run / 端末から起動したとき stdout に流す)。
 	// すでに別のレイヤが初期化済みなら try_init で握り潰す。
 	let _ = tracing_subscriber::fmt()
@@ -2657,6 +2661,29 @@ pub fn run() {
 		})
 		.run(tauri::generate_context!())
 		.expect("error while running UN Motion Supervisor");
+}
+
+fn install_panic_log_hook(process_name: &'static str) {
+	let previous = panic::take_hook();
+	panic::set_hook(Box::new(move |info| {
+		let pid = std::process::id();
+		let timestamp_ms = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.map(|duration| duration.as_millis())
+			.unwrap_or_default();
+		let log_dir = app_config_dir().join("logs");
+		let path = log_dir.join(format!("{process_name}-panic-{pid}-{timestamp_ms}.log"));
+		if fs::create_dir_all(&log_dir).is_ok()
+			&& let Ok(mut file) = fs::OpenOptions::new().create_new(true).write(true).open(&path)
+		{
+			let _ = writeln!(file, "process={process_name}");
+			let _ = writeln!(file, "pid={pid}");
+			let _ = writeln!(file, "timestamp_ms={timestamp_ms}");
+			let _ = writeln!(file, "panic={info}");
+			let _ = writeln!(file, "backtrace={:?}", Backtrace::force_capture());
+		}
+		previous(info);
+	}));
 }
 
 // ---------- profile helpers ----------

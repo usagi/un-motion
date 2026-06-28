@@ -207,8 +207,8 @@ impl MotionFrameSource for VmcUnmotionSource {
 	fn next_frame(&mut self) -> anyhow::Result<Option<UNMotionFrame>> {
 		let batch = self.source.poll_batch()?;
 		// 観測ログ用に poll サイクル単位の差分を累積へ反映する。
-		const RECV_LOG_INTERVAL: u64 = 300;
-		const FRAME_LOG_INTERVAL: u64 = 300;
+		const RECV_LOG_INTERVAL: u64 = 9_000;
+		const FRAME_LOG_INTERVAL: u64 = 9_000;
 
 		if batch.received_datagrams > 0 {
 			let before = self
@@ -232,7 +232,7 @@ impl MotionFrameSource for VmcUnmotionSource {
 			// `RECV_LOG_INTERVAL` の境界を跨いだ場合に periodic 累積ログを出す。
 			if after / RECV_LOG_INTERVAL > before / RECV_LOG_INTERVAL {
 				let snap = self.telemetry.atomics.snapshot();
-				info!(
+				debug!(
 					target: "un_motion_runtime::vmc_unmotion_source",
 					source_id = %self.source_id,
 					total_received = snap.raw_received,
@@ -318,7 +318,7 @@ impl MotionFrameSource for VmcUnmotionSource {
 		}
 		if after_frames / FRAME_LOG_INTERVAL > before_frames / FRAME_LOG_INTERVAL {
 			let snap = self.telemetry.atomics.snapshot();
-			info!(
+			debug!(
 				target: "un_motion_runtime::vmc_unmotion_source",
 				source_id = %self.source_id,
 				total_frames_emitted = snap.frames_emitted,
