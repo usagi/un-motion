@@ -12,6 +12,9 @@ pub const IFACIALMOCAP_UDP_PORT: u16 = 49983;
 pub const IFACIALMOCAP_TCP_PORT: u16 = 49986;
 const TCP_REASSEMBLY_MAX_BYTES: usize = 64 * 1024;
 const TCP_FRAME_DELIMITER: &str = "___iFacialMocap";
+const IFACIALMOCAP_EYE_ROTATION_SCALE: f32 = 0.35;
+const IFACIALMOCAP_EYE_ROTATION_CLAMP_DEG: f32 = 8.0;
+const IFACIALMOCAP_EYE_ROTATION_DEADZONE_DEG: f32 = 1.25;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IfacialMocapTransport {
@@ -71,6 +74,9 @@ pub struct IfacialMocapFrame {
 impl IfacialMocapFrame {
 	pub fn to_unmotion_frame(&self, sequence: u64) -> UNMotionFrame {
 		let mut frame = UNMotionFrame::new(sequence);
+		let head = mirror_euler_left_right(self.head);
+		let left_eye = conditioned_eye_euler(mirror_euler_left_right(self.right_eye));
+		let right_eye = conditioned_eye_euler(mirror_euler_left_right(self.left_eye));
 		frame.header = MotionHeader {
 			magic: MotionHeader::MAGIC,
 			version_major: 1,
@@ -99,12 +105,11 @@ impl IfacialMocapFrame {
 		frame.face = Some(FaceMotion {
 			tracking_state: tracking_state(self.confidence),
 			confidence: self.confidence,
-			head: Some(transform_from_euler(self.head)),
-			expressions: self
-				.expressions
-				.iter()
+			head: Some(transform_from_euler(head)),
+			expressions: output_expression_samples(&self.expressions)
+				.into_iter()
 				.map(|(name, value)| un_motion_frame::ExpressionSample {
-					name: name.clone(),
+					name,
 					value: value.clamp(0.0, 1.0),
 					confidence: self.confidence,
 					source_index,
@@ -116,11 +121,11 @@ impl IfacialMocapFrame {
 		frame.eyes = Some(EyeMotion {
 			tracking_state: tracking_state(self.confidence),
 			confidence: self.confidence,
-			left_gaze: Some(gaze_from_euler(self.left_eye, self.confidence)),
-			right_gaze: Some(gaze_from_euler(self.right_eye, self.confidence)),
-			combined_gaze: Some(gaze_from_euler(average_euler(self.left_eye, self.right_eye), self.confidence)),
-			blink_left: expression_value(&self.expressions, "eyeBlinkLeft"),
-			blink_right: expression_value(&self.expressions, "eyeBlinkRight"),
+			left_gaze: Some(gaze_from_euler(left_eye, self.confidence)),
+			right_gaze: Some(gaze_from_euler(right_eye, self.confidence)),
+			combined_gaze: Some(gaze_from_euler(average_euler(left_eye, right_eye), self.confidence)),
+			blink_left: expression_output_value(&self.expressions, "EyeBlinkLeft"),
+			blink_right: expression_output_value(&self.expressions, "EyeBlinkRight"),
 		});
 
 		frame.body = Some(BodyMotion {
@@ -129,24 +134,24 @@ impl IfacialMocapFrame {
 			humanoid: Some(HumanoidPose {
 				root: None,
 				bones: vec![
-					bone_sample(HumanoidBone::Head, self.head, self.confidence, source_index),
-					bone_sample(HumanoidBone::LeftEye, self.left_eye, self.confidence, source_index),
-					bone_sample(HumanoidBone::RightEye, self.right_eye, self.confidence, source_index),
+					bone_sample(HumanoidBone::Head, head, self.confidence, source_index),
+					bone_sample(HumanoidBone::LeftEye, left_eye, self.confidence, source_index),
+					bone_sample(HumanoidBone::RightEye, right_eye, self.confidence, source_index),
 				],
 			}),
 		});
 
-		push_scalar_signal(&mut frame, "head.yaw", self.head.yaw, self.confidence, source_index);
-		push_scalar_signal(&mut frame, "head.pitch", self.head.pitch, self.confidence, source_index);
-		push_scalar_signal(&mut frame, "head.roll", self.head.roll, self.confidence, source_index);
-		push_scalar_signal(&mut frame, "eye.left.yaw", self.left_eye.yaw, self.confidence, source_index);
-		push_scalar_signal(&mut frame, "eye.left.pitch", self.left_eye.pitch, self.confidence, source_index);
-		push_scalar_signal(&mut frame, "eye.right.yaw", self.right_eye.yaw, self.confidence, source_index);
-		push_scalar_signal(&mut frame, "eye.right.pitch", self.right_eye.pitch, self.confidence, source_index);
-		for (name, value) in &self.expressions {
+		push_scalar_signal(&mut frame, "head.yaw", head.yaw, self.confidence, source_index);
+		push_scalar_signal(&mut frame, "head.pitch", head.pitch, self.confidence, source_index);
+		push_scalar_signal(&mut frame, "head.roll", head.roll, self.confidence, source_index);
+		push_scalar_signal(&mut frame, "eye.left.yaw", left_eye.yaw, self.confidence, source_index);
+		push_scalar_signal(&mut frame, "eye.left.pitch", left_eye.pitch, self.confidence, source_index);
+		push_scalar_signal(&mut frame, "eye.right.yaw", right_eye.yaw, self.confidence, source_index);
+		push_scalar_signal(&mut frame, "eye.right.pitch", right_eye.pitch, self.confidence, source_index);
+		for (output_name, value) in output_expression_samples(&self.expressions) {
 			push_scalar_signal(
 				&mut frame,
-				format!("face.{name}"),
+				format!("face.{output_name}"),
 				value.clamp(0.0, 1.0),
 				self.confidence,
 				source_index,
@@ -341,7 +346,7 @@ pub fn parse_ifacialmocap_frame(packet: &str, source_id: &str, received_timestam
 			.trim();
 		let Some((field_name, raw_value)) = normalized.split_once('#') else {
 			if let Some((name, value)) = parse_blendshape_segment(normalized) {
-				expressions.push((name.to_string(), value));
+				push_expression_if_supported(&mut expressions, name, value);
 			}
 			continue;
 		};
@@ -357,7 +362,11 @@ pub fn parse_ifacialmocap_frame(packet: &str, source_id: &str, received_timestam
 		} else if field_name.eq_ignore_ascii_case("confidence") {
 			confidence = raw_value.parse::<f32>().unwrap_or(confidence).clamp(0.0, 1.0);
 		} else if let Ok(value) = raw_value.parse::<f32>() {
-			expressions.push((field_name.to_string(), normalize_blendshape_value(value)));
+			push_expression_if_supported(
+				&mut expressions,
+				normalize_expression_name(field_name),
+				normalize_blendshape_value(value),
+			);
 		}
 	}
 
@@ -374,8 +383,8 @@ pub fn parse_ifacialmocap_frame(packet: &str, source_id: &str, received_timestam
 
 fn parse_triplet(raw: &str) -> anyhow::Result<EulerDeg> {
 	let mut values = raw.split(',').map(str::trim);
-	let yaw = parse_next_triplet_value(&mut values, raw, "x")?;
-	let pitch = parse_next_triplet_value(&mut values, raw, "y")?;
+	let pitch = parse_next_triplet_value(&mut values, raw, "x")?;
+	let yaw = parse_next_triplet_value(&mut values, raw, "y")?;
 	let roll = parse_next_triplet_value(&mut values, raw, "z")?;
 	Ok(EulerDeg { yaw, pitch, roll })
 }
@@ -417,7 +426,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 	haystack.windows(needle.len()).position(|window| window == needle)
 }
 
-fn parse_blendshape_segment(segment: &str) -> Option<(&str, f32)> {
+fn parse_blendshape_segment(segment: &str) -> Option<(String, f32)> {
 	let (name, raw_value) = if let Some((name, raw_value)) = segment.split_once('&') {
 		(name.trim(), raw_value.trim())
 	} else {
@@ -428,8 +437,704 @@ fn parse_blendshape_segment(segment: &str) -> Option<(&str, f32)> {
 		return None;
 	}
 	let value = raw_value.parse::<f32>().ok()?;
-	Some((name, normalize_blendshape_value(value)))
+	Some((normalize_expression_name(name), normalize_blendshape_value(value)))
 }
+
+fn normalize_expression_name(name: &str) -> String {
+	let trimmed = name.trim();
+	if let Some(base) = trimmed.strip_suffix("Left") {
+		return format!("{base}Left");
+	}
+	if let Some(base) = trimmed.strip_suffix("Right") {
+		return format!("{base}Right");
+	}
+	if let Some(base) = trimmed.strip_suffix("_L") {
+		return format!("{base}Left");
+	}
+	if let Some(base) = trimmed.strip_suffix("_R") {
+		return format!("{base}Right");
+	}
+	trimmed.to_string()
+}
+
+fn push_expression_if_supported(expressions: &mut Vec<(String, f32)>, name: String, value: f32) {
+	if is_supported_expression_name(&name) {
+		expressions.push((name, value));
+	}
+}
+
+fn is_supported_expression_name(name: &str) -> bool {
+	PERFECT_SYNC_EXPRESSION_NAMES.iter().any(|candidate| *candidate == name)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExpressionRoute {
+	target: &'static str,
+	source: &'static str,
+	scale: f32,
+	offset: f32,
+}
+
+impl ExpressionRoute {
+	fn apply(self, value: f32) -> f32 {
+		let deadzone = neutral_expression_deadzone(self.source);
+		if value <= deadzone || deadzone >= 1.0 {
+			return 0.0;
+		}
+		let normalized = (value - deadzone) / (1.0 - deadzone);
+		(normalized * self.scale + self.offset.min(0.0)).clamp(0.0, 1.0)
+	}
+}
+
+fn output_expression_samples(expressions: &[(String, f32)]) -> Vec<(String, f32)> {
+	WAIDAYO_EXPRESSION_ROUTES
+		.iter()
+		.filter_map(|route| {
+			reference_expression_value(route.target, expressions)
+				.or_else(|| routed_expression_input_value(expressions, route.source).map(|value| route.apply(value)))
+				.map(|value| (route.target.to_string(), value))
+		})
+		.collect()
+}
+
+fn expression_input_value(expressions: &[(String, f32)], name: &str) -> Option<f32> {
+	expressions
+		.iter()
+		.find(|(expression_name, _)| expression_name.eq_ignore_ascii_case(name))
+		.map(|(_, value)| *value)
+}
+
+fn routed_expression_input_value(expressions: &[(String, f32)], name: &str) -> Option<f32> {
+	expression_input_value(expressions, name)
+}
+
+fn expression_output_value(expressions: &[(String, f32)], target_name: &str) -> Option<f32> {
+	if let Some(value) = reference_expression_value(target_name, expressions) {
+		return Some(value);
+	}
+	WAIDAYO_EXPRESSION_ROUTES
+		.iter()
+		.find(|route| route.target.eq_ignore_ascii_case(target_name))
+		.and_then(|route| routed_expression_input_value(expressions, route.source).map(|value| route.apply(value)))
+}
+
+fn reference_expression_value(target_name: &str, expressions: &[(String, f32)]) -> Option<f32> {
+	if is_mouth_reference_target(target_name) && !has_mouth_reference_activity(expressions) {
+		return has_mouth_reference_input(expressions).then_some(0.0);
+	}
+	match target_name {
+		"JawOpen" => Some(linear_reference_expression(
+			expressions,
+			0.0193575,
+			&[
+				("mouthPucker", 0.895732),
+				("mouthShrugLower", -0.834260),
+				("mouthUpperUpRight", -0.813287),
+				("mouthUpperUpLeft", 0.806331),
+				("mouthStretchRight", 0.687600),
+				("jawForward", 0.685263),
+				("mouthPressRight", -0.673926),
+				("cheekSquintLeft", -0.628695),
+				("mouthShrugUpper", 0.620638),
+				("cheekSquintRight", 0.605881),
+				("mouthDimpleLeft", 0.287633),
+				("mouthDimpleRight", 0.256968),
+			],
+		)),
+		"MouthClose" => Some(
+			(linear_reference_expression(
+				expressions,
+				0.0542856,
+				&[
+					("mouthPucker", 0.991320),
+					("mouthStretchLeft", -0.694120),
+					("mouthShrugLower", -0.641695),
+					("jawForward", 0.624090),
+					("mouthStretchRight", 0.610927),
+					("mouthUpperUpRight", -0.445962),
+					("mouthDimpleLeft", 0.427641),
+					("mouthPressLeft", -0.402367),
+					("cheekSquintRight", 0.383662),
+					("mouthRollLower", 0.296870),
+					("mouthDimpleRight", 0.269139),
+					("mouthUpperUpLeft", 0.189510),
+				],
+			) * 0.35)
+				.clamp(0.0, 1.0),
+		),
+		"MouthFunnel" => Some(
+			(linear_reference_expression(
+				expressions,
+				0.016428,
+				&[
+					("mouthLowerDownRight", -0.779802),
+					("mouthPressLeft", -0.692941),
+					("jawForward", 0.681390),
+					("mouthLowerDownLeft", 0.583915),
+					("mouthPucker", 0.574089),
+					("mouthShrugLower", -0.470701),
+					("mouthPressRight", 0.409697),
+					("mouthDimpleRight", 0.376845),
+					("cheekSquintRight", 0.364146),
+					("cheekSquintLeft", 0.301663),
+					("mouthShrugUpper", 0.223403),
+					("mouthStretchRight", 0.198249),
+				],
+			) * 0.33)
+				.clamp(0.0, 1.0),
+		),
+		"MouthPucker" => Some(linear_reference_expression(
+			expressions,
+			-0.0440393,
+			&[
+				("mouthPucker", 1.047880),
+				("mouthDimpleRight", 0.583544),
+				("mouthShrugLower", -0.522829),
+				("mouthShrugUpper", 0.422763),
+				("mouthPressLeft", -0.303711),
+				("mouthDimpleLeft", -0.257891),
+				("cheekSquintLeft", 0.174118),
+				("mouthPressRight", 0.170328),
+				("jawForward", 0.151967),
+				("mouthStretchLeft", -0.129068),
+				("mouthRollLower", 0.123525),
+				("mouthStretchRight", 0.110059),
+			],
+		)),
+		"MouthLowerDownLeft" => Some(linear_reference_expression(
+			expressions,
+			0.0988282,
+			&[
+				("mouthStretchLeft", 0.951173),
+				("cheekSquintRight", 0.712863),
+				("mouthShrugLower", -0.640984),
+				("mouthStretchRight", -0.638482),
+				("mouthLowerDownRight", 0.460380),
+				("cheekSquintLeft", -0.420251),
+				("mouthDimpleRight", -0.397521),
+				("jawForward", 0.381497),
+				("mouthUpperUpRight", -0.348055),
+				("mouthDimpleLeft", 0.259369),
+				("mouthLowerDownLeft", 0.209532),
+				("mouthPressRight", 0.195917),
+			],
+		)),
+		"MouthLowerDownRight" => Some(linear_reference_expression(
+			expressions,
+			0.0479514,
+			&[
+				("mouthLowerDownRight", 0.786781),
+				("mouthStretchLeft", 0.740279),
+				("cheekSquintRight", 0.442464),
+				("mouthPressRight", 0.421028),
+				("mouthUpperUpLeft", -0.406526),
+				("mouthPressLeft", -0.394606),
+				("mouthShrugLower", -0.372652),
+				("jawForward", 0.364607),
+				("mouthStretchRight", -0.354547),
+				("mouthDimpleRight", -0.268101),
+				("cheekSquintLeft", -0.234518),
+				("mouthSmileRight", 0.165545),
+			],
+		)),
+		"MouthUpperUpLeft" => Some(linear_reference_expression(
+			expressions,
+			0.0579641,
+			&[
+				("mouthUpperUpLeft", 0.660409),
+				("cheekSquintRight", 0.514395),
+				("mouthShrugUpper", -0.457388),
+				("jawForward", -0.421338),
+				("mouthPressLeft", 0.384614),
+				("mouthStretchLeft", 0.382888),
+				("mouthDimpleRight", -0.285681),
+				("mouthStretchRight", -0.253365),
+				("mouthUpperUpRight", -0.215084),
+				("mouthPucker", -0.185683),
+				("mouthPressRight", -0.174403),
+				("cheekSquintLeft", 0.171233),
+			],
+		)),
+		"MouthUpperUpRight" => Some(linear_reference_expression(
+			expressions,
+			-0.0432926,
+			&[
+				("mouthShrugUpper", -0.808661),
+				("cheekSquintRight", 0.760106),
+				("mouthDimpleLeft", -0.718591),
+				("mouthShrugLower", 0.508648),
+				("jawForward", -0.405385),
+				("mouthUpperUpRight", 0.365672),
+				("mouthStretchLeft", 0.343098),
+				("mouthDimpleRight", 0.213314),
+				("mouthRollLower", 0.177719),
+				("mouthLowerDownLeft", 0.174027),
+				("cheekSquintLeft", -0.169373),
+				("mouthPressRight", 0.143459),
+			],
+		)),
+		_ => None,
+	}
+}
+
+fn is_mouth_reference_target(target_name: &str) -> bool {
+	matches!(
+		target_name,
+		"JawOpen"
+			| "MouthClose"
+			| "MouthFunnel"
+			| "MouthPucker"
+			| "MouthLowerDownLeft"
+			| "MouthLowerDownRight"
+			| "MouthUpperUpLeft"
+			| "MouthUpperUpRight"
+	)
+}
+
+fn has_mouth_reference_activity(expressions: &[(String, f32)]) -> bool {
+	mouth_reference_source_names()
+		.iter()
+		.any(|name| routed_expression_input_value(expressions, name).is_some_and(|value| value > neutral_expression_deadzone(name) + 0.03))
+}
+
+fn has_mouth_reference_input(expressions: &[(String, f32)]) -> bool {
+	mouth_reference_source_names()
+		.iter()
+		.any(|name| routed_expression_input_value(expressions, name).is_some())
+}
+
+fn mouth_reference_source_names() -> &'static [&'static str] {
+	&[
+		"jawOpen",
+		"mouthClose",
+		"mouthFunnel",
+		"mouthPucker",
+		"mouthLowerDownLeft",
+		"mouthLowerDownRight",
+		"mouthUpperUpLeft",
+		"mouthUpperUpRight",
+		"mouthStretchLeft",
+		"mouthStretchRight",
+		"mouthPressLeft",
+		"mouthPressRight",
+	]
+}
+
+fn linear_reference_expression(expressions: &[(String, f32)], intercept: f32, terms: &[(&str, f32)]) -> f32 {
+	let mut value = intercept;
+	for (name, coefficient) in terms {
+		value += routed_expression_input_value(expressions, name).unwrap_or(0.0) * coefficient;
+	}
+	value.clamp(0.0, 1.0)
+}
+
+fn neutral_expression_deadzone(source: &str) -> f32 {
+	match source {
+		"browDownLeft" => 0.08,
+		"browDownRight" => 0.07,
+		"browInnerUp" => 0.17,
+		"cheekPuff" => 0.15,
+		"cheekSquintLeft" | "cheekSquintRight" => 0.05,
+		"eyeBlinkLeft" | "eyeBlinkRight" => 0.20,
+		"eyeLookDownLeft" | "eyeLookDownRight" | "eyeLookInLeft" | "eyeLookInRight" | "eyeLookOutLeft" | "eyeLookOutRight"
+		| "eyeLookUpLeft" | "eyeLookUpRight" => 1.0,
+		"eyeSquintLeft" | "eyeSquintRight" => 0.05,
+		"jawForward" => 0.04,
+		"jawLeft" => 1.0,
+		"jawOpen" => 0.08,
+		"mouthClose" => 0.08,
+		"mouthDimpleLeft" => 0.05,
+		"mouthDimpleRight" => 0.06,
+		"mouthFrownLeft" => 0.10,
+		"mouthFrownRight" => 0.13,
+		"mouthFunnel" => 0.06,
+		"mouthLeft" => 0.03,
+		"mouthLowerDownLeft" => 0.11,
+		"mouthLowerDownRight" => 0.10,
+		"mouthPressLeft" | "mouthPressRight" => 0.15,
+		"mouthPucker" => 0.20,
+		"mouthRollLower" => 0.11,
+		"mouthRollUpper" => 0.04,
+		"mouthShrugLower" => 0.15,
+		"mouthShrugUpper" => 0.10,
+		"mouthStretchLeft" | "mouthStretchRight" => 0.20,
+		"mouthUpperUpLeft" => 0.05,
+		"mouthUpperUpRight" => 0.06,
+		"noseSneerLeft" => 0.16,
+		"noseSneerRight" => 0.19,
+		_ => 0.0,
+	}
+}
+
+const PERFECT_SYNC_EXPRESSION_NAMES: &[&str] = &[
+	"browDownLeft",
+	"browDownRight",
+	"browInnerUp",
+	"browOuterUpLeft",
+	"browOuterUpRight",
+	"cheekPuff",
+	"cheekSquintLeft",
+	"cheekSquintRight",
+	"eyeBlinkLeft",
+	"eyeBlinkRight",
+	"eyeLookDownLeft",
+	"eyeLookDownRight",
+	"eyeLookInLeft",
+	"eyeLookInRight",
+	"eyeLookOutLeft",
+	"eyeLookOutRight",
+	"eyeLookUpLeft",
+	"eyeLookUpRight",
+	"eyeSquintLeft",
+	"eyeSquintRight",
+	"eyeWideLeft",
+	"eyeWideRight",
+	"jawForward",
+	"jawLeft",
+	"jawOpen",
+	"jawRight",
+	"mouthClose",
+	"mouthDimpleLeft",
+	"mouthDimpleRight",
+	"mouthFrownLeft",
+	"mouthFrownRight",
+	"mouthFunnel",
+	"mouthLeft",
+	"mouthLowerDownLeft",
+	"mouthLowerDownRight",
+	"mouthPressLeft",
+	"mouthPressRight",
+	"mouthPucker",
+	"mouthRight",
+	"mouthRollLower",
+	"mouthRollUpper",
+	"mouthShrugLower",
+	"mouthShrugUpper",
+	"mouthSmileLeft",
+	"mouthSmileRight",
+	"mouthStretchLeft",
+	"mouthStretchRight",
+	"mouthUpperUpLeft",
+	"mouthUpperUpRight",
+	"noseSneerLeft",
+	"noseSneerRight",
+	"tongueOut",
+];
+
+const WAIDAYO_EXPRESSION_ROUTES: &[ExpressionRoute] = &[
+	ExpressionRoute {
+		target: "BrowDownLeft",
+		source: "browDownLeft",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "BrowDownRight",
+		source: "browDownRight",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "BrowInnerUp",
+		source: "browInnerUp",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "BrowOuterUpLeft",
+		source: "browOuterUpLeft",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "BrowOuterUpRight",
+		source: "browOuterUpRight",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "CheekPuff",
+		source: "cheekPuff",
+		scale: 0.45,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "CheekSquintLeft",
+		source: "cheekSquintLeft",
+		scale: 1.55,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "CheekSquintRight",
+		source: "cheekSquintRight",
+		scale: 1.35,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "EyeBlinkLeft",
+		source: "eyeBlinkLeft",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "EyeBlinkRight",
+		source: "eyeBlinkRight",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "EyeLookDownLeft",
+		source: "eyeLookDownLeft",
+		scale: 0.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "EyeLookDownRight",
+		source: "eyeLookDownRight",
+		scale: 0.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "EyeLookInLeft",
+		source: "eyeLookInLeft",
+		scale: 0.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "EyeLookInRight",
+		source: "eyeLookInRight",
+		scale: 0.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "EyeLookOutLeft",
+		source: "eyeLookOutLeft",
+		scale: 0.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "EyeLookOutRight",
+		source: "eyeLookOutRight",
+		scale: 0.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "EyeLookUpLeft",
+		source: "eyeLookUpLeft",
+		scale: 0.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "EyeLookUpRight",
+		source: "eyeLookUpRight",
+		scale: 0.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "EyeSquintLeft",
+		source: "eyeSquintLeft",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "EyeSquintRight",
+		source: "eyeSquintRight",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "EyeWideLeft",
+		source: "eyeWideLeft",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "EyeWideRight",
+		source: "eyeWideRight",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "JawForward",
+		source: "jawForward",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "JawLeft",
+		source: "jawLeft",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "JawOpen",
+		source: "jawOpen",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "JawRight",
+		source: "jawRight",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "MouthClose",
+		source: "mouthClose",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "MouthDimpleLeft",
+		source: "mouthDimpleLeft",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "MouthDimpleRight",
+		source: "mouthDimpleRight",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "MouthFrownLeft",
+		source: "mouthFrownLeft",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "MouthFrownRight",
+		source: "mouthFrownRight",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "MouthFunnel",
+		source: "mouthFunnel",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "MouthLeft",
+		source: "mouthLeft",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "MouthLowerDownLeft",
+		source: "mouthLowerDownLeft",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "MouthLowerDownRight",
+		source: "mouthLowerDownRight",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "MouthPressLeft",
+		source: "mouthPressLeft",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "MouthPressRight",
+		source: "mouthPressRight",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "MouthPucker",
+		source: "mouthPucker",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "MouthRight",
+		source: "mouthRight",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "MouthRollLower",
+		source: "mouthRollLower",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "MouthRollUpper",
+		source: "mouthRollUpper",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "MouthShrugLower",
+		source: "mouthShrugLower",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "MouthShrugUpper",
+		source: "mouthShrugUpper",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "MouthSmileLeft",
+		source: "mouthSmileLeft",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "MouthSmileRight",
+		source: "mouthSmileRight",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "MouthStretchLeft",
+		source: "mouthStretchLeft",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "MouthStretchRight",
+		source: "mouthStretchRight",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "MouthUpperUpLeft",
+		source: "mouthUpperUpLeft",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "MouthUpperUpRight",
+		source: "mouthUpperUpRight",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "NoseSneerLeft",
+		source: "noseSneerLeft",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "NoseSneerRight",
+		source: "noseSneerRight",
+		scale: 1.0,
+		offset: 0.0,
+	},
+	ExpressionRoute {
+		target: "TongueOut",
+		source: "tongueOut",
+		scale: 1.0,
+		offset: 0.0,
+	},
+];
 
 fn normalize_blendshape_value(value: f32) -> f32 {
 	if value.is_finite() {
@@ -498,19 +1203,36 @@ fn gaze_from_euler(euler: EulerDeg, confidence: f32) -> GazeSample {
 	}
 }
 
+fn conditioned_eye_euler(euler: EulerDeg) -> EulerDeg {
+	EulerDeg {
+		yaw: conditioned_eye_angle(euler.yaw),
+		pitch: conditioned_eye_angle(euler.pitch),
+		roll: 0.0,
+	}
+}
+
+fn conditioned_eye_angle(angle: f32) -> f32 {
+	if angle.abs() <= IFACIALMOCAP_EYE_ROTATION_DEADZONE_DEG {
+		0.0
+	} else {
+		(angle * IFACIALMOCAP_EYE_ROTATION_SCALE).clamp(-IFACIALMOCAP_EYE_ROTATION_CLAMP_DEG, IFACIALMOCAP_EYE_ROTATION_CLAMP_DEG)
+	}
+}
+
+fn mirror_euler_left_right(euler: EulerDeg) -> EulerDeg {
+	EulerDeg {
+		yaw: -euler.yaw,
+		pitch: euler.pitch,
+		roll: -euler.roll,
+	}
+}
+
 fn average_euler(left: EulerDeg, right: EulerDeg) -> EulerDeg {
 	EulerDeg {
 		yaw: (left.yaw + right.yaw) * 0.5,
 		pitch: (left.pitch + right.pitch) * 0.5,
 		roll: (left.roll + right.roll) * 0.5,
 	}
-}
-
-fn expression_value(expressions: &[(String, f32)], name: &str) -> Option<f32> {
-	expressions
-		.iter()
-		.find(|(expression_name, _)| expression_name.eq_ignore_ascii_case(name))
-		.map(|(_, value)| *value)
 }
 
 fn push_scalar_signal(frame: &mut UNMotionFrame, name: impl Into<String>, value: f32, confidence: f32, source_index: Option<u16>) {
@@ -604,12 +1326,14 @@ mod tests {
 		let frame = parse_ifacialmocap_frame(packet, "ifm:test", 1234).expect("parse");
 
 		assert_eq!(frame.source_id, "ifm:test");
-		assert_eq!(frame.head.yaw, 2.5);
-		assert_eq!(frame.left_eye.pitch, -0.4);
+		assert_eq!(frame.head.pitch, 2.5);
+		assert_eq!(frame.head.yaw, -1.5);
+		assert_eq!(frame.left_eye.pitch, 1.2);
+		assert_eq!(frame.left_eye.yaw, -0.4);
 		assert_eq!(frame.confidence, 0.92);
 		assert_eq!(
 			frame.expressions,
-			vec![("eyeBlinkLeft".to_string(), 0.7), ("mouthSmile_R".to_string(), 0.65)]
+			vec![("eyeBlinkLeft".to_string(), 0.7), ("mouthSmileRight".to_string(), 0.65)]
 		);
 	}
 
@@ -619,7 +1343,19 @@ mod tests {
 
 		let frame = parse_ifacialmocap_frame(packet, "ifm:test", 1234).expect("parse");
 
-		assert_eq!(frame.expressions, vec![("mouthSmile_R".to_string(), -0.25)]);
+		assert_eq!(frame.expressions, vec![("mouthSmileRight".to_string(), -0.25)]);
+	}
+
+	#[test]
+	fn drops_control_and_unknown_expression_fields() {
+		let packet = "trackingStatus-1|hapihapi-100|tongueOut-25|mouthSmile_R-65|head#0.0,0.0,0.0|leftEye#0.0,0.0,0.0|rightEye#0.0,0.0,0.0";
+
+		let frame = parse_ifacialmocap_frame(packet, "ifm:test", 1234).expect("parse");
+
+		assert_eq!(
+			frame.expressions,
+			vec![("tongueOut".to_string(), 0.25), ("mouthSmileRight".to_string(), 0.65)]
+		);
 	}
 
 	#[test]
@@ -629,6 +1365,143 @@ mod tests {
 		let frame = parse_ifacialmocap_frame(packet, "ifm:test", 1).expect("parse");
 
 		assert_eq!(frame.head.roll, 0.4);
+	}
+
+	#[test]
+	fn maps_ifacialmocap_xyz_rotation_to_pitch_yaw_roll() {
+		let packet = "head#10.0,20.0,30.0|leftEye#1.0,2.0,3.0|rightEye#4.0,5.0,6.0";
+
+		let frame = parse_ifacialmocap_frame(packet, "ifm:test", 1).expect("parse");
+
+		assert_eq!(
+			frame.head,
+			EulerDeg {
+				pitch: 10.0,
+				yaw: 20.0,
+				roll: 30.0
+			}
+		);
+		assert_eq!(
+			frame.left_eye,
+			EulerDeg {
+				pitch: 1.0,
+				yaw: 2.0,
+				roll: 3.0
+			}
+		);
+		let unmotion = frame.to_unmotion_frame(7);
+		let head = unmotion
+			.body
+			.as_ref()
+			.and_then(|body| body.humanoid.as_ref())
+			.and_then(|humanoid| humanoid.bones.iter().find(|bone| bone.bone == HumanoidBone::Head))
+			.and_then(|bone| bone.transform.rotation)
+			.expect("head rotation");
+		let pitch_only = parse_ifacialmocap_frame("head#10.0,0.0,0.0|leftEye#0.0,0.0,0.0|rightEye#0.0,0.0,0.0", "ifm:test", 1)
+			.expect("parse")
+			.to_unmotion_frame(8);
+		let pitch_head = pitch_only
+			.body
+			.as_ref()
+			.and_then(|body| body.humanoid.as_ref())
+			.and_then(|humanoid| humanoid.bones.iter().find(|bone| bone.bone == HumanoidBone::Head))
+			.and_then(|bone| bone.transform.rotation)
+			.expect("pitch head rotation");
+		assert!(head.x.abs() > 0.05, "combined x rotation should be present: {head:?}");
+		assert!(pitch_head.x.abs() > 0.05, "x input should drive quaternion x/pitch: {pitch_head:?}");
+		assert!(
+			pitch_head.y.abs() < 1e-5,
+			"x input should not drive quaternion y/yaw: {pitch_head:?}"
+		);
+	}
+
+	#[test]
+	fn emits_eye_look_once_as_eye_bones_not_face_expressions() {
+		let packet =
+			"eyeLookOut_L-80|eyeLookIn_R-75|eyeBlink_L-25|mouthSmile_R-65|head#0.0,0.0,0.0|leftEye#1.0,2.0,3.0|rightEye#4.0,5.0,6.0";
+
+		let frame = parse_ifacialmocap_frame(packet, "ifm:test", 1).expect("parse").to_unmotion_frame(1);
+		let face = frame.face.as_ref().expect("face");
+		let names = face
+			.expressions
+			.iter()
+			.map(|expression| expression.name.as_str())
+			.collect::<Vec<_>>();
+
+		assert_eq!(names, vec!["EyeBlinkLeft", "EyeLookInRight", "EyeLookOutLeft", "MouthSmileRight"]);
+		assert!(frame.signals.iter().any(|signal| signal.name == "face.EyeLookOutLeft"));
+		assert!(frame.signals.iter().any(|signal| signal.name == "eye.left.yaw"));
+		assert!(
+			frame
+				.body
+				.as_ref()
+				.and_then(|body| body.humanoid.as_ref())
+				.is_some_and(|humanoid| humanoid.bones.iter().any(|bone| bone.bone == HumanoidBone::LeftEye))
+		);
+	}
+
+	#[test]
+	fn suppresses_neutral_mouth_and_eye_noise() {
+		let packet = "jawOpen-7|mouthPucker-19|mouthLowerDown_L-10|mouthLowerDown_R-9|cheekPuff-13|eyeLookOut_L-100|eyeLookDown_R-100|eyeBlink_L-18|eyeBlink_R-18|head#0.0,0.0,0.0|leftEye#1.0,1.0,0.0|rightEye#-1.0,-1.0,0.0";
+
+		let frame = parse_ifacialmocap_frame(packet, "ifm:test", 1).expect("parse").to_unmotion_frame(1);
+		let face = frame.face.as_ref().expect("face");
+
+		for name in [
+			"JawOpen",
+			"MouthClose",
+			"MouthFunnel",
+			"MouthLowerDownLeft",
+			"MouthLowerDownRight",
+			"CheekPuff",
+			"EyeLookOutLeft",
+			"EyeLookDownRight",
+			"EyeBlinkLeft",
+			"EyeBlinkRight",
+		] {
+			let value = face
+				.expressions
+				.iter()
+				.find(|expression| expression.name == name)
+				.map(|expression| expression.value)
+				.unwrap_or(0.0);
+			assert_eq!(value, 0.0, "{name} should be neutral-suppressed");
+		}
+		assert!(
+			frame
+				.signals
+				.iter()
+				.any(|signal| signal.name == "eye.left.yaw" && signal.value == MotionSignalValue::Scalar(0.0))
+		);
+	}
+
+	#[test]
+	fn preserves_cheek_puff_and_direct_open_mouth_shapes() {
+		let packet = "jawOpen-80|mouthClose-90|mouthFunnel-90|mouthPucker-90|mouthPress_L-80|mouthPress_R-80|mouthLowerDown_L-80|mouthLowerDown_R-20|mouthUpperUp_L-70|mouthUpperUp_R-10|cheekPuff-80|head#0.0,0.0,0.0|leftEye#0.0,0.0,0.0|rightEye#0.0,0.0,0.0";
+
+		let frame = parse_ifacialmocap_frame(packet, "ifm:test", 1).expect("parse").to_unmotion_frame(1);
+		let face = frame.face.as_ref().expect("face");
+		let value = |name: &str| {
+			face.expressions
+				.iter()
+				.find(|expression| expression.name == name)
+				.map(|expression| expression.value)
+				.unwrap_or(0.0)
+		};
+
+		assert!(value("CheekPuff") > 0.3, "CheekPuff should remain active but VMC-scaled");
+		for name in [
+			"JawOpen",
+			"MouthClose",
+			"MouthFunnel",
+			"MouthPucker",
+			"MouthLowerDownLeft",
+			"MouthLowerDownRight",
+			"MouthUpperUpLeft",
+			"MouthUpperUpRight",
+		] {
+			assert!((0.0..=1.0).contains(&value(name)), "{name} should stay clamped");
+		}
 	}
 
 	#[test]
@@ -655,7 +1528,7 @@ mod tests {
 			3
 		);
 		assert!(frame.eyes.as_ref().expect("eyes").left_gaze.is_some());
-		assert!(frame.signals.iter().any(|signal| signal.name == "face.eyeBlinkLeft"));
+		assert!(frame.signals.iter().any(|signal| signal.name == "face.EyeBlinkLeft"));
 	}
 
 	#[test]
@@ -666,11 +1539,16 @@ mod tests {
 			let input = parse_ifacialmocap_frame(packet, "ifm:fixture", index as u64).expect("fixture packet");
 			let frame = input.to_unmotion_frame(index as u64);
 
-			assert_eq!(input.expressions.len(), 54);
+			assert_eq!(input.expressions.len(), 52);
 			assert!(input.expressions.iter().any(|(name, _)| name == "jawOpen"));
-			assert!(input.expressions.iter().any(|(name, _)| name == "eyeBlink_L"));
-			assert!(frame.signals.iter().any(|signal| signal.name == "face.jawOpen"));
-			assert_eq!(frame.face.as_ref().expect("face").expressions.len(), 54);
+			assert!(input.expressions.iter().any(|(name, _)| name == "eyeBlinkLeft"));
+			assert!(frame.signals.iter().any(|signal| signal.name == "face.JawOpen"));
+			let face = frame.face.as_ref().expect("face");
+			assert_eq!(face.expressions.len(), 52);
+			assert!(face.expressions.iter().any(|expression| expression.name == "CheekPuff"));
+			assert!(face.expressions.iter().any(|expression| expression.name == "MouthPucker"));
+			assert!(face.expressions.iter().any(|expression| expression.name == "MouthClose"));
+			assert!(face.expressions.iter().any(|expression| expression.name == "MouthFunnel"));
 			assert_eq!(
 				frame.body.as_ref().expect("body").humanoid.as_ref().expect("humanoid").bones.len(),
 				3
@@ -706,7 +1584,8 @@ mod tests {
 
 		assert_eq!(batch.frames.len(), 1);
 		assert_eq!(batch.decode_errors, 1);
-		assert_eq!(batch.frames[0].head.yaw, 6.0);
+		assert_eq!(batch.frames[0].head.pitch, 6.0);
+		assert_eq!(batch.frames[0].head.yaw, -2.0);
 	}
 
 	#[test]
@@ -735,7 +1614,8 @@ mod tests {
 		writer.join().expect("writer");
 
 		assert_eq!(frames.len(), 1);
-		assert_eq!(frames[0].head.yaw, 3.0);
+		assert_eq!(frames[0].head.pitch, 3.0);
+		assert_eq!(frames[0].head.yaw, -1.5);
 		assert_eq!(frames[0].confidence, 0.9);
 	}
 }
