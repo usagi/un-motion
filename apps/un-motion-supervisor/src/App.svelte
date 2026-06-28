@@ -1410,10 +1410,7 @@
 		if (!runtime) return "Loading";
 		if (engine !== "mediapipe-native") return "N/A";
 		const headEnabled = runtime.modifierHeadEnabled ?? true;
-		const faceEnabled = runtime.modifierFaceEnabled ?? true;
-		if (!headEnabled && !faceEnabled) return "Head/Face off";
 		if (!headEnabled) return "Head off";
-		if (!faceEnabled) return "Face off";
 		if ((runtime.modifierHeadFromFaceMatrix ?? true) === false) return "Face Head off";
 		return null;
 	}
@@ -2037,7 +2034,6 @@
 		if (engine !== "mediapipe-native") return false;
 		const modifier = profile.runtimeSelection?.modifier;
 		if ((modifier?.headEnabled ?? true) === false) return false;
-		if ((modifier?.faceEnabled ?? true) === false) return false;
 		const model = modifier?.facePoseModel;
 		return !(model?.enabled && model.neutralNoseDropEyeMouth != null);
 	}
