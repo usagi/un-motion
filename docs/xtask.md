@@ -17,6 +17,8 @@ product binary ではないが repository 内で再現したい script、実験�
 ```sh
 cargo xtask verify
 cargo xtask verify --skip-frontend
+cargo xtask build
+cargo xtask build --release
 cargo xtask fmt
 cargo xtask check
 cargo xtask test
@@ -49,6 +51,10 @@ cargo xtask vmc stability-summary --dir target/vmc-captures/runs/stability --out
 ## verify
 
 `verify` は frontend と Rust check を意図的に直列実行します。1 つの検証結果が欲しい時に、frontend build、Tauri asset generation、Rust workspace check を手動で並列実行しません。
+
+## build
+
+`build` は Supervisor frontend を build してから、`un-motion-core`、`un-motion-capturer`、`un-motion-supervisor` を同じ Cargo profile で build します。`--release` を付けると release profile を使います。
 
 ## release package
 

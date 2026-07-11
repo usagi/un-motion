@@ -33,6 +33,7 @@ fn main() -> Result<()> {
 		"fmt" => cargo_simple(&repo, "fmt", ["fmt", "--all"]),
 		"check" => cargo_simple(&repo, "check", ["check", "--workspace"]),
 		"test" => cargo_simple(&repo, "test", ["test", "--workspace"]),
+		"build" => build(&repo, args.collect()),
 		"frontend" => frontend(&repo, args.collect()),
 		"core" => core(&repo, args.collect()),
 		"make-release-package" => make_release_package(&repo, args.collect()),
@@ -54,6 +55,56 @@ fn main() -> Result<()> {
 
 fn cargo_simple<const N: usize>(repo: &Path, label: &str, args: [&str; N]) -> Result<()> {
 	run(repo, "cargo", args).with_context(|| format!("cargo xtask {label} failed"))
+}
+
+#[derive(Debug)]
+struct BuildArgs {
+	release: bool,
+}
+
+fn build(repo: &Path, raw_args: Vec<OsString>) -> Result<()> {
+	let args = parse_build_args(raw_args)?;
+	build_binaries(repo, args.release)
+}
+
+fn parse_build_args(raw_args: Vec<OsString>) -> Result<BuildArgs> {
+	let mut release = false;
+	for arg in raw_args {
+		match arg.to_string_lossy().as_ref() {
+			"--release" => release = true,
+			"--help" | "-h" | "help" => {
+				print_build_usage();
+				std::process::exit(0);
+			}
+			other => bail!("unknown build option: {other}"),
+		}
+	}
+	Ok(BuildArgs { release })
+}
+
+fn build_binaries(repo: &Path, release: bool) -> Result<()> {
+	run(repo.join("apps/un-motion-supervisor"), "npm", ["run", "build"])?;
+	cargo_build_package(repo, release, "un-motion-core", "un-motion-core")?;
+	cargo_build_package(repo, release, "un-motion-capturer", "un-motion-capturer")?;
+	cargo_build_package(repo, release, "un-motion-supervisor", "un-motion-supervisor")?;
+	Ok(())
+}
+
+fn cargo_build_package(repo: &Path, release: bool, package: &str, bin: &str) -> Result<()> {
+	let mut cmd = Command::new(resolve_tool("cargo"));
+	cmd.current_dir(repo).arg("build");
+	if release {
+		cmd.arg("--release");
+	}
+	cmd.args(["-p", package, "--bin", bin]);
+	run_command(
+		&format!("cargo build{} -p {package} --bin {bin}", if release { " --release" } else { "" }),
+		&mut cmd,
+	)
+}
+
+fn print_build_usage() {
+	eprintln!("usage: cargo xtask build [--release]");
 }
 
 #[derive(Debug)]
@@ -1815,22 +1866,7 @@ fn make_release_package(repo: &Path, raw_args: Vec<OsString>) -> Result<()> {
 	let staging_dir = staging_root.join(&package_name);
 
 	if !args.skip_build {
-		run(repo.join("apps/un-motion-supervisor"), "npm", ["run", "build"])?;
-		run(
-			repo,
-			"cargo",
-			["build", "--release", "-p", "un-motion-core", "--bin", "un-motion-core"],
-		)?;
-		run(
-			repo,
-			"cargo",
-			["build", "--release", "-p", "un-motion-capturer", "--bin", "un-motion-capturer"],
-		)?;
-		run(
-			repo,
-			"cargo",
-			["build", "--release", "-p", "un-motion-supervisor", "--bin", "un-motion-supervisor"],
-		)?;
+		build_binaries(repo, true)?;
 	}
 
 	fs::create_dir_all(&output_dir).with_context(|| format!("failed to create {}", output_dir.display()))?;
@@ -4699,11 +4735,12 @@ fn unmf(repo: &Path, args: Vec<OsString>) -> Result<()> {
 		bail!("missing unmf subcommand");
 	};
 	match subcommand.to_string_lossy().as_ref() {
+		"capture-frame" | "capture" | "frame" => unmf_capture_frame(repo, args[1..].to_vec()),
 		"stability" | "stability-report" => unmf_stability_report(repo, args[1..].to_vec()),
 		"noise" | "noise-report" => unmf_noise_report(repo, args[1..].to_vec()),
 		"--help" | "-h" | "help" => {
 			eprintln!(
-				"usage:\n  cargo xtask unmf stability [--key un-motion/frame] [--topic-mode frame|by-primary-source|by-stream-id] [--duration-ms 5000] [--output report.json] [--min-samples 2]\n  cargo xtask unmf noise --input snapshot.analysis-extras.jsonl|png-dir [--output report.json] [--markdown report.md] [--spectral-points 1024]"
+				"usage:\n  cargo xtask unmf capture-frame [--key un-motion/frame] [--topic-mode frame|by-primary-source|by-stream-id] [--output frame.json] [--timeout-ms 5000]\n  cargo xtask unmf stability [--key un-motion/frame] [--topic-mode frame|by-primary-source|by-stream-id] [--duration-ms 5000] [--output report.json] [--min-samples 2]\n  cargo xtask unmf noise --input snapshot.analysis-extras.jsonl|png-dir [--output report.json] [--markdown report.md] [--spectral-points 1024]"
 			);
 			Ok(())
 		}
@@ -4835,6 +4872,62 @@ fn unmf_noise_report(repo: &Path, raw_args: Vec<OsString>) -> Result<()> {
 	println!("wrote {}", output.display());
 	println!("wrote {}", markdown.display());
 	Ok(())
+}
+
+fn unmf_capture_frame(repo: &Path, raw_args: Vec<OsString>) -> Result<()> {
+	let args = parse_unmf_capture_frame_args(raw_args)?;
+	let strategy = ZenohTopicStrategy::new(args.base_key_expr.clone(), args.topic_mode);
+	let subscribe_key_expr = strategy.subscribe_key_expr();
+	let mut backend = ZenohSubscriberBackend::open_default().context("UNMF/Z capture Zenoh open failed")?;
+	let subscriber = Subscriber::declare(&mut backend, strategy)
+		.with_context(|| format!("UNMF/Z capture subscribe failed on {subscribe_key_expr}"))?;
+	let started = Instant::now();
+	let frame = loop {
+		if started.elapsed() >= args.timeout {
+			bail!("UNMF/Z capture timed out after {} ms on {subscribe_key_expr}", args.timeout.as_millis());
+		}
+		match subscriber.recv_frame_timeout(Duration::from_millis(50)) {
+			Ok(Some(frame)) => {
+				if !unmf_capture_frame_matches(&frame, &args) {
+					continue;
+				}
+				break frame;
+			}
+			Ok(None) => {}
+			Err(error) => eprintln!("UNMF/Z capture decode error: {error}"),
+		}
+	};
+	let output_path = absolutize(repo, &args.output);
+	if let Some(parent) = output_path.parent() {
+		fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+	}
+	let json = serde_json::to_string_pretty(&frame)?;
+	fs::write(&output_path, format!("{json}\n")).with_context(|| format!("failed to write {}", output_path.display()))?;
+	println!(
+		"captured UNMotionFrame from {} to {}",
+		subscribe_key_expr,
+		output_path.display()
+	);
+	Ok(())
+}
+
+fn unmf_capture_frame_matches(frame: &UNMotionFrame, args: &UnmfCaptureFrameArgs) -> bool {
+	if let Some(stream_id) = args.stream_id.as_deref()
+		&& frame.header.stream_id.as_deref() != Some(stream_id)
+	{
+		return false;
+	}
+	if args.require_body_bones {
+		let body_bones = frame
+			.body
+			.as_ref()
+			.and_then(|body| body.humanoid.as_ref())
+			.map_or(0, |humanoid| humanoid.bones.len());
+		if body_bones == 0 {
+			return false;
+		}
+	}
+	true
 }
 
 fn parse_unmf_noise_args(raw_args: Vec<OsString>) -> Result<UnmfNoiseArgs> {
@@ -5098,21 +5191,6 @@ fn unmf_noise_luma(image: &image::RgbImage) -> Vec<f64> {
 		.collect()
 }
 
-fn unmf_noise_temporal_std(frames: &[(u32, u32, Vec<f64>)]) -> Vec<f64> {
-	let Some((_, _, first)) = frames.first() else {
-		return Vec::new();
-	};
-	let mut out = Vec::with_capacity(first.len());
-	for index in 0..first.len() {
-		let series = frames
-			.iter()
-			.filter_map(|(_, _, luma)| luma.get(index).copied())
-			.collect::<Vec<_>>();
-		out.push(std_dev_f64(&series, mean_f64(&series)));
-	}
-	out
-}
-
 #[derive(Default)]
 struct UnmfNoiseAdjacentStats {
 	mean_abs: Vec<f64>,
@@ -5147,31 +5225,6 @@ impl UnmfNoiseAdjacentStats {
 		self.flat_mean_abs
 			.push(if flat_count == 0 { 0.0 } else { flat_sum / flat_count as f64 });
 	}
-}
-
-fn unmf_noise_adjacent_stats(frames: &[(u32, u32, Vec<f64>)]) -> UnmfNoiseAdjacentStats {
-	let mut out = UnmfNoiseAdjacentStats::default();
-	for pair in frames.windows(2) {
-		let (width, height, previous) = &pair[0];
-		let (_, _, current) = &pair[1];
-		let edge = unmf_noise_edge_mask(previous, *width as usize, *height as usize);
-		let mut all = Vec::with_capacity(previous.len());
-		let mut edge_values = Vec::new();
-		let mut flat_values = Vec::new();
-		for (index, (a, b)) in previous.iter().zip(current).enumerate() {
-			let diff = (b - a).abs();
-			all.push(diff);
-			if edge.get(index).copied().unwrap_or(false) {
-				edge_values.push(diff);
-			} else {
-				flat_values.push(diff);
-			}
-		}
-		out.mean_abs.push(mean_f64(&all));
-		out.edge_mean_abs.push(mean_f64(&edge_values));
-		out.flat_mean_abs.push(mean_f64(&flat_values));
-	}
-	out
 }
 
 fn unmf_noise_edge_mask(luma: &[f64], width: usize, height: usize) -> Vec<bool> {
@@ -5217,44 +5270,6 @@ fn sort_unmf_noise_image_paths(paths: &mut [PathBuf]) {
 			.cmp(&parse_unmf_noise_timestamp_ns(right))
 			.then_with(|| left.cmp(right))
 	});
-}
-
-fn analyze_unmf_noise_temporal_spectrum(
-	frames: &[image::RgbImage],
-	timestamps_ns: &[u64],
-	requested_points: usize,
-) -> UnmfNoiseTemporalSpectrumReport {
-	let Some(first) = frames.first() else {
-		return UnmfNoiseTemporalSpectrumReport::default();
-	};
-	if frames.len() < 4 || first.width() == 0 || first.height() == 0 {
-		return UnmfNoiseTemporalSpectrumReport::default();
-	}
-	let sample_rate_hz = estimate_unmf_noise_sample_rate_hz(frames.len(), timestamps_ns);
-	let duration_secs = frames.len() as f64 / sample_rate_hz.max(1e-9);
-	let spectrum_sample_count = if frames.len() > 256 {
-		largest_power_of_two_at_most(frames.len())
-	} else {
-		frames.len()
-	};
-	let frequency_resolution_hz = sample_rate_hz / spectrum_sample_count as f64;
-	let points = halton_image_points(requested_points, first.width(), first.height());
-	let mut channels = unmf_noise_spectrum_channel_accumulators();
-	for (x, y) in &points {
-		let series = unmf_noise_pixel_series(frames, *x, *y);
-		for (index, values) in series.iter().enumerate() {
-			channels[index].push_spectrum(values, sample_rate_hz);
-		}
-	}
-	UnmfNoiseTemporalSpectrumReport {
-		points: points.len(),
-		spectrum_sample_count,
-		sample_rate_hz,
-		duration_secs,
-		frequency_resolution_hz,
-		method: "Halton quasi-random points; per-point mean-removed DFT for short series or prefix radix-2 FFT for long series; YCbCr is full-range BT.601 from gamma-coded sRGB",
-		channels: channels.into_iter().map(UnmfNoiseSpectrumChannelAccumulator::finish).collect(),
-	}
 }
 
 fn analyze_unmf_noise_temporal_spectrum_from_series(
@@ -5323,23 +5338,6 @@ fn halton(mut index: u64, base: u64) -> f64 {
 		factor /= base as f64;
 	}
 	value
-}
-
-fn unmf_noise_pixel_series(frames: &[image::RgbImage], x: u32, y: u32) -> [Vec<f64>; 3] {
-	let mut y_values = Vec::with_capacity(frames.len());
-	let mut cb_values = Vec::with_capacity(frames.len());
-	let mut cr_values = Vec::with_capacity(frames.len());
-	for frame in frames {
-		let pixel = frame.get_pixel(x.min(frame.width() - 1), y.min(frame.height() - 1)).0;
-		let rr = pixel[0] as f64 / 255.0;
-		let gg = pixel[1] as f64 / 255.0;
-		let bb = pixel[2] as f64 / 255.0;
-		let (y, cb, cr) = rgb_to_ycbcr_bt601_full_range(rr, gg, bb);
-		y_values.push(y);
-		cb_values.push(cb);
-		cr_values.push(cr);
-	}
-	[y_values, cb_values, cr_values]
 }
 
 fn rgb_to_ycbcr_bt601_full_range(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
@@ -6020,6 +6018,16 @@ struct UnmfStabilityArgs {
 	read_timeout: Duration,
 	output: Option<PathBuf>,
 	min_samples: usize,
+}
+
+#[derive(Debug)]
+struct UnmfCaptureFrameArgs {
+	base_key_expr: String,
+	topic_mode: TopicMode,
+	stream_id: Option<String>,
+	require_body_bones: bool,
+	timeout: Duration,
+	output: PathBuf,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -7399,6 +7407,57 @@ fn parse_unmf_stability_args(raw_args: Vec<OsString>) -> Result<UnmfStabilityArg
 	Ok(args)
 }
 
+fn parse_unmf_capture_frame_args(raw_args: Vec<OsString>) -> Result<UnmfCaptureFrameArgs> {
+	let mut args = UnmfCaptureFrameArgs {
+		base_key_expr: "un-motion/frame".to_string(),
+		topic_mode: TopicMode::Frame,
+		stream_id: None,
+		require_body_bones: false,
+		timeout: Duration::from_secs(5),
+		output: PathBuf::from("target/unmf-captures/frame.json"),
+	};
+	let mut iter = raw_args.into_iter();
+	while let Some(arg) = iter.next() {
+		match arg.to_string_lossy().as_ref() {
+			"--key" | "--base-key" | "--base-key-expr" => {
+				args.base_key_expr = next_value(&mut iter, "--key")?.to_string_lossy().into_owned()
+			}
+			"--topic-mode" | "--mode" => {
+				let value = next_value(&mut iter, "--topic-mode")?.to_string_lossy().into_owned();
+				args.topic_mode = parse_unmf_topic_mode(&value)?;
+			}
+			"--stream-id" => {
+				args.stream_id = Some(next_value(&mut iter, "--stream-id")?.to_string_lossy().into_owned());
+			}
+			"--require-body-bones" => args.require_body_bones = true,
+			"--timeout-ms" => {
+				args.timeout = Duration::from_millis(
+					next_value(&mut iter, "--timeout-ms")?
+						.to_string_lossy()
+						.parse::<u64>()
+						.context("invalid --timeout-ms")?,
+				);
+			}
+			"--output" | "-o" => args.output = PathBuf::from(next_value(&mut iter, "--output")?),
+			"--help" | "-h" => {
+				eprintln!(
+					"usage: cargo xtask unmf capture-frame [--key un-motion/frame] [--topic-mode frame|by-primary-source|by-stream-id] [--stream-id id] [--require-body-bones] [--output frame.json] [--timeout-ms 5000]"
+				);
+				std::process::exit(0);
+			}
+			other if !other.starts_with('-') => args.base_key_expr = other.to_string(),
+			other => bail!("unexpected unmf capture-frame argument: {other}"),
+		}
+	}
+	if args.base_key_expr.trim().is_empty() {
+		bail!("--key must not be empty");
+	}
+	if args.timeout.is_zero() {
+		bail!("--timeout-ms must be greater than 0");
+	}
+	Ok(args)
+}
+
 fn parse_unmf_topic_mode(value: &str) -> Result<TopicMode> {
 	match value {
 		"frame" => Ok(TopicMode::Frame),
@@ -7661,6 +7720,7 @@ fn print_usage() {
   cargo xtask fmt
   cargo xtask check
   cargo xtask test
+  cargo xtask build [--release]
   cargo xtask frontend build
   cargo xtask core smoke
   cargo xtask core lifecycle-smoke
@@ -7728,6 +7788,12 @@ mod tests {
 		assert!(args.release);
 		assert_eq!(args.log.as_deref(), Some("info,un_motion_runtime=debug"));
 		assert_eq!(args.passthrough, vec![OsString::from("--with-tray")]);
+	}
+
+	#[test]
+	fn parse_build_args_accepts_release() {
+		let args = parse_build_args(vec!["--release".into()]).unwrap();
+		assert!(args.release);
 	}
 
 	#[test]

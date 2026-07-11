@@ -1378,9 +1378,6 @@ fn arms_observation_quality(
 		}
 		return ObservationQuality::new(confidence * 0.45, "low_confidence");
 	}
-	if hands_enabled && left_hand.score <= 0.0 && right_hand.score <= 0.0 {
-		return ObservationQuality::new(confidence * 0.35, "pose_chain_hands_missing");
-	}
 	let left_ratio = lengths[0].min(lengths[1]) / lengths[0].max(lengths[1]);
 	let right_ratio = lengths[2].min(lengths[3]) / lengths[2].max(lengths[3]);
 	let symmetry = left_ratio.min(right_ratio).clamp(0.0, 1.0);
@@ -2527,13 +2524,6 @@ fn head_confidence_from_signals(signals: &[MotionSignal]) -> f32 {
 
 fn upper_arm_local_rotation_from_signals(signals: &[MotionSignal], side: HandSide) -> Option<[f32; 4]> {
 	let target = arm_segment_direction_from_signals(signals, side.prefix(), "shoulder", "elbow")?;
-	if let Some(forearm) = arm_segment_direction_from_signals(signals, side.prefix(), "elbow", "wrist")
-		&& dot3_array(target, forearm).abs() < 0.94
-	{
-		if let Some(rotation) = quat_from_basis(side.arm_rest_axis(), [0.0, 0.0, 1.0], target, forearm) {
-			return Some(rotation);
-		}
-	}
 	Some(quat_from_to(side.arm_rest_axis(), target))
 }
 
@@ -3150,21 +3140,8 @@ fn push_arm_pose_signals(signals: &mut Vec<MotionSignal>, pose: &NativePose, con
 		return;
 	}
 	for (side, shoulder, elbow, wrist) in [("left", 11, 13, 15), ("right", 12, 14, 16)] {
-		if pose_arm_side_requires_tracked_hand(signals, side, config) {
-			continue;
-		}
 		push_arm_pose_side_signals(signals, side, pose, shoulder, elbow, wrist, config);
 	}
-}
-
-fn pose_arm_side_requires_tracked_hand(signals: &[MotionSignal], side: &str, config: &MediaPipePostProcessConfig) -> bool {
-	let present_signal = format!("hand.{side}.present");
-	config.hands_enabled
-		&& !signals.iter().any(|signal| {
-			signal.name == present_signal
-				&& matches!(signal.value, MotionSignalValue::Scalar(value) if value > 0.0)
-				&& signal.confidence >= config.min_landmark_confidence
-		})
 }
 
 fn push_arm_pose_side_signals(
@@ -5025,6 +5002,36 @@ mod tests {
 	}
 
 	#[test]
+	fn native_pose_world_output_keeps_arm_signals_when_hand_tracking_is_enabled_but_missing() {
+		let input = ImageFrame::new_rgb8(7, 123, "file:test", 1, 1, vec![0, 0, 0]).unwrap();
+		let mut native = NativeMediaPipeOutput::default();
+		native.pose.landmark_count = 17;
+		native.pose.world_landmark_count = 17;
+		for index in [11, 12, 13, 14, 15, 16] {
+			native.pose.landmarks[index] = lm3(0.5, 0.5, 0.0);
+		}
+		native.pose.world_landmarks[11] = lm3(0.20, -0.40, -0.04);
+		native.pose.world_landmarks[13] = lm3(0.28, -0.20, -0.10);
+		native.pose.world_landmarks[15] = lm3(0.39, -0.30, -0.26);
+		native.pose.world_landmarks[12] = lm3(-0.10, -0.40, -0.04);
+		native.pose.world_landmarks[14] = lm3(-0.14, -0.21, -0.13);
+		native.pose.world_landmarks[16] = lm3(-0.08, -0.36, -0.31);
+
+		let frame = MediaPipePostProcessor::new(MediaPipePostProcessConfig {
+			hands_enabled: true,
+			arms_ik_enabled: true,
+			..MediaPipePostProcessConfig::default()
+		})
+		.process_native_output(&input, &native);
+
+		assert!(frame.signals.iter().all(|signal| signal.name != "hand.left.present"));
+		assert_signal_near(&frame.signals, "arm.left.shoulder.x", -0.20);
+		assert_signal_near(&frame.signals, "arm.right.shoulder.x", 0.10);
+		assert!(body_has_bone(&frame, HumanoidBone::LeftUpperArm));
+		assert!(body_has_bone(&frame, HumanoidBone::RightUpperArm));
+	}
+
+	#[test]
 	fn native_pose_world_output_emits_torso_legs_and_feet_when_enabled() {
 		let input = ImageFrame::new_rgb8(7, 123, "file:test", 1, 1, vec![0, 0, 0]).unwrap();
 		let mut native = NativeMediaPipeOutput::default();
@@ -5197,7 +5204,7 @@ mod tests {
 	}
 
 	#[test]
-	fn pose_arm_output_neutralizes_when_hands_are_missing() {
+	fn pose_arm_output_stays_live_when_hands_are_missing() {
 		let input = ImageFrame::new_rgb8(7, 123, "file:test", 320, 240, vec![0; 320 * 240 * 3]).unwrap();
 		let mut native = NativeMediaPipeOutput {
 			pose: NativePose {
@@ -5221,38 +5228,29 @@ mod tests {
 
 		let frame = MediaPipePostProcessor::default().process_native_output(&input, &native);
 
-		for (bone, expected) in [
-			(
-				HumanoidBone::LeftUpperArm,
-				rest_pose_upper_arm_rotation(HandSide::Left, MediaPipePostProcessRules::default().lost_signal_rest_pose_blend),
-			),
-			(HumanoidBone::LeftLowerArm, IDENTITY_QUAT_ARRAY),
-			(HumanoidBone::LeftHand, IDENTITY_QUAT_ARRAY),
-			(
-				HumanoidBone::RightUpperArm,
-				rest_pose_upper_arm_rotation(HandSide::Right, MediaPipePostProcessRules::default().lost_signal_rest_pose_blend),
-			),
-			(HumanoidBone::RightLowerArm, IDENTITY_QUAT_ARRAY),
-			(HumanoidBone::RightHand, IDENTITY_QUAT_ARRAY),
+		for bone in [
+			HumanoidBone::LeftUpperArm,
+			HumanoidBone::LeftLowerArm,
+			HumanoidBone::RightUpperArm,
+			HumanoidBone::RightLowerArm,
 		] {
-			let sample = body_bone(&frame, bone).expect("rest-pose arm/hand bone");
+			let sample = body_bone(&frame, bone).expect("pose arm bone");
 			assert_eq!(sample.state, SampleState::Valid);
-			let rotation = sample.transform.rotation.expect("rest-pose rotation");
-			assert_quat_near(&rotation, expected, 1e-5);
+			assert!(sample.transform.rotation.is_some());
 		}
 		assert!(
 			frame
 				.metadata
 				.notes
 				.iter()
-				.any(|note| note.contains("arms=") && note.contains("pose_chain_hands_missing"))
+				.any(|note| note.contains("arms=") && note.contains("pose_chain"))
 		);
 		assert!(
 			frame
 				.metadata
 				.notes
 				.iter()
-				.any(|note| note == "mediapipe.stability left_arm=rest_pose_hands_missing")
+				.all(|note| !note.contains("rest_pose_hands_missing") && !note.contains("hold_hands_missing"))
 		);
 	}
 
@@ -5361,7 +5359,7 @@ mod tests {
 	}
 
 	#[test]
-	fn upper_arm_uses_forearm_direction_as_elbow_bend_plane() {
+	fn upper_arm_uses_shoulder_to_elbow_direction_without_forearm_twist() {
 		let signals = vec![
 			scalar("arm.left.shoulder.x", 0.0, 1.0),
 			scalar("arm.left.shoulder.y", 0.0, 1.0),
@@ -5376,8 +5374,8 @@ mod tests {
 
 		let upper = upper_arm_local_rotation_from_signals(&signals, HandSide::Left).expect("upper arm rotation");
 		assert!(
-			upper[0].abs() > 0.6,
-			"upper arm should carry elbow bend-plane twist instead of leaving it undefined: {upper:?}"
+			upper[0].abs() < 0.05 && upper[2].abs() < 0.05,
+			"upper arm must not inherit forearm-derived axial twist: {upper:?}"
 		);
 	}
 
