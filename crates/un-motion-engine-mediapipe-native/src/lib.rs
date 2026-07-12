@@ -41,18 +41,18 @@ impl NativeMediaPipeImageEngine {
 		&self.config
 	}
 
-	pub fn process_rgb_frame(&mut self, frame: &ImageFrame) -> anyhow::Result<NativeMediaPipeOutput> {
+	pub fn process_rgb_frame(&mut self, frame: &ImageFrame) -> anyhow::Result<Box<NativeMediaPipeOutput>> {
 		let rgb = image_frame_rgb_ref(frame)?;
 		let timestamp_ms = frame.metadata.capture_timestamp_ns.saturating_div(1_000_000).min(i64::MAX as u64) as i64;
 		if self.config.include_gestures {
-			self.runtime.process_rgb_everything_at(rgb, timestamp_ms)
+			self.runtime.process_rgb_everything_at_boxed(rgb, timestamp_ms)
 		} else {
-			self.runtime.process_rgb_at(rgb, timestamp_ms)
+			self.runtime.process_rgb_at_boxed(rgb, timestamp_ms)
 		}
 	}
 
-	pub fn poll_latest(&mut self) -> anyhow::Result<NativeMediaPipeOutput> {
-		self.runtime.poll_latest(self.config.include_gestures)
+	pub fn poll_latest(&mut self) -> anyhow::Result<Box<NativeMediaPipeOutput>> {
+		self.runtime.poll_latest_boxed(self.config.include_gestures)
 	}
 
 	pub fn live_stream_stats(&mut self) -> Option<NativeLiveStreamStats> {

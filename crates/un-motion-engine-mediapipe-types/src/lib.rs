@@ -21,3 +21,9 @@ impl From<NativeMediaPipeOutput> for MediaPipeRawOutput {
 		Self::Native(Box::new(output))
 	}
 }
+
+impl From<Box<NativeMediaPipeOutput>> for MediaPipeRawOutput {
+	fn from(output: Box<NativeMediaPipeOutput>) -> Self {
+		Self::Native(output)
+	}
+}

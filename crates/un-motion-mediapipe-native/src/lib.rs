@@ -353,7 +353,6 @@ pub struct NativeMediaPipeRuntime {
 	api: Arc<NativeMediaPipeApi>,
 	handle: NonNull<c_void>,
 	options: NativeMediaPipeOptions,
-	running_mode: u32,
 	last_timestamp_ms: i64,
 	last_live_stream_output_timestamp_ms: i64,
 }
@@ -471,59 +470,72 @@ impl NativeMediaPipeRuntime {
 			api,
 			handle,
 			options,
-			running_mode: options.running_mode,
 			last_timestamp_ms: -1,
 			last_live_stream_output_timestamp_ms: -1,
 		})
 	}
 
 	pub fn process_rgb(&mut self, image: RgbImageRef<'_>) -> anyhow::Result<NativeMediaPipeOutput> {
-		self.process_rgb_with_options(image, false)
+		self.process_rgb_boxed(image).map(|output| *output)
 	}
 
 	pub fn process_rgb_at(&mut self, image: RgbImageRef<'_>, timestamp_ms: i64) -> anyhow::Result<NativeMediaPipeOutput> {
-		self.process_rgb_at_with_options(image, timestamp_ms, false)
+		self.process_rgb_at_boxed(image, timestamp_ms).map(|output| *output)
 	}
 
 	pub fn process_rgb_everything(&mut self, image: RgbImageRef<'_>) -> anyhow::Result<NativeMediaPipeOutput> {
-		self.process_rgb_with_options(image, true)
+		self.process_rgb_everything_boxed(image).map(|output| *output)
 	}
 
 	pub fn process_rgb_everything_at(&mut self, image: RgbImageRef<'_>, timestamp_ms: i64) -> anyhow::Result<NativeMediaPipeOutput> {
-		self.process_rgb_at_with_options(image, timestamp_ms, true)
+		self.process_rgb_everything_at_boxed(image, timestamp_ms).map(|output| *output)
 	}
 
 	pub fn poll_latest(&mut self, include_gestures: bool) -> anyhow::Result<NativeMediaPipeOutput> {
-		let mut pose = NativePose::default();
-		let mut hands = NativeHands::default();
-		let mut face = NativeFace::default();
-		let mut gestures = NativeGestures::default();
-		let mut holistic = NativeHolistic::default();
+		self.poll_latest_boxed(include_gestures).map(|output| *output)
+	}
+
+	pub fn process_rgb_boxed(&mut self, image: RgbImageRef<'_>) -> anyhow::Result<Box<NativeMediaPipeOutput>> {
+		self.process_rgb_with_options_boxed(image, false)
+	}
+
+	pub fn process_rgb_at_boxed(&mut self, image: RgbImageRef<'_>, timestamp_ms: i64) -> anyhow::Result<Box<NativeMediaPipeOutput>> {
+		self.process_rgb_at_with_options_boxed(image, timestamp_ms, false)
+	}
+
+	pub fn process_rgb_everything_boxed(&mut self, image: RgbImageRef<'_>) -> anyhow::Result<Box<NativeMediaPipeOutput>> {
+		self.process_rgb_with_options_boxed(image, true)
+	}
+
+	pub fn process_rgb_everything_at_boxed(
+		&mut self,
+		image: RgbImageRef<'_>,
+		timestamp_ms: i64,
+	) -> anyhow::Result<Box<NativeMediaPipeOutput>> {
+		self.process_rgb_at_with_options_boxed(image, timestamp_ms, true)
+	}
+
+	pub fn poll_latest_boxed(&mut self, include_gestures: bool) -> anyhow::Result<Box<NativeMediaPipeOutput>> {
+		let mut output = Box::new(NativeMediaPipeOutput::default());
 		let min_result_timestamp_ms = self.last_live_stream_output_timestamp_ms.saturating_add(1);
 		let (return_code, result_timestamp_ms) = self.poll_latest_at(
 			min_result_timestamp_ms,
 			include_gestures,
 			0,
-			&mut pose,
-			&mut hands,
-			&mut face,
-			&mut gestures,
-			&mut holistic,
+			&mut output.pose,
+			&mut output.hands,
+			&mut output.face,
+			&mut output.gestures,
+			&mut output.holistic,
 		)?;
 		if return_code != 30 {
 			if let Some(latest_timestamp_ms) = result_timestamp_ms {
 				self.last_live_stream_output_timestamp_ms = latest_timestamp_ms;
 			}
 		}
-		Ok(NativeMediaPipeOutput {
-			return_code,
-			result_timestamp_ms,
-			pose,
-			hands,
-			face,
-			gestures,
-			holistic,
-		})
+		output.return_code = return_code;
+		output.result_timestamp_ms = result_timestamp_ms;
+		Ok(output)
 	}
 
 	pub fn live_stream_stats(&mut self) -> Option<NativeLiveStreamStats> {
@@ -533,50 +545,50 @@ impl NativeMediaPipeRuntime {
 		(return_code == 0).then_some(stats)
 	}
 
-	fn process_rgb_with_options(&mut self, image: RgbImageRef<'_>, include_gestures: bool) -> anyhow::Result<NativeMediaPipeOutput> {
-		self.process_rgb_at_with_options(image, 0, include_gestures)
+	fn process_rgb_with_options_boxed(
+		&mut self,
+		image: RgbImageRef<'_>,
+		include_gestures: bool,
+	) -> anyhow::Result<Box<NativeMediaPipeOutput>> {
+		self.process_rgb_at_with_options_boxed(image, 0, include_gestures)
 	}
 
-	fn process_rgb_at_with_options(
+	fn process_rgb_at_with_options_boxed(
 		&mut self,
 		image: RgbImageRef<'_>,
 		mut timestamp_ms: i64,
 		include_gestures: bool,
-	) -> anyhow::Result<NativeMediaPipeOutput> {
+	) -> anyhow::Result<Box<NativeMediaPipeOutput>> {
 		validate_rgb_image(image)?;
 		if timestamp_ms <= self.last_timestamp_ms {
 			timestamp_ms = self.last_timestamp_ms.saturating_add(1);
 		}
 		self.last_timestamp_ms = timestamp_ms;
 
-		let mut pose = NativePose::default();
-		let mut hands = NativeHands::default();
-		let mut face = NativeFace::default();
-		let mut gestures = NativeGestures::default();
-		let mut holistic = NativeHolistic::default();
+		let mut output = Box::new(NativeMediaPipeOutput::default());
 		let using_holistic = self.options.enable_holistic != 0;
 		let pose_ptr = if self.options.enable_pose != 0 && !using_holistic {
-			&mut pose
+			&mut output.pose
 		} else {
 			std::ptr::null_mut()
 		};
 		let hands_ptr = if self.options.enable_hands != 0 && !using_holistic {
-			&mut hands
+			&mut output.hands
 		} else {
 			std::ptr::null_mut()
 		};
 		let face_ptr = if self.options.enable_face != 0 && !using_holistic {
-			&mut face
+			&mut output.face
 		} else {
 			std::ptr::null_mut()
 		};
 		let gestures_ptr = if include_gestures && self.options.enable_gestures != 0 {
-			&mut gestures
+			&mut output.gestures
 		} else {
 			std::ptr::null_mut()
 		};
 		let holistic_ptr = if self.options.enable_holistic != 0 {
-			&mut holistic
+			&mut output.holistic
 		} else {
 			std::ptr::null_mut()
 		};
@@ -669,27 +681,8 @@ impl NativeMediaPipeRuntime {
 			}
 		};
 
-		if self.running_mode == RUNNING_MODE_LIVE_STREAM {
-			return Ok(NativeMediaPipeOutput {
-				return_code,
-				result_timestamp_ms: None,
-				pose,
-				hands,
-				face,
-				gestures,
-				holistic,
-			});
-		}
-
-		Ok(NativeMediaPipeOutput {
-			return_code,
-			result_timestamp_ms: None,
-			pose,
-			hands,
-			face,
-			gestures,
-			holistic,
-		})
+		output.return_code = return_code;
+		Ok(output)
 	}
 
 	fn poll_latest_at(
