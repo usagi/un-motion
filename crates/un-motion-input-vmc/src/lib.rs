@@ -371,7 +371,12 @@ fn normalize_input_quaternion(rotation: [f32; 4]) -> Option<[f32; 4]> {
 		return None;
 	}
 	let inverse_length = length_squared.sqrt().recip();
-	Some(rotation.map(|value| value * inverse_length))
+	let normalized = rotation.map(|value| value * inverse_length);
+	Some(if normalized[3] < 0.0 {
+		normalized.map(|value| -value)
+	} else {
+		normalized
+	})
 }
 
 fn osc_string(value: &OscType) -> Option<&str> {
@@ -476,6 +481,15 @@ mod tests {
 		assert_eq!(normalize_input_quaternion([0.0; 4]), None);
 		let normalized = normalize_input_quaternion([0.0, 0.0, 0.0, 2.0]).expect("valid quaternion");
 		assert_eq!(normalized, [0.0, 0.0, 0.0, 1.0]);
+	}
+
+	#[test]
+	fn equivalent_quaternion_signs_are_canonicalized() {
+		let positive = normalize_input_quaternion([0.25, -0.5, 0.75, 1.0]).expect("positive quaternion");
+		let negative = normalize_input_quaternion([-0.25, 0.5, -0.75, -1.0]).expect("negative quaternion");
+
+		assert_eq!(positive, negative);
+		assert!(positive[3] >= 0.0);
 	}
 
 	#[test]
