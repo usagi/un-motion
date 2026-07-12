@@ -153,7 +153,10 @@ impl VmcPacketDecoder {
 		if is_unsupported_waidayo_mp_datagram(data) {
 			return Ok(None);
 		}
-		let (_remaining, packet) = decoder::decode_udp(data)?;
+		let (remaining, packet) = decoder::decode_udp(data)?;
+		if !remaining.is_empty() {
+			anyhow::bail!("VMC OSC datagram has {} trailing byte(s)", remaining.len());
+		}
 		Ok(self.decode_packet(&packet, received_timestamp_ns).map(|mut frame| {
 			if preserve_raw {
 				frame.raw_datagram = Some(data.to_vec());
@@ -457,6 +460,17 @@ mod tests {
 				.decode_packet(&nested_bundle(MAX_OSC_BUNDLE_DEPTH + 1, message()), 2)
 				.is_none()
 		);
+	}
+
+	#[test]
+	fn rejects_trailing_bytes_after_osc_packet() {
+		let mut data = encoder::encode(&packet_message("/VMC/Ext/OK", vec![OscType::Int(1)])).expect("encode packet");
+		data.extend_from_slice(&[0, 0, 0, 0]);
+		let mut decoder = VmcPacketDecoder::new("trailing");
+
+		let error = decoder.decode_datagram(&data, 1).expect_err("trailing bytes must fail");
+
+		assert!(error.to_string().contains("trailing byte"), "{error:#}");
 	}
 
 	#[test]
