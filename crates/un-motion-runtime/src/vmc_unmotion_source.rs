@@ -51,6 +51,8 @@ use un_motion_input_vmc::{
 
 use crate::{MotionFrameSource, SourceTelemetryHandle};
 
+const BLENDSHAPE_TRANSACTION_TIMEOUT_NS: u64 = 1_000_000_000;
+
 /// VMC/UDP 受信を `MotionFrameSource` として提供する。
 ///
 /// # Aggregation model
@@ -94,6 +96,8 @@ pub struct VmcUnmotionSource {
 	pending_blendshapes: BTreeMap<String, f32>,
 	/// `/VMC/Ext/Blend/Val` で受信し、次の Apply まで公開しない値。
 	staged_blendshapes: BTreeMap<String, f32>,
+	/// 現在の未Apply transactionで最初の値を受信したtimestamp。
+	staged_blendshapes_started_ts: Option<u64>,
 	/// 最新の受信 unix timestamp ns。emit する UNMotionFrame の
 	/// `capture_timestamp_ns` / `frame_timestamp_ns` に使う。
 	pending_received_ts: u64,
@@ -141,6 +145,7 @@ impl VmcUnmotionSource {
 			pending_bones: BTreeMap::new(),
 			pending_blendshapes: BTreeMap::new(),
 			staged_blendshapes: BTreeMap::new(),
+			staged_blendshapes_started_ts: None,
 			pending_received_ts: 0,
 			pending_dirty: false,
 			telemetry: SourceTelemetryHandle::new("vmc-receive", source_id),
@@ -153,6 +158,13 @@ impl VmcUnmotionSource {
 	/// 1 つの `VmcInputFrame` を accumulator にマージする。同じ channel の値が
 	/// 既にあれば上書き (=「最後に届いた値が現在の状態」)。
 	fn merge_bundle(&mut self, frame: &VmcInputFrame) {
+		if self
+			.staged_blendshapes_started_ts
+			.is_some_and(|started| frame.received_timestamp_ns.saturating_sub(started) > BLENDSHAPE_TRANSACTION_TIMEOUT_NS)
+		{
+			self.staged_blendshapes.clear();
+			self.staged_blendshapes_started_ts = None;
+		}
 		if let Some(ok) = frame.ok {
 			self.pending_ok = Some(ok);
 			if ok <= 0 {
@@ -160,6 +172,7 @@ impl VmcUnmotionSource {
 				self.pending_bones.clear();
 				self.pending_blendshapes.clear();
 				self.staged_blendshapes.clear();
+				self.staged_blendshapes_started_ts = None;
 				self.pending_received_ts = self.pending_received_ts.max(frame.received_timestamp_ns);
 				self.pending_dirty = true;
 				self.telemetry.atomics.bundles_merged.fetch_add(1, Ordering::Relaxed);
@@ -178,11 +191,13 @@ impl VmcUnmotionSource {
 			let valid_name = !blend.name.is_empty() && blend.name.len() <= MAX_VMC_NAME_BYTES;
 			let has_capacity = self.staged_blendshapes.contains_key(&blend.name) || self.staged_blendshapes.len() < MAX_VMC_BLENDSHAPES;
 			if valid_name && has_capacity {
+				self.staged_blendshapes_started_ts.get_or_insert(frame.received_timestamp_ns);
 				self.staged_blendshapes.insert(blend.name.clone(), blend.value);
 			}
 		}
 		if frame.blend_apply {
 			self.pending_blendshapes = std::mem::take(&mut self.staged_blendshapes);
+			self.staged_blendshapes_started_ts = None;
 		}
 		if frame.received_timestamp_ns > self.pending_received_ts {
 			self.pending_received_ts = frame.received_timestamp_ns;
@@ -983,6 +998,38 @@ mod tests {
 		assert!(source.pending_dirty);
 		assert_eq!(source.pending_blendshapes.get("Joy"), Some(&0.75));
 		assert!(source.staged_blendshapes.is_empty());
+	}
+
+	#[test]
+	fn accumulator_expires_unapplied_blendshape_transactions() {
+		let mut source = VmcUnmotionSource::bind("blend-timeout", "127.0.0.1:0".parse().unwrap()).expect("bind");
+		let mut frame = VmcInputFrame {
+			source_id: "blend-timeout".to_string(),
+			received_timestamp_ns: 1,
+			raw_datagram: None,
+			ok: None,
+			root: None,
+			bones: Vec::new(),
+			blendshapes: vec![VmcBlendshapeSample {
+				name: "Stale".to_string(),
+				value: 0.75,
+			}],
+			blend_apply: false,
+			message_count: 1,
+		};
+		source.merge_bundle(&frame);
+
+		frame.received_timestamp_ns = BLENDSHAPE_TRANSACTION_TIMEOUT_NS + 2;
+		frame.blendshapes = vec![VmcBlendshapeSample {
+			name: "Fresh".to_string(),
+			value: 0.5,
+		}];
+		frame.blend_apply = true;
+		source.merge_bundle(&frame);
+
+		assert!(!source.pending_blendshapes.contains_key("Stale"));
+		assert_eq!(source.pending_blendshapes.get("Fresh"), Some(&0.5));
+		assert!(source.staged_blendshapes_started_ts.is_none());
 	}
 
 	#[test]
