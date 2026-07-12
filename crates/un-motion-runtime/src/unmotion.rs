@@ -44,7 +44,7 @@ pub trait MotionFrameSource: Send + 'static {
 pub struct MotionFrameStreamPoll {
 	pub stream_id: StreamId,
 	pub frames: Vec<UNMotionFrame>,
-	pub state: StreamState,
+	pub state: Arc<StreamState>,
 	pub snapshot: StreamSnapshot,
 }
 
@@ -57,7 +57,7 @@ impl MotionFrameStreamPoll {
 pub struct MotionFrameStreamWorker<S> {
 	config: MotionFrameStreamConfig,
 	source: S,
-	state: StreamState,
+	state: Arc<StreamState>,
 }
 
 impl<S> MotionFrameStreamWorker<S>
@@ -65,7 +65,7 @@ where
 	S: MotionFrameSource,
 {
 	pub fn new(config: MotionFrameStreamConfig, source: S) -> Self {
-		let state = StreamState::new(config.stream_id.clone());
+		let state = Arc::new(StreamState::new(config.stream_id.clone()));
 		Self { config, source, state }
 	}
 
@@ -81,16 +81,35 @@ where
 		let observed_at_ns = now_unix_ns();
 		let mut frames = Vec::new();
 		if let Some(frame) = self.source.next_frame()? {
-			apply_unmotion_frame_to_stream_state(&mut self.state, &frame, observed_at_ns);
+			let mut next_state = next_stream_state(&self.state);
+			apply_unmotion_frame_to_stream_state(&mut next_state, &frame, observed_at_ns);
+			self.state = Arc::new(next_state);
 			frames.push(frame);
 		}
 
 		Ok(MotionFrameStreamPoll {
 			stream_id: self.config.stream_id.clone(),
 			frames,
-			state: self.state.clone(),
+			state: Arc::clone(&self.state),
 			snapshot: self.state.snapshot_at(now_unix_ns(), self.config.stale_after_ns),
 		})
+	}
+}
+
+fn next_stream_state(previous: &StreamState) -> StreamState {
+	StreamState {
+		stream_id: previous.stream_id.clone(),
+		enabled: previous.enabled,
+		first_packet_at_ns: previous.first_packet_at_ns,
+		last_packet_at_ns: previous.last_packet_at_ns,
+		last_event_at_ns: previous.last_event_at_ns,
+		packet_count: previous.packet_count,
+		event_count: previous.event_count,
+		decode_error_count: previous.decode_error_count,
+		root: None,
+		bones: Default::default(),
+		blendshapes: Default::default(),
+		part_diagnostics: Default::default(),
 	}
 }
 
@@ -304,7 +323,7 @@ fn run_latest_frame_stream_worker<S>(
 					slot.store(LatestMotionFrame {
 						stream_id: poll.stream_id,
 						frame: Arc::new(frame),
-						state: Arc::new(poll.state),
+						state: poll.state,
 						snapshot: poll.snapshot,
 					});
 				}
@@ -688,6 +707,7 @@ mod tests {
 		assert_eq!(poll.state.packet_count, 1);
 		assert_eq!(poll.state.blendshapes["jawOpen"], 0.5);
 		assert_eq!(poll.snapshot.stream_id, StreamId::new("unmotion:stream-4"));
+		assert!(Arc::ptr_eq(&poll.state, &worker.state));
 	}
 
 	#[test]
