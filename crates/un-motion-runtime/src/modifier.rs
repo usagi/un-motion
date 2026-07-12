@@ -24,7 +24,7 @@
 //!   意味論的に「**基準を整える** → **姿勢量を整える** → **ノイズを整える** →
 //!   **視点を整える** → **不要を捨てる**」と読める並びを採る。
 //!
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use un_motion_frame::{HandMotion, HumanoidBone, MotionSignalValue, Quatf, TransformSample, UNMotionFrame, Vec3f};
@@ -638,16 +638,29 @@ pub struct SmoothingStage {
 	bone_state: HashMap<HumanoidBone, QuatSmoothingState>,
 	named_quat_state: HashMap<String, QuatSmoothingState>,
 	named_vec3_state: HashMap<String, Vec3SmoothingState>,
+	named_quat_order: VecDeque<String>,
+	named_vec3_order: VecDeque<String>,
 	root_translation_state: Option<Vec3SmoothingState>,
 	root_rotation_state: Option<QuatSmoothingState>,
 	face_expression_state: HashMap<String, ScalarSmoothingState>,
 	signal_scalar_state: HashMap<String, ScalarSmoothingState>,
-	hand_transform_keys: HashMap<(bool, u8, usize), (Arc<str>, Arc<str>)>,
+	face_expression_order: VecDeque<String>,
+	signal_scalar_order: VecDeque<String>,
+	hand_transform_keys: HashMap<HandTransformKey, HandTransformKeys>,
 	generation: u64,
 }
 
 const MAX_DYNAMIC_SMOOTHING_STATES: usize = 1_024;
 const DYNAMIC_SMOOTHING_STATE_TTL_FRAMES: u64 = 300;
+
+type HandTransformKey = (bool, u8, usize);
+type ScalarSmoothingCache<'a> = (&'a mut HashMap<String, ScalarSmoothingState>, &'a mut VecDeque<String>);
+
+#[derive(Clone)]
+struct HandTransformKeys {
+	translation: Arc<str>,
+	rotation: Arc<str>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SmoothingMode {
@@ -711,22 +724,6 @@ struct ScalarSmoothingState {
 	last_seen_generation: u64,
 }
 
-trait DynamicSmoothingState {
-	fn last_seen_generation(&self) -> u64;
-}
-
-impl DynamicSmoothingState for QuatSmoothingState {
-	fn last_seen_generation(&self) -> u64 {
-		self.last_seen_generation
-	}
-}
-
-impl DynamicSmoothingState for Vec3SmoothingState {
-	fn last_seen_generation(&self) -> u64 {
-		self.last_seen_generation
-	}
-}
-
 impl SmoothingStage {
 	pub fn from_config(config: &SmoothingConfig, bone_subset: BoneSubsetConfig) -> Option<Self> {
 		let adaptive = AdaptiveParams {
@@ -760,10 +757,14 @@ impl SmoothingStage {
 			bone_state: HashMap::new(),
 			named_quat_state: HashMap::new(),
 			named_vec3_state: HashMap::new(),
+			named_quat_order: VecDeque::new(),
+			named_vec3_order: VecDeque::new(),
 			root_translation_state: None,
 			root_rotation_state: None,
 			face_expression_state: HashMap::new(),
 			signal_scalar_state: HashMap::new(),
+			face_expression_order: VecDeque::new(),
+			signal_scalar_order: VecDeque::new(),
 			hand_transform_keys: HashMap::new(),
 			generation: 0,
 		})
@@ -1035,7 +1036,7 @@ impl SmoothingStage {
 
 	fn step_expression(&mut self, name: &str, current: f32, timestamp_ns: u64, confidence: f32) -> f32 {
 		Self::step_named_scalar(
-			&mut self.face_expression_state,
+			(&mut self.face_expression_state, &mut self.face_expression_order),
 			self.mode,
 			name,
 			current,
@@ -1047,7 +1048,7 @@ impl SmoothingStage {
 
 	fn step_signal_scalar(&mut self, name: &str, current: f32, timestamp_ns: u64, confidence: f32) -> f32 {
 		Self::step_named_scalar(
-			&mut self.signal_scalar_state,
+			(&mut self.signal_scalar_state, &mut self.signal_scalar_order),
 			self.mode,
 			name,
 			current,
@@ -1058,7 +1059,7 @@ impl SmoothingStage {
 	}
 
 	fn step_named_scalar(
-		state_map: &mut HashMap<String, ScalarSmoothingState>,
+		cache: ScalarSmoothingCache<'_>,
 		mode: SmoothingMode,
 		name: &str,
 		current: f32,
@@ -1066,25 +1067,15 @@ impl SmoothingStage {
 		confidence: f32,
 		generation: u64,
 	) -> f32 {
+		let (state_map, state_order) = cache;
 		if let Some(state) = state_map.get_mut(name) {
 			state.last_seen_generation = generation;
 			Self::step_scalar(mode, state, current, timestamp_ns, confidence)
 		} else {
-			if state_map.len() >= MAX_DYNAMIC_SMOOTHING_STATES {
-				let oldest = state_map
-					.iter()
-					.map(|(name, state)| (name, generation.wrapping_sub(state.last_seen_generation)))
-					.max_by_key(|(_, age)| *age)
-					.map(|(name, age)| (name.clone(), age));
-				if let Some((oldest, age)) = oldest {
-					if age == 0 {
-						return current;
-					}
-					state_map.remove(&oldest);
-				}
-			}
+			Self::evict_dynamic_state(state_map, state_order);
+			let name = name.to_string();
 			state_map.insert(
-				name.to_string(),
+				name.clone(),
 				ScalarSmoothingState {
 					smoothed: current,
 					last_raw: current,
@@ -1093,6 +1084,7 @@ impl SmoothingStage {
 					last_seen_generation: generation,
 				},
 			);
+			state_order.push_back(name);
 			current
 		}
 	}
@@ -1103,9 +1095,10 @@ impl SmoothingStage {
 			state.last_seen_generation = self.generation;
 			Self::step_vec3(mode, state, current, timestamp_ns, confidence)
 		} else {
-			Self::evict_oldest_dynamic_state(&mut self.named_vec3_state, self.generation);
+			Self::evict_dynamic_state(&mut self.named_vec3_state, &mut self.named_vec3_order);
+			let name = name.to_string();
 			self.named_vec3_state.insert(
-				name.to_string(),
+				name.clone(),
 				Vec3SmoothingState {
 					smoothed: current,
 					last_raw: current,
@@ -1114,6 +1107,7 @@ impl SmoothingStage {
 					last_seen_generation: self.generation,
 				},
 			);
+			self.named_vec3_order.push_back(name);
 			current
 		}
 	}
@@ -1124,9 +1118,10 @@ impl SmoothingStage {
 			state.last_seen_generation = self.generation;
 			Self::step_quat(mode, state, current, timestamp_ns, confidence)
 		} else {
-			Self::evict_oldest_dynamic_state(&mut self.named_quat_state, self.generation);
+			Self::evict_dynamic_state(&mut self.named_quat_state, &mut self.named_quat_order);
+			let name = name.to_string();
 			self.named_quat_state.insert(
-				name.to_string(),
+				name.clone(),
 				QuatSmoothingState {
 					smoothed: current,
 					last_raw: current,
@@ -1135,20 +1130,31 @@ impl SmoothingStage {
 					last_seen_generation: self.generation,
 				},
 			);
+			self.named_quat_order.push_back(name);
 			current
 		}
 	}
 
-	fn evict_oldest_dynamic_state<T: DynamicSmoothingState>(state_map: &mut HashMap<String, T>, generation: u64) {
+	fn evict_dynamic_state<T>(state_map: &mut HashMap<String, T>, state_order: &mut VecDeque<String>) {
 		if state_map.len() < MAX_DYNAMIC_SMOOTHING_STATES {
 			return;
 		}
-		if let Some(oldest) = state_map
-			.iter()
-			.max_by_key(|(_, state)| generation.wrapping_sub(state.last_seen_generation()))
-			.map(|(name, _)| name.clone())
-		{
-			state_map.remove(&oldest);
+		while let Some(oldest) = state_order.pop_front() {
+			if state_map.remove(&oldest).is_some() {
+				break;
+			}
+		}
+	}
+
+	fn expire_dynamic_states<T>(
+		state_map: &mut HashMap<String, T>,
+		state_order: &mut VecDeque<String>,
+		mut expired: impl FnMut(&T) -> bool,
+	) {
+		let previous_len = state_map.len();
+		state_map.retain(|_, state| !expired(state));
+		if state_map.len() != previous_len {
+			state_order.retain(|name| state_map.contains_key(name));
 		}
 	}
 
@@ -1156,25 +1162,28 @@ impl SmoothingStage {
 		let confidence = hand.confidence;
 		if let Some(wrist) = hand.wrist.as_mut() {
 			let keys = self.hand_transform_keys(is_left, u8::MAX, 0, || "wrist".to_string());
-			self.smooth_transform_sample(&keys.0, &keys.1, wrist, timestamp_ns, confidence);
+			self.smooth_transform_sample(&keys.translation, &keys.rotation, wrist, timestamp_ns, confidence);
 		}
 		for finger in &mut hand.fingers {
 			for (index, joint) in finger.joints.iter_mut().enumerate() {
 				let finger_id = finger.finger as u8;
 				let keys = self.hand_transform_keys(is_left, finger_id, index, || format!("{:?}.{index}", finger.finger));
-				self.smooth_transform_sample(&keys.0, &keys.1, joint, timestamp_ns, confidence);
+				self.smooth_transform_sample(&keys.translation, &keys.rotation, joint, timestamp_ns, confidence);
 			}
 		}
 	}
 
-	fn hand_transform_keys(&mut self, is_left: bool, finger: u8, joint: usize, label: impl FnOnce() -> String) -> (Arc<str>, Arc<str>) {
+	fn hand_transform_keys(&mut self, is_left: bool, finger: u8, joint: usize, label: impl FnOnce() -> String) -> HandTransformKeys {
 		if let Some(keys) = self.hand_transform_keys.get(&(is_left, finger, joint)) {
 			return keys.clone();
 		}
 		let side = if is_left { "left" } else { "right" };
 		let label = label();
 		let base = format!("hand.{side}.{label}");
-		let keys = (Arc::from(format!("{base}.translation")), Arc::from(format!("{base}.rotation")));
+		let keys = HandTransformKeys {
+			translation: Arc::from(format!("{base}.translation")),
+			rotation: Arc::from(format!("{base}.rotation")),
+		};
 		if self.hand_transform_keys.len() < MAX_DYNAMIC_SMOOTHING_STATES {
 			self.hand_transform_keys.insert((is_left, finger, joint), keys.clone());
 		}
@@ -1258,14 +1267,18 @@ impl ModifierStage for SmoothingStage {
 			signal.value = MotionSignalValue::Scalar(self.step_signal_scalar(&signal.name, value, timestamp_ns, signal.confidence));
 		}
 		let generation = self.generation;
-		self.face_expression_state
-			.retain(|_, state| generation.wrapping_sub(state.last_seen_generation) <= DYNAMIC_SMOOTHING_STATE_TTL_FRAMES);
-		self.signal_scalar_state
-			.retain(|_, state| generation.wrapping_sub(state.last_seen_generation) <= DYNAMIC_SMOOTHING_STATE_TTL_FRAMES);
-		self.named_vec3_state
-			.retain(|_, state| generation.wrapping_sub(state.last_seen_generation) <= DYNAMIC_SMOOTHING_STATE_TTL_FRAMES);
-		self.named_quat_state
-			.retain(|_, state| generation.wrapping_sub(state.last_seen_generation) <= DYNAMIC_SMOOTHING_STATE_TTL_FRAMES);
+		Self::expire_dynamic_states(&mut self.face_expression_state, &mut self.face_expression_order, |state| {
+			generation.wrapping_sub(state.last_seen_generation) > DYNAMIC_SMOOTHING_STATE_TTL_FRAMES
+		});
+		Self::expire_dynamic_states(&mut self.signal_scalar_state, &mut self.signal_scalar_order, |state| {
+			generation.wrapping_sub(state.last_seen_generation) > DYNAMIC_SMOOTHING_STATE_TTL_FRAMES
+		});
+		Self::expire_dynamic_states(&mut self.named_vec3_state, &mut self.named_vec3_order, |state| {
+			generation.wrapping_sub(state.last_seen_generation) > DYNAMIC_SMOOTHING_STATE_TTL_FRAMES
+		});
+		Self::expire_dynamic_states(&mut self.named_quat_state, &mut self.named_quat_order, |state| {
+			generation.wrapping_sub(state.last_seen_generation) > DYNAMIC_SMOOTHING_STATE_TTL_FRAMES
+		});
 	}
 }
 
@@ -2746,6 +2759,7 @@ mod tests {
 		}
 		stage.apply(&mut frame);
 		assert_eq!(stage.signal_scalar_state.len(), MAX_DYNAMIC_SMOOTHING_STATES);
+		assert_eq!(stage.signal_scalar_order.len(), MAX_DYNAMIC_SMOOTHING_STATES);
 		let mut replacement = UNMotionFrame::new(2);
 		replacement.signals.push(un_motion_frame::MotionSignal {
 			name: "replacement".to_string(),
@@ -2756,6 +2770,7 @@ mod tests {
 		});
 		stage.apply(&mut replacement);
 		assert_eq!(stage.signal_scalar_state.len(), MAX_DYNAMIC_SMOOTHING_STATES);
+		assert_eq!(stage.signal_scalar_order.len(), MAX_DYNAMIC_SMOOTHING_STATES);
 		assert!(stage.signal_scalar_state.contains_key("replacement"));
 	}
 
@@ -2786,6 +2801,8 @@ mod tests {
 		}
 		assert!(stage.named_vec3_state.is_empty());
 		assert!(stage.named_quat_state.is_empty());
+		assert!(stage.named_vec3_order.is_empty());
+		assert!(stage.named_quat_order.is_empty());
 	}
 
 	#[test]
@@ -2798,7 +2815,7 @@ mod tests {
 		let mut first = UNMotionFrame::new(1);
 		first.left_hand = Some(make_left_hand_motion());
 		stage.apply(&mut first);
-		let cached_translation = Arc::clone(&stage.hand_transform_keys[&(true, Finger::Index as u8, 0)].0);
+		let cached_translation = Arc::clone(&stage.hand_transform_keys[&(true, Finger::Index as u8, 0)].translation);
 		assert_eq!(stage.hand_transform_keys.len(), 2);
 
 		let mut second = UNMotionFrame::new(2);
@@ -2808,7 +2825,7 @@ mod tests {
 		assert_eq!(stage.hand_transform_keys.len(), 2);
 		assert!(Arc::ptr_eq(
 			&cached_translation,
-			&stage.hand_transform_keys[&(true, Finger::Index as u8, 0)].0
+			&stage.hand_transform_keys[&(true, Finger::Index as u8, 0)].translation
 		));
 	}
 
