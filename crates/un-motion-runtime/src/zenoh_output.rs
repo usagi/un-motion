@@ -390,12 +390,6 @@ impl ZenohOutputWorkerHandle {
 	}
 }
 
-impl Drop for ZenohOutputWorkerHandle {
-	fn drop(&mut self) {
-		let _ = self.command_tx.send(ZenohOutputCommand::Shutdown);
-	}
-}
-
 pub fn spawn_zenoh_output_worker(config: ZenohOutputConfig, event_tx: Sender<ZenohOutputEvent>) -> anyhow::Result<ZenohOutputWorkerHandle> {
 	let worker = ZenohOutputWorker::open(config)?;
 	let base_key_expr = worker.config.base_key_expr.clone();

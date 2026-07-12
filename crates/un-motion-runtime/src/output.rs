@@ -281,12 +281,6 @@ impl VmcOutputWorkerHandle {
 	}
 }
 
-impl Drop for VmcOutputWorkerHandle {
-	fn drop(&mut self) {
-		let _ = self.command_tx.send(VmcOutputCommand::Shutdown);
-	}
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum FileOutputFormat {
 	#[default]
@@ -429,12 +423,6 @@ impl FileOutputWorkerHandle {
 	pub fn join(mut self) -> thread::Result<()> {
 		self.shutdown();
 		if let Some(join) = self.join.take() { join.join() } else { Ok(()) }
-	}
-}
-
-impl Drop for FileOutputWorkerHandle {
-	fn drop(&mut self) {
-		let _ = self.command_tx.send(FileOutputCommand::Shutdown);
 	}
 }
 
@@ -722,12 +710,6 @@ impl VrcOscOutputWorkerHandle {
 	pub fn join(mut self) -> thread::Result<()> {
 		self.shutdown();
 		if let Some(join) = self.join.take() { join.join() } else { Ok(()) }
-	}
-}
-
-impl Drop for VrcOscOutputWorkerHandle {
-	fn drop(&mut self) {
-		let _ = self.command_tx.send(VrcOscOutputCommand::Shutdown);
 	}
 }
 
@@ -1051,6 +1033,22 @@ mod tests {
 		assert_eq!(frame.header.sequence, 2);
 		drop(command_rx);
 		assert_eq!(handle.send(UNMotionFrame::new(3)), Err(OutputDisconnected));
+	}
+
+	#[test]
+	fn dropping_live_output_handle_disconnects_without_enqueueing_shutdown() {
+		let (command_tx, command_rx) = mpsc::sync_channel(1);
+		command_tx.send(VmcOutputCommand::FrameReady).expect("fill command queue");
+		let handle = VmcOutputWorkerHandle {
+			target_addr: "127.0.0.1:39540".parse().expect("target"),
+			command_tx,
+			latest_frame: LatestFrameSlot::new(),
+			join: None,
+		};
+
+		drop(handle);
+		assert_eq!(command_rx.recv(), Ok(VmcOutputCommand::FrameReady));
+		assert!(command_rx.recv().is_err());
 	}
 
 	#[test]
