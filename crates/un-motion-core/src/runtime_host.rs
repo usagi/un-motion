@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{
 	Arc,
-	mpsc::{self, Receiver, Sender, TryRecvError},
+	mpsc::{self, Receiver, Sender, SyncSender, TryRecvError},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -37,6 +37,8 @@ const STALE_AFTER_NS: u64 = 500_000_000;
 const LOOP_MAX_SLEEP: Duration = Duration::from_millis(5);
 const FLOW_IDLE_SLEEP: Duration = Duration::from_millis(1);
 const RUNTIME_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(100);
+const RUNTIME_CONTROL_QUEUE_CAPACITY: usize = 64;
+const MAX_CONTROL_MESSAGES_PER_TICK: usize = 64;
 const BUILTIN_UNMOTION_FLOW_ID: &str = "mediapipe-main";
 
 type StatusCallback = Arc<dyn Fn(CoreRuntimeStatusUpdate) + Send + Sync + 'static>;
@@ -357,7 +359,7 @@ const FACE_POSE_MODEL_MAX_MEDIAN_ABS_ROLL: f32 = 0.20;
 const FACE_POSE_MODEL_MAX_NOSE_DROP_MAD: f32 = 0.055;
 
 pub(crate) struct CoreRuntimeHost {
-	control_tx: Sender<CoreRuntimeControl>,
+	control_tx: SyncSender<CoreRuntimeControl>,
 	join: Option<JoinHandle<()>>,
 }
 
@@ -369,7 +371,7 @@ impl std::fmt::Debug for CoreRuntimeHost {
 
 impl CoreRuntimeHost {
 	pub(crate) fn spawn(config: CoreRuntimeConfig, status_callback: StatusCallback) -> anyhow::Result<Self> {
-		let (control_tx, control_rx) = mpsc::channel();
+		let (control_tx, control_rx) = runtime_control_channel();
 		let (init_tx, init_rx) = mpsc::channel();
 		let join = thread::spawn(move || run_core_runtime(config, control_rx, init_tx, status_callback));
 		match init_rx
@@ -460,6 +462,10 @@ impl CoreRuntimeHost {
 		self.stop();
 		if let Some(join) = self.join.take() { join.join() } else { Ok(()) }
 	}
+}
+
+fn runtime_control_channel() -> (SyncSender<CoreRuntimeControl>, Receiver<CoreRuntimeControl>) {
+	mpsc::sync_channel(RUNTIME_CONTROL_QUEUE_CAPACITY)
 }
 
 fn analysis_extras_max_samples(duration: Duration) -> usize {
@@ -1088,7 +1094,7 @@ fn drain_control_messages(
 	latest_unmotion_frame: &Option<Arc<UNMotionFrame>>,
 ) -> ControlDrainResult {
 	let mut result = ControlDrainResult::default();
-	loop {
+	for _ in 0..MAX_CONTROL_MESSAGES_PER_TICK {
 		match control_rx.try_recv() {
 			Ok(CoreRuntimeControl::Stop) | Err(TryRecvError::Disconnected) => {
 				result.stop = true;
@@ -1152,6 +1158,7 @@ fn drain_control_messages(
 			Err(TryRecvError::Empty) => return result,
 		}
 	}
+	result
 }
 
 fn capture_unmotion_frame_modifier(config: &CoreRuntimeConfig) -> &ModifierConfig {
@@ -2196,6 +2203,18 @@ mod tests {
 	use un_motion_frame::{ExpressionSample, FaceMotion, SampleState, TrackingState, UNMotionFrame};
 	use un_motion_profile_schema::{CoreProfileDocument, CoreProfileDocumentProfile};
 	use un_motion_runtime::{LatestMotionFrame, LatestMotionFrameSlot, StreamHealth, stream_state_from_unmotion_frame};
+
+	#[test]
+	fn runtime_control_channel_is_bounded() {
+		let (tx, _rx) = runtime_control_channel();
+		for _ in 0..RUNTIME_CONTROL_QUEUE_CAPACITY {
+			tx.try_send(CoreRuntimeControl::Stop).expect("queue slot");
+		}
+		assert!(matches!(
+			tx.try_send(CoreRuntimeControl::Stop),
+			Err(std::sync::mpsc::TrySendError::Full(CoreRuntimeControl::Stop))
+		));
+	}
 
 	fn profile(runtime_selection: Option<ProfileRuntimeSettings>) -> CoreProfileDocumentProfile {
 		CoreProfileDocumentProfile {
