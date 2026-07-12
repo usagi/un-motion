@@ -211,13 +211,20 @@ struct CoreMutableState {
 }
 
 #[derive(Debug)]
+struct PendingRuntimeStatus {
+	generation: u64,
+	update: CoreRuntimeStatusUpdate,
+}
+
+#[derive(Debug)]
 struct CoreControlInner {
 	state: RwLock<CoreMutableState>,
 	mutation: AsyncMutex<()>,
 	profile_store: Option<CoreProfileDocumentStore>,
 	runtime_host: Mutex<Option<CoreRuntimeHost>>,
-	pending_runtime_status: ArcSwapOption<CoreRuntimeStatusUpdate>,
+	pending_runtime_status: ArcSwapOption<PendingRuntimeStatus>,
 	runtime_status_apply: AsyncMutex<()>,
+	runtime_generation: AtomicU64,
 	events: broadcast::Sender<CoreEvent>,
 	next_event_sequence: AtomicU64,
 }
@@ -270,6 +277,7 @@ impl CoreControlState {
 				runtime_host: Mutex::new(None),
 				pending_runtime_status: ArcSwapOption::empty(),
 				runtime_status_apply: AsyncMutex::new(()),
+				runtime_generation: AtomicU64::new(0),
 				events,
 				next_event_sequence: AtomicU64::new(1),
 			}),
@@ -398,6 +406,7 @@ impl CoreControlState {
 			return self.status().await;
 		}
 		self.clear_pending_runtime_status().await;
+		self.inner.runtime_generation.fetch_add(1, Ordering::AcqRel);
 		let status_callback = self.runtime_status_callback();
 		let host = match core_runtime_config_from_document(&document) {
 			Ok(config) => run_blocking_runtime_operation(move || CoreRuntimeHost::spawn(config, status_callback)).await,
@@ -406,6 +415,7 @@ impl CoreControlState {
 		let host = match host {
 			Ok(host) => host,
 			Err(error) => {
+				self.inner.runtime_generation.fetch_add(1, Ordering::AcqRel);
 				let status = {
 					let mut state = self.inner.state.write().await;
 					state.status.running = false;
@@ -640,6 +650,7 @@ impl CoreControlState {
 	}
 
 	async fn stop_runtime_host(&self) -> RuntimeStopOutcome {
+		self.inner.runtime_generation.fetch_add(1, Ordering::AcqRel);
 		let _apply = self.inner.runtime_status_apply.lock().await;
 		let host = self.runtime_host_lock().take();
 		if let Some(host) = host {
@@ -659,11 +670,16 @@ impl CoreControlState {
 
 	fn runtime_status_callback(&self) -> std::sync::Arc<dyn Fn(CoreRuntimeStatusUpdate) + Send + Sync + 'static> {
 		let inner = Arc::downgrade(&self.inner);
+		let generation = self.inner.runtime_generation.load(Ordering::Acquire);
 		Arc::new(move |update| {
 			let Some(inner) = inner.upgrade() else {
 				return;
 			};
-			inner.pending_runtime_status.store(Some(Arc::new(update)));
+			if inner.runtime_generation.load(Ordering::Acquire) == generation {
+				inner
+					.pending_runtime_status
+					.store(Some(Arc::new(PendingRuntimeStatus { generation, update })));
+			}
 		})
 	}
 
@@ -672,15 +688,18 @@ impl CoreControlState {
 		let Some(update) = self.inner.pending_runtime_status.swap(None) else {
 			return;
 		};
-		let mut state = self.inner.state.write().await;
-		if state.status.active_profile_id != update.active_profile_id {
+		if self.inner.runtime_generation.load(Ordering::Acquire) != update.generation {
 			return;
 		}
-		state.status.running = update.running;
-		state.status.health.clone_from(&update.health);
-		state.status.frame_count = update.frame_count;
-		state.status.packet_count = update.packet_count;
-		state.runtime_snapshot.clone_from(&update.runtime_snapshot);
+		let mut state = self.inner.state.write().await;
+		if state.status.active_profile_id != update.update.active_profile_id {
+			return;
+		}
+		state.status.running = update.update.running;
+		state.status.health.clone_from(&update.update.health);
+		state.status.frame_count = update.update.frame_count;
+		state.status.packet_count = update.update.packet_count;
+		state.runtime_snapshot.clone_from(&update.update.runtime_snapshot);
 		state.status.updated_at_ms = now_unix_ms();
 	}
 
@@ -810,6 +829,24 @@ mod tests {
 		let status = status_task.await.expect("status task");
 		assert_eq!(status.health, "latest");
 		assert_eq!(status.frame_count, 2);
+	}
+
+	#[tokio::test]
+	async fn stale_runtime_status_callbacks_are_rejected() {
+		let state = CoreControlState::default();
+		let callback = state.runtime_status_callback();
+		state.inner.runtime_generation.fetch_add(1, Ordering::AcqRel);
+		callback(CoreRuntimeStatusUpdate {
+			active_profile_id: "default".to_string(),
+			running: true,
+			health: "stale".to_string(),
+			frame_count: 99,
+			packet_count: 99,
+			runtime_snapshot: None,
+		});
+
+		assert!(state.inner.pending_runtime_status.load().is_none());
+		assert!(!state.status().await.running);
 	}
 
 	#[test]
