@@ -221,6 +221,11 @@ struct CoreControlInner {
 	next_event_sequence: AtomicU64,
 }
 
+struct RuntimeStopOutcome {
+	was_running: bool,
+	error: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct CoreControlState {
 	inner: Arc<CoreControlInner>,
@@ -302,7 +307,8 @@ impl CoreControlState {
 		} else {
 			normalize_profile_document(profile_document)
 		};
-		let was_running = self.stop_runtime_host().await;
+		let stop = self.stop_runtime_host().await;
+		let was_running = stop.was_running;
 		{
 			let mut state = self.inner.state.write().await;
 			state.profiles = document_profiles(&normalized);
@@ -353,7 +359,7 @@ impl CoreControlState {
 		let should_restart =
 			was_running && (normalized.selected_profile_id != current_active_profile_id || old_active_profile != new_active_profile);
 		if should_restart {
-			self.stop_runtime_host().await;
+			let _ = self.stop_runtime_host().await;
 		}
 		{
 			let mut state = self.inner.state.write().await;
@@ -419,7 +425,9 @@ impl CoreControlState {
 			Err(_) => Err((host, true)),
 		};
 		if let Err((rejected_host, lock_poisoned)) = install_result {
-			let _ = tokio::task::spawn_blocking(move || rejected_host.join()).await;
+			if let Some(error) = join_runtime_host(rejected_host).await {
+				tracing::error!(error = %error, "rejected runtime host failed to stop");
+			}
 			if !lock_poisoned {
 				return self.status().await;
 			}
@@ -449,11 +457,11 @@ impl CoreControlState {
 
 	pub async fn stop_runtime(&self) -> RuntimeStatus {
 		let _mutation = self.inner.mutation.lock().await;
-		self.stop_runtime_host().await;
+		let stop = self.stop_runtime_host().await;
 		let status = {
 			let mut state = self.inner.state.write().await;
 			state.status.running = false;
-			state.status.health = "stopped".to_string();
+			state.status.health = stop.error.map_or_else(|| "stopped".to_string(), |error| format!("failed: {error}"));
 			state.runtime_snapshot = None;
 			state.status.updated_at_ms = now_unix_ms();
 			state.status.clone()
@@ -578,7 +586,8 @@ impl CoreControlState {
 		} else {
 			normalize_profile_document(document)
 		};
-		let was_running = self.stop_runtime_host().await;
+		let stop = self.stop_runtime_host().await;
+		let was_running = stop.was_running;
 		let status = {
 			let mut state = self.inner.state.write().await;
 			state.profiles = document_profiles(&normalized);
@@ -632,14 +641,20 @@ impl CoreControlState {
 		Ok(host.as_ref().context("runtime is not running")?.handle())
 	}
 
-	async fn stop_runtime_host(&self) -> bool {
+	async fn stop_runtime_host(&self) -> RuntimeStopOutcome {
 		let host = self.inner.runtime_host.lock().ok().and_then(|mut host| host.take());
 		if let Some(host) = host {
-			let _ = tokio::task::spawn_blocking(move || host.join()).await;
+			let error = join_runtime_host(host).await;
+			if let Some(error) = &error {
+				tracing::error!(error = %error, "runtime host failed to stop");
+			}
 			self.inner.pending_runtime_status.store(None);
-			true
+			RuntimeStopOutcome { was_running: true, error }
 		} else {
-			false
+			RuntimeStopOutcome {
+				was_running: false,
+				error: None,
+			}
 		}
 	}
 
@@ -667,6 +682,29 @@ impl CoreControlState {
 		state.status.packet_count = update.packet_count;
 		state.runtime_snapshot.clone_from(&update.runtime_snapshot);
 		state.status.updated_at_ms = now_unix_ms();
+	}
+}
+
+async fn join_runtime_host(host: CoreRuntimeHost) -> Option<String> {
+	match tokio::task::spawn_blocking(move || host.join()).await {
+		Ok(result) => runtime_thread_join_error(result),
+		Err(error) => Some(format!("runtime join task failed: {error}")),
+	}
+}
+
+fn runtime_thread_join_error(result: std::thread::Result<()>) -> Option<String> {
+	result
+		.err()
+		.map(|payload| format!("runtime thread panicked: {}", panic_payload_message(payload.as_ref())))
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+	if let Some(message) = payload.downcast_ref::<String>() {
+		message
+	} else if let Some(message) = payload.downcast_ref::<&'static str>() {
+		message
+	} else {
+		"non-string panic payload"
 	}
 }
 
@@ -732,6 +770,19 @@ mod tests {
 		assert!(status.running);
 		assert_eq!(status.frame_count, 12);
 		assert_eq!(status.packet_count, 34);
+	}
+
+	#[test]
+	fn runtime_thread_join_errors_preserve_panic_messages() {
+		assert_eq!(runtime_thread_join_error(Ok(())), None);
+		assert_eq!(
+			runtime_thread_join_error(Err(Box::new("runtime failure"))),
+			Some("runtime thread panicked: runtime failure".to_string())
+		);
+		assert_eq!(
+			runtime_thread_join_error(Err(Box::new(42_u32))),
+			Some("runtime thread panicked: non-string panic payload".to_string())
+		);
 	}
 
 	#[tokio::test]
