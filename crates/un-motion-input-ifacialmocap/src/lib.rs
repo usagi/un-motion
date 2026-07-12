@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{ErrorKind, Read};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -74,6 +75,10 @@ pub struct IfacialMocapFrame {
 impl IfacialMocapFrame {
 	pub fn to_unmotion_frame(&self, sequence: u64) -> UNMotionFrame {
 		let mut frame = UNMotionFrame::new(sequence);
+		let expression_lookup = ExpressionLookup::new(&self.expressions);
+		let output_expressions = output_expression_samples(&expression_lookup);
+		let blink_left = expression_output_value(&output_expressions, "EyeBlinkLeft");
+		let blink_right = expression_output_value(&output_expressions, "EyeBlinkRight");
 		let head = mirror_euler_left_right(self.head);
 		let left_eye = conditioned_eye_euler(mirror_euler_left_right(self.right_eye));
 		let right_eye = conditioned_eye_euler(mirror_euler_left_right(self.left_eye));
@@ -102,30 +107,14 @@ impl IfacialMocapFrame {
 		});
 
 		let source_index = Some(0);
-		frame.face = Some(FaceMotion {
-			tracking_state: tracking_state(self.confidence),
-			confidence: self.confidence,
-			head: Some(transform_from_euler(head)),
-			expressions: output_expression_samples(&self.expressions)
-				.into_iter()
-				.map(|(name, value)| un_motion_frame::ExpressionSample {
-					name,
-					value: value.clamp(0.0, 1.0),
-					confidence: self.confidence,
-					source_index,
-					state: SampleState::Valid,
-				})
-				.collect(),
-		});
-
 		frame.eyes = Some(EyeMotion {
 			tracking_state: tracking_state(self.confidence),
 			confidence: self.confidence,
 			left_gaze: Some(gaze_from_euler(left_eye, self.confidence)),
 			right_gaze: Some(gaze_from_euler(right_eye, self.confidence)),
 			combined_gaze: Some(gaze_from_euler(average_euler(left_eye, right_eye), self.confidence)),
-			blink_left: expression_output_value(&self.expressions, "EyeBlinkLeft"),
-			blink_right: expression_output_value(&self.expressions, "EyeBlinkRight"),
+			blink_left,
+			blink_right,
 		});
 
 		frame.body = Some(BodyMotion {
@@ -148,7 +137,7 @@ impl IfacialMocapFrame {
 		push_scalar_signal(&mut frame, "eye.left.pitch", left_eye.pitch, self.confidence, source_index);
 		push_scalar_signal(&mut frame, "eye.right.yaw", right_eye.yaw, self.confidence, source_index);
 		push_scalar_signal(&mut frame, "eye.right.pitch", right_eye.pitch, self.confidence, source_index);
-		for (output_name, value) in output_expression_samples(&self.expressions) {
+		for (output_name, value) in &output_expressions {
 			push_scalar_signal(
 				&mut frame,
 				format!("face.{output_name}"),
@@ -157,6 +146,21 @@ impl IfacialMocapFrame {
 				source_index,
 			);
 		}
+		frame.face = Some(FaceMotion {
+			tracking_state: tracking_state(self.confidence),
+			confidence: self.confidence,
+			head: Some(transform_from_euler(head)),
+			expressions: output_expressions
+				.into_iter()
+				.map(|(name, value)| un_motion_frame::ExpressionSample {
+					name,
+					value: value.clamp(0.0, 1.0),
+					confidence: self.confidence,
+					source_index,
+					state: SampleState::Valid,
+				})
+				.collect(),
+		});
 		frame.metadata.producer = Some("un-motion-input-ifacialmocap".to_string());
 		frame.metadata.notes.push("source_protocol=ifacialmocap".to_string());
 		frame
@@ -495,7 +499,28 @@ impl ExpressionRoute {
 	}
 }
 
-fn output_expression_samples(expressions: &[(String, f32)]) -> Vec<(String, f32)> {
+struct ExpressionLookup<'a> {
+	values: HashMap<&'a str, f32>,
+}
+
+impl<'a> ExpressionLookup<'a> {
+	fn new(expressions: &'a [(String, f32)]) -> Self {
+		Self {
+			values: expressions.iter().map(|(name, value)| (name.as_str(), *value)).collect(),
+		}
+	}
+
+	fn get(&self, name: &str) -> Option<f32> {
+		self.values.get(name).copied().or_else(|| {
+			self.values
+				.iter()
+				.find(|(expression_name, _)| expression_name.eq_ignore_ascii_case(name))
+				.map(|(_, value)| *value)
+		})
+	}
+}
+
+fn output_expression_samples(expressions: &ExpressionLookup<'_>) -> Vec<(String, f32)> {
 	WAIDAYO_EXPRESSION_ROUTES
 		.iter()
 		.filter_map(|route| {
@@ -506,28 +531,18 @@ fn output_expression_samples(expressions: &[(String, f32)]) -> Vec<(String, f32)
 		.collect()
 }
 
-fn expression_input_value(expressions: &[(String, f32)], name: &str) -> Option<f32> {
-	expressions
-		.iter()
-		.find(|(expression_name, _)| expression_name.eq_ignore_ascii_case(name))
-		.map(|(_, value)| *value)
-}
-
-fn routed_expression_input_value(expressions: &[(String, f32)], name: &str) -> Option<f32> {
-	expression_input_value(expressions, name)
+fn routed_expression_input_value(expressions: &ExpressionLookup<'_>, name: &str) -> Option<f32> {
+	expressions.get(name)
 }
 
 fn expression_output_value(expressions: &[(String, f32)], target_name: &str) -> Option<f32> {
-	if let Some(value) = reference_expression_value(target_name, expressions) {
-		return Some(value);
-	}
-	WAIDAYO_EXPRESSION_ROUTES
+	expressions
 		.iter()
-		.find(|route| route.target.eq_ignore_ascii_case(target_name))
-		.and_then(|route| routed_expression_input_value(expressions, route.source).map(|value| route.apply(value)))
+		.find(|(name, _)| name.eq_ignore_ascii_case(target_name))
+		.map(|(_, value)| *value)
 }
 
-fn reference_expression_value(target_name: &str, expressions: &[(String, f32)]) -> Option<f32> {
+fn reference_expression_value(target_name: &str, expressions: &ExpressionLookup<'_>) -> Option<f32> {
 	if is_mouth_reference_target(target_name) && !has_mouth_reference_activity(expressions) {
 		return has_mouth_reference_input(expressions).then_some(0.0);
 	}
@@ -700,13 +715,13 @@ fn is_mouth_reference_target(target_name: &str) -> bool {
 	)
 }
 
-fn has_mouth_reference_activity(expressions: &[(String, f32)]) -> bool {
+fn has_mouth_reference_activity(expressions: &ExpressionLookup<'_>) -> bool {
 	mouth_reference_source_names()
 		.iter()
 		.any(|name| routed_expression_input_value(expressions, name).is_some_and(|value| value > neutral_expression_deadzone(name) + 0.03))
 }
 
-fn has_mouth_reference_input(expressions: &[(String, f32)]) -> bool {
+fn has_mouth_reference_input(expressions: &ExpressionLookup<'_>) -> bool {
 	mouth_reference_source_names()
 		.iter()
 		.any(|name| routed_expression_input_value(expressions, name).is_some())
@@ -729,7 +744,7 @@ fn mouth_reference_source_names() -> &'static [&'static str] {
 	]
 }
 
-fn linear_reference_expression(expressions: &[(String, f32)], intercept: f32, terms: &[(&str, f32)]) -> f32 {
+fn linear_reference_expression(expressions: &ExpressionLookup<'_>, intercept: f32, terms: &[(&str, f32)]) -> f32 {
 	let mut value = intercept;
 	for (name, coefficient) in terms {
 		value += routed_expression_input_value(expressions, name).unwrap_or(0.0) * coefficient;
