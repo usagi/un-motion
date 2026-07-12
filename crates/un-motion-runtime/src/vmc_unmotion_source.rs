@@ -44,7 +44,10 @@ use un_motion_frame::{
 	BodyMotion, BoneSample, CoordinateSpace, ExpressionSample, FaceMotion, Handedness, HumanoidBone, HumanoidPose, LengthUnit, Quatf,
 	SampleState, TrackingState, TransformSample, UNMotionFrame, Vec3f,
 };
-use un_motion_input_vmc::{VmcBlendshapeSample, VmcBoneSample, VmcInputConfig, VmcInputFrame, VmcInputSource, VmcTransform};
+use un_motion_input_vmc::{
+	MAX_VMC_BLENDSHAPES, MAX_VMC_NAME_BYTES, VmcBlendshapeSample, VmcBoneSample, VmcInputConfig, VmcInputFrame, VmcInputSource,
+	VmcTransform,
+};
 
 use crate::{MotionFrameSource, SourceTelemetryHandle};
 
@@ -148,10 +151,16 @@ impl VmcUnmotionSource {
 			self.pending_root = Some(root.clone());
 		}
 		for bone in &frame.bones {
-			self.pending_bones.insert(bone.name.clone(), bone.clone());
+			if humanoid_bone_from_name(&bone.name).is_some() {
+				self.pending_bones.insert(bone.name.clone(), bone.clone());
+			}
 		}
 		for blend in &frame.blendshapes {
-			self.pending_blendshapes.insert(blend.name.clone(), blend.value);
+			let valid_name = !blend.name.is_empty() && blend.name.len() <= MAX_VMC_NAME_BYTES;
+			let has_capacity = self.pending_blendshapes.contains_key(&blend.name) || self.pending_blendshapes.len() < MAX_VMC_BLENDSHAPES;
+			if valid_name && has_capacity {
+				self.pending_blendshapes.insert(blend.name.clone(), blend.value);
+			}
 		}
 		if frame.received_timestamp_ns > self.pending_received_ts {
 			self.pending_received_ts = frame.received_timestamp_ns;
@@ -831,6 +840,36 @@ mod tests {
 		assert_eq!(humanoid_bone_from_name("LeftThumbProximal"), None);
 		assert_eq!(humanoid_bone_from_name(""), None);
 		assert_eq!(humanoid_bone_from_name("UnknownBone"), None);
+	}
+
+	#[test]
+	fn accumulator_rejects_unknown_bones_and_bounds_blendshapes() {
+		let mut source = VmcUnmotionSource::bind("bounded", "127.0.0.1:0".parse().unwrap()).expect("bind");
+		let mut frame = VmcInputFrame {
+			source_id: "bounded".to_string(),
+			received_timestamp_ns: 1,
+			raw_datagram: None,
+			ok: None,
+			root: None,
+			bones: Vec::new(),
+			blendshapes: Vec::new(),
+			blend_apply: false,
+			message_count: 0,
+		};
+		frame.bones.push(VmcBoneSample {
+			name: "UnknownBone".to_string(),
+			position: [0.0; 3],
+			rotation: [0.0, 0.0, 0.0, 1.0],
+		});
+		for index in 0..(MAX_VMC_BLENDSHAPES + 10) {
+			frame.blendshapes.push(VmcBlendshapeSample {
+				name: format!("Blend{index}"),
+				value: 0.5,
+			});
+		}
+		source.merge_bundle(&frame);
+		assert!(source.pending_bones.is_empty());
+		assert_eq!(source.pending_blendshapes.len(), MAX_VMC_BLENDSHAPES);
 	}
 
 	#[test]

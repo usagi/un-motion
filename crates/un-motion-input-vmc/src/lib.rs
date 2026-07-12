@@ -6,6 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rosc::{OscMessage, OscPacket, OscType, decoder};
 
 const MAX_DATAGRAMS_PER_POLL: usize = 64;
+pub const MAX_VMC_BLENDSHAPES: usize = 1_024;
+pub const MAX_VMC_NAME_BYTES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VmcInputConfig {
@@ -175,11 +177,15 @@ impl VmcPacketDecoder {
 			}
 			"/VMC/Ext/Blend/Val" => {
 				if let (Some(name), Some(value)) = (message.args.first().and_then(osc_string), message.args.get(1).and_then(osc_float)) {
-					self.pending_blendshapes.insert(name.to_string(), value);
-					frame.blendshapes.push(VmcBlendshapeSample {
-						name: name.to_string(),
-						value,
-					});
+					let valid_name = !name.is_empty() && name.len() <= MAX_VMC_NAME_BYTES;
+					let has_capacity = self.pending_blendshapes.contains_key(name) || self.pending_blendshapes.len() < MAX_VMC_BLENDSHAPES;
+					if valid_name && has_capacity {
+						self.pending_blendshapes.insert(name.to_string(), value);
+						frame.blendshapes.push(VmcBlendshapeSample {
+							name: name.to_string(),
+							value,
+						});
+					}
 				}
 			}
 			"/VMC/Ext/Blend/Apply" => {
@@ -396,6 +402,23 @@ mod tests {
 			timetag: OscTime { seconds: 0, fractional: 1 },
 			content,
 		})
+	}
+
+	#[test]
+	fn pending_blendshape_names_are_bounded() {
+		let mut decoder = VmcPacketDecoder::new("bounded");
+		for index in 0..(MAX_VMC_BLENDSHAPES + 10) {
+			let packet = packet_message(
+				"/VMC/Ext/Blend/Val",
+				vec![OscType::String(format!("Blend{index}")), OscType::Float(0.5)],
+			);
+			let _ = decoder.decode_packet(&packet, index as u64);
+		}
+		assert_eq!(decoder.pending_blendshapes.len(), MAX_VMC_BLENDSHAPES);
+		let oversized = "x".repeat(MAX_VMC_NAME_BYTES + 1);
+		let packet = packet_message("/VMC/Ext/Blend/Val", vec![OscType::String(oversized.clone()), OscType::Float(0.5)]);
+		assert!(decoder.decode_packet(&packet, 0).is_none());
+		assert!(!decoder.pending_blendshapes.contains_key(&oversized));
 	}
 
 	fn encoded_bone_packet(name: &str, x: f32) -> Vec<u8> {
