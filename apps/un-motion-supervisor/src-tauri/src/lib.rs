@@ -425,6 +425,7 @@ struct ManagedCapturer {
 	bind_addr: SocketAddr,
 	started_at: Instant,
 	stderr_tail: Arc<Mutex<CapturerLogTail>>,
+	stderr_join: Option<std::thread::JoinHandle<()>>,
 	/// Phase E telemetry: 前回 `capturer_runtime_status` で観測した累積カウンタ。
 	/// 次回観測時に Δcount / Δt で FPS を算出する。値が無い間は FPS = 0 を返す
 	/// (まだ「2 サンプル目が無い」状態)。Supervisor の 1.5s poll cadence で更新される。
@@ -650,7 +651,7 @@ fn launch_capturer(
 		profile_id: resolved_profile_id.clone(),
 	};
 
-	let (child, bind_addr, stderr_tail, started_at) = {
+	let (child, bind_addr, stderr_tail, stderr_join, started_at) = {
 		let mut attempt = 0;
 		loop {
 			attempt += 1;
@@ -668,12 +669,15 @@ fn launch_capturer(
 				.stderr(Stdio::piped())
 				.spawn()
 				.map_err(|e| format!("launch capturer: {e}"))?;
-			let stderr_tail = spawn_stderr_tail(child.stderr.take());
+			let (stderr_tail, mut stderr_join) = spawn_stderr_tail(child.stderr.take());
 			let started_at = Instant::now();
 			match wait_for_healthz(&http_client, bind_addr, &mut child, &stderr_tail) {
-				Ok(()) => break (child, bind_addr, stderr_tail, started_at),
+				Ok(()) => break (child, bind_addr, stderr_tail, stderr_join, started_at),
 				Err(error) => {
 					let _ = force_stop_capturer_child_if_running(&mut child, "launch_capturer: healthz failed, abort spawn");
+					if let Some(join) = stderr_join.take() {
+						let _ = join.join();
+					}
 					let tail = stderr_tail.lock().map(|tail| tail.lines.clone()).unwrap_or_default();
 					if attempt < 3 && capturer_bind_conflict(&error, &tail) {
 						continue;
@@ -702,6 +706,7 @@ fn launch_capturer(
 								bind_addr,
 								started_at,
 								stderr_tail,
+								stderr_join: None,
 								prev_telemetry: None,
 							},
 						);
@@ -736,6 +741,7 @@ fn launch_capturer(
 				bind_addr,
 				started_at,
 				stderr_tail,
+				stderr_join,
 				prev_telemetry: None,
 			},
 		);
@@ -3510,6 +3516,7 @@ fn refresh_capturers(state: &mut SupervisorState) {
 			}
 		};
 		if let Some(status) = exit_status {
+			join_capturer_stderr(capturer);
 			capturer.info.state = if matches!(capturer.info.state, CapturerState::Stopping) || status.success() {
 				CapturerState::Exited
 			} else {
@@ -3611,11 +3618,18 @@ fn stop_managed_capturer(id: u32, capturer: &mut ManagedCapturer, http_client: &
 }
 
 fn refresh_capturer_stderr(capturer: &mut ManagedCapturer) {
+	join_capturer_stderr(capturer);
 	let Ok(tail) = capturer.stderr_tail.lock() else {
 		return;
 	};
 	capturer.info.stderr_tail.clear();
 	capturer.info.last_stderr = tail.lines.last().cloned();
+}
+
+fn join_capturer_stderr(capturer: &mut ManagedCapturer) {
+	if let Some(join) = capturer.stderr_join.take() {
+		let _ = join.join();
+	}
 }
 
 /// `runtime_snapshot.output_telemetry` JSON から `TelemetrySample` を切り出す。
@@ -3774,13 +3788,13 @@ fn capturer_bind_conflict(error: &str, stderr_lines: &[String]) -> bool {
 		.any(|needle| error.contains(needle) || stderr.contains(needle))
 }
 
-fn spawn_stderr_tail(stderr: Option<ChildStderr>) -> Arc<Mutex<CapturerLogTail>> {
+fn spawn_stderr_tail(stderr: Option<ChildStderr>) -> (Arc<Mutex<CapturerLogTail>>, Option<std::thread::JoinHandle<()>>) {
 	let tail = Arc::new(Mutex::new(CapturerLogTail::default()));
 	let Some(stderr) = stderr else {
-		return tail;
+		return (tail, None);
 	};
 	let thread_tail = Arc::clone(&tail);
-	std::thread::spawn(move || {
+	let join = std::thread::spawn(move || {
 		for line in BufReader::new(stderr).lines().map_while(Result::ok) {
 			let Ok(mut tail) = thread_tail.lock() else {
 				return;
@@ -3793,7 +3807,7 @@ fn spawn_stderr_tail(stderr: Option<ChildStderr>) -> Arc<Mutex<CapturerLogTail>>
 			}
 		}
 	});
-	tail
+	(tail, Some(join))
 }
 
 fn configure_hidden_child(_command: &mut Command) {
@@ -4095,6 +4109,34 @@ mod tests {
 		child.wait().expect("wait child");
 
 		assert!(!force_stop_capturer_child_if_running(&mut child, "test").expect("query exited child"));
+	}
+
+	#[test]
+	fn stderr_tail_join_observes_all_child_output() {
+		#[cfg(windows)]
+		let mut child = Command::new("cmd")
+			.args(["/C", "echo first 1>&2 & echo second 1>&2"])
+			.stderr(Stdio::piped())
+			.spawn()
+			.expect("spawn stderr child");
+		#[cfg(not(windows))]
+		let mut child = Command::new("sh")
+			.args(["-c", "printf 'first\\nsecond\\n' >&2"])
+			.stderr(Stdio::piped())
+			.spawn()
+			.expect("spawn stderr child");
+		let (tail, join) = spawn_stderr_tail(child.stderr.take());
+		child.wait().expect("wait child");
+		join.expect("stderr join").join().expect("join stderr reader");
+
+		let lines = tail
+			.lock()
+			.expect("tail")
+			.lines
+			.iter()
+			.map(|line| line.trim().to_string())
+			.collect::<Vec<_>>();
+		assert_eq!(lines, ["first", "second"]);
 	}
 
 	#[test]
