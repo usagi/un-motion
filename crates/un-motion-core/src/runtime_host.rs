@@ -36,6 +36,7 @@ const DEFAULT_VRC_OSC_PARAMETER_PREFIX: &str = "FT";
 const STALE_AFTER_NS: u64 = 500_000_000;
 const LOOP_MAX_SLEEP: Duration = Duration::from_millis(5);
 const FLOW_IDLE_SLEEP: Duration = Duration::from_millis(1);
+const RUNTIME_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(100);
 const BUILTIN_UNMOTION_FLOW_ID: &str = "mediapipe-main";
 
 type StatusCallback = Arc<dyn Fn(CoreRuntimeStatusUpdate) + Send + Sync + 'static>;
@@ -936,6 +937,7 @@ fn run_core_runtime(
 	let mut last_output_sequences: HashMap<StreamId, u64> = HashMap::new();
 	let mut neutral_calibration: Option<PendingNeutralCalibration> = None;
 	let mut face_pose_model: Option<PendingFacePoseModel> = None;
+	let mut last_runtime_snapshot_at = Instant::now();
 	tracing::info!(
 		frame_streams = config.frame_streams.len(),
 		vmc_output = workers.vmc_output.is_some(),
@@ -962,6 +964,7 @@ fn run_core_runtime(
 			break;
 		}
 		if apply_frame_stream_startup_errors(&workers.frame_stream_errors, &mut latest_states, &mut health) {
+			last_runtime_snapshot_at = Instant::now();
 			status_callback(CoreRuntimeStatusUpdate {
 				active_profile_id: active_profile_id.clone(),
 				running: true,
@@ -1008,7 +1011,7 @@ fn run_core_runtime(
 			}
 			sent = true;
 		}
-		if received_unmotion || sent {
+		if (received_unmotion || sent) && runtime_snapshot_due(&mut last_runtime_snapshot_at, now) {
 			workers.refresh_source_telemetry(&mut output_telemetry);
 			status_callback(CoreRuntimeStatusUpdate {
 				active_profile_id: active_profile_id.clone(),
@@ -1726,6 +1729,14 @@ fn runtime_snapshot(
 			.collect(),
 		output_telemetry: output_telemetry.clone(),
 	}
+}
+
+fn runtime_snapshot_due(last_published_at: &mut Instant, now: Instant) -> bool {
+	if now.saturating_duration_since(*last_published_at) < RUNTIME_SNAPSHOT_INTERVAL {
+		return false;
+	}
+	*last_published_at = now;
+	true
 }
 
 fn drain_output_messages(output_rx: &Receiver<VmcOutputEvent>, health: &mut String, output_telemetry: &mut OutputTelemetry) {
@@ -2859,6 +2870,18 @@ mod tests {
 		assert_eq!(vrc_osc.sent_datagrams, 4);
 		assert_eq!(vrc_osc.sent_packets, 12);
 		assert_eq!(vrc_osc.target_addr.as_deref(), Some("127.0.0.1:9000"));
+	}
+
+	#[test]
+	fn runtime_snapshot_cadence_limits_high_frequency_updates() {
+		let start = Instant::now();
+		let mut last = start;
+		assert!(!runtime_snapshot_due(&mut last, start + Duration::from_millis(99)));
+		assert_eq!(last, start);
+		assert!(runtime_snapshot_due(&mut last, start + Duration::from_millis(100)));
+		assert_eq!(last, start + Duration::from_millis(100));
+		assert!(!runtime_snapshot_due(&mut last, start + Duration::from_millis(150)));
+		assert!(runtime_snapshot_due(&mut last, start + Duration::from_millis(200)));
 	}
 
 	#[test]
