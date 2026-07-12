@@ -544,7 +544,7 @@ fn vec3_to_array(value: Vec3f) -> [f32; 3] {
 }
 
 fn quat_to_array(value: Quatf) -> [f32; 4] {
-	[value.x, value.y, value.z, value.w]
+	normalize_quat([value.x, value.y, value.z, value.w])
 }
 
 fn humanoid_bone_name(bone: HumanoidBone) -> &'static str {
@@ -1874,7 +1874,7 @@ fn quat_from_rotation_matrix(matrix: [[f32; 3]; 3]) -> [f32; 4] {
 
 fn normalize_quat(q: [f32; 4]) -> [f32; 4] {
 	let len = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
-	if len <= 1e-6 {
+	if !len.is_finite() || len <= 1e-6 {
 		IDENTITY_QUAT
 	} else {
 		[q[0] / len, q[1] / len, q[2] / len, q[3] / len]
@@ -2218,6 +2218,13 @@ mod tests {
 		}));
 		let ok = messages.iter().find(|message| message.addr == "/VMC/Ext/OK").expect("OK packet");
 		assert_eq!(ok.args, vec![OscType::Int(0)]);
+	}
+
+	#[test]
+	fn quaternion_output_is_normalized_and_invalid_values_fall_back_to_identity() {
+		assert_eq!(normalize_quat([0.0, 0.0, 0.0, 2.0]), IDENTITY_QUAT);
+		assert_eq!(normalize_quat([0.0, 0.0, 0.0, f32::NAN]), IDENTITY_QUAT);
+		assert_eq!(normalize_quat([0.0; 4]), IDENTITY_QUAT);
 	}
 
 	#[test]

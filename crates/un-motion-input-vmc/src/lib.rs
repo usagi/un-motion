@@ -352,17 +352,26 @@ fn parse_transform(args: &[OscType]) -> Option<VmcTransform> {
 		args.get(2).and_then(osc_float)?,
 		args.get(3).and_then(osc_float)?,
 	];
-	let rotation = [
+	let rotation = normalize_input_quaternion([
 		args.get(4).and_then(osc_float)?,
 		args.get(5).and_then(osc_float)?,
 		args.get(6).and_then(osc_float)?,
 		args.get(7).and_then(osc_float)?,
-	];
+	])?;
 	Some(VmcTransform {
 		name: name.to_string(),
 		position,
 		rotation,
 	})
+}
+
+fn normalize_input_quaternion(rotation: [f32; 4]) -> Option<[f32; 4]> {
+	let length_squared = rotation.iter().map(|value| value * value).sum::<f32>();
+	if !length_squared.is_finite() || length_squared <= 1e-12 {
+		return None;
+	}
+	let inverse_length = length_squared.sqrt().recip();
+	Some(rotation.map(|value| value * inverse_length))
 }
 
 fn osc_string(value: &OscType) -> Option<&str> {
@@ -463,6 +472,13 @@ mod tests {
 	}
 
 	#[test]
+	fn rejects_zero_quaternions_and_normalizes_valid_transforms() {
+		assert_eq!(normalize_input_quaternion([0.0; 4]), None);
+		let normalized = normalize_input_quaternion([0.0, 0.0, 0.0, 2.0]).expect("valid quaternion");
+		assert_eq!(normalized, [0.0, 0.0, 0.0, 1.0]);
+	}
+
+	#[test]
 	fn pending_blendshape_names_are_bounded() {
 		let mut decoder = VmcPacketDecoder::new("bounded");
 		for index in 0..(MAX_VMC_BLENDSHAPES + 10) {
@@ -537,7 +553,10 @@ mod tests {
 		assert_eq!(frame.root.expect("root").position, [1.0, 2.0, 3.0]);
 		assert_eq!(frame.bones.len(), 1);
 		assert_eq!(frame.bones[0].name, "Head");
-		assert_eq!(frame.bones[0].rotation, [0.0, 0.2, 0.0, 0.98]);
+		let rotation = frame.bones[0].rotation;
+		let length = rotation.iter().map(|value| value * value).sum::<f32>().sqrt();
+		assert!((length - 1.0).abs() < 1e-6);
+		assert!((rotation[1] - 0.199_960_01).abs() < 1e-6);
 		assert_eq!(frame.message_count, 3);
 	}
 
