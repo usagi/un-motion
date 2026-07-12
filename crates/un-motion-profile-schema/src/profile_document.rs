@@ -11,6 +11,10 @@ use crate::CoreProfile;
 use crate::profile_settings::{ProfilePipelineComponents, ProfileRuntimeSettings};
 
 const CONF_FILE_NAME: &str = "conf.toml";
+const PROFILE_TRANSACTION_MARKER: &str = ".profiles-transaction";
+const NEXT_PROFILES_DIR: &str = ".profiles-next";
+const PREVIOUS_PROFILES_DIR: &str = ".profiles-previous";
+const NEXT_CONF_FILE: &str = ".conf.toml.next";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -205,6 +209,7 @@ impl CoreProfileDocumentStore {
 	}
 
 	pub fn load(&self) -> CoreProfileDocument {
+		let _ = self.recover_profile_transaction();
 		let mut profiles = Vec::new();
 		let mut profile_sources = Vec::new();
 		let profile_manifest = load_profile_manifest(&self.conf_path);
@@ -264,11 +269,20 @@ impl CoreProfileDocumentStore {
 	}
 
 	pub fn save(&self, document: CoreProfileDocument) -> anyhow::Result<CoreProfileDocument> {
+		self.recover_profile_transaction()?;
 		let normalized = normalize_profile_document(document);
-		fs::create_dir_all(&self.profiles_dir)
-			.with_context(|| format!("failed to create profiles directory {}", self.profiles_dir.display()))?;
+		let root = self.store_root();
+		fs::create_dir_all(root).with_context(|| format!("failed to create profile store {}", root.display()))?;
+		let next_profiles = root.join(NEXT_PROFILES_DIR);
+		let previous_profiles = root.join(PREVIOUS_PROFILES_DIR);
+		let next_conf = root.join(NEXT_CONF_FILE);
+		let marker = root.join(PROFILE_TRANSACTION_MARKER);
+		remove_path_if_exists(&next_profiles)?;
+		remove_path_if_exists(&previous_profiles)?;
+		remove_path_if_exists(&next_conf)?;
+		fs::create_dir(&next_profiles)
+			.with_context(|| format!("failed to create staged profiles directory {}", next_profiles.display()))?;
 		let profile_file_names = unique_profile_file_names(&normalized.profiles);
-		let expected_files = profile_file_names.iter().cloned().collect::<HashSet<_>>();
 
 		let mut profile_files = Vec::with_capacity(normalized.profiles.len());
 		for (profile, file_name) in normalized.profiles.iter().zip(profile_file_names) {
@@ -300,35 +314,82 @@ impl CoreProfileDocumentStore {
 				pipeline_components: profile.pipeline_components.clone(),
 			};
 			let raw = toml::to_string_pretty(&file).context("failed to format profile TOML")?;
-			let path = self.profiles_dir.join(file_name);
+			let path = next_profiles.join(file_name);
 			profile_files.push((path, raw));
 		}
 		for (path, raw) in profile_files {
 			atomic_write(&path, raw.as_bytes()).with_context(|| format!("failed to write profile {}", path.display()))?;
 		}
 
-		save_profile_metadata(
+		let conf_raw = format_profile_metadata(
 			&self.conf_path,
 			&normalized.selected_profile_id,
 			&normalized.profiles.iter().map(|profile| profile.id.clone()).collect::<Vec<_>>(),
 		)?;
-
-		if let Ok(entries) = fs::read_dir(&self.profiles_dir) {
-			for entry in entries.flatten() {
-				let path = entry.path();
-				if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
-					continue;
-				}
-				let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-					continue;
-				};
-				if !expected_files.contains(file_name) {
-					fs::remove_file(&path).with_context(|| format!("failed to remove stale profile {}", path.display()))?;
-				}
-			}
+		atomic_write(&next_conf, conf_raw.as_bytes())?;
+		atomic_write(&marker, b"prepared\n")?;
+		if self.profiles_dir.exists() {
+			fs::rename(&self.profiles_dir, &previous_profiles).with_context(|| {
+				format!(
+					"failed to preserve profiles {} -> {}",
+					self.profiles_dir.display(),
+					previous_profiles.display()
+				)
+			})?;
 		}
+		fs::rename(&next_profiles, &self.profiles_dir)
+			.with_context(|| format!("failed to install profiles {}", self.profiles_dir.display()))?;
+		atomic_write(&self.conf_path, conf_raw.as_bytes())?;
+		remove_path_if_exists(&previous_profiles)?;
+		remove_path_if_exists(&next_conf)?;
+		remove_path_if_exists(&marker)?;
 		Ok(normalized)
 	}
+
+	fn store_root(&self) -> &Path {
+		self.conf_path
+			.parent()
+			.filter(|path| !path.as_os_str().is_empty())
+			.unwrap_or_else(|| Path::new("."))
+	}
+
+	fn recover_profile_transaction(&self) -> anyhow::Result<()> {
+		let root = self.store_root();
+		let marker = root.join(PROFILE_TRANSACTION_MARKER);
+		if !marker.exists() {
+			return Ok(());
+		}
+		let next_profiles = root.join(NEXT_PROFILES_DIR);
+		let previous_profiles = root.join(PREVIOUS_PROFILES_DIR);
+		let next_conf = root.join(NEXT_CONF_FILE);
+		if !self.profiles_dir.exists() {
+			if next_profiles.exists() {
+				fs::rename(&next_profiles, &self.profiles_dir)
+					.with_context(|| format!("failed to recover profiles {}", self.profiles_dir.display()))?;
+			} else if previous_profiles.exists() {
+				fs::rename(&previous_profiles, &self.profiles_dir)
+					.with_context(|| format!("failed to restore profiles {}", self.profiles_dir.display()))?;
+			}
+		}
+		if self.profiles_dir.exists() && !next_profiles.exists() && next_conf.exists() {
+			let raw = fs::read(&next_conf).with_context(|| format!("failed to read staged conf {}", next_conf.display()))?;
+			atomic_write(&self.conf_path, &raw)?;
+		}
+		remove_path_if_exists(&next_profiles)?;
+		remove_path_if_exists(&previous_profiles)?;
+		remove_path_if_exists(&next_conf)?;
+		remove_path_if_exists(&marker)?;
+		Ok(())
+	}
+}
+
+fn remove_path_if_exists(path: &Path) -> anyhow::Result<()> {
+	if path.is_dir() {
+		fs::remove_dir_all(path).with_context(|| format!("failed to remove directory {}", path.display()))?;
+	} else if path.exists() {
+		fs::remove_file(path).with_context(|| format!("failed to remove file {}", path.display()))?;
+	}
+	Ok(())
 }
 
 pub fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
@@ -771,7 +832,7 @@ fn sort_profiles_by_saved_order(profiles: &mut [CoreProfileDocumentProfile], ord
 	);
 }
 
-fn save_profile_metadata(path: &Path, active_profile_id: &str, profile_order: &[String]) -> anyhow::Result<()> {
+fn format_profile_metadata(path: &Path, active_profile_id: &str, profile_order: &[String]) -> anyhow::Result<String> {
 	let mut doc = match fs::read_to_string(path) {
 		Ok(raw) => raw
 			.parse::<toml::Value>()
@@ -799,8 +860,7 @@ fn save_profile_metadata(path: &Path, active_profile_id: &str, profile_order: &[
 		"profile_ids".to_string(),
 		toml::Value::Array(profile_order.iter().map(|id| toml::Value::String(id.clone())).collect()),
 	);
-	let raw = toml::to_string_pretty(&doc).context("failed to format conf.toml")?;
-	atomic_write(path, raw.as_bytes()).with_context(|| format!("failed to write {}", path.display()))
+	toml::to_string_pretty(&doc).context("failed to format conf.toml")
 }
 
 #[cfg(test)]
@@ -946,6 +1006,37 @@ mirrorCorrectionEnabled = true
 			reloaded.profiles.iter().map(|profile| profile.id.as_str()).collect::<Vec<_>>(),
 			vec!["p2"]
 		);
+	}
+
+	#[test]
+	fn store_recovers_interrupted_profile_directory_swap() {
+		let root = temp_root("recover-profile-transaction");
+		let store = CoreProfileDocumentStore::from_root(&root);
+		let previous = root.join(PREVIOUS_PROFILES_DIR);
+		let next = root.join(NEXT_PROFILES_DIR);
+		fs::remove_dir(root.join("profiles")).expect("simulate profiles moved aside");
+		fs::create_dir_all(&previous).expect("previous profiles");
+		fs::create_dir_all(&next).expect("next profiles");
+		fs::write(previous.join("old.toml"), "id = \"old\"\nname = \"Old\"\ncreated_at = \"1\"\n").expect("old profile");
+		fs::write(next.join("new.toml"), "id = \"new\"\nname = \"New\"\ncreated_at = \"2\"\n").expect("new profile");
+		fs::write(
+			root.join(NEXT_CONF_FILE),
+			"[desktop]\nactive_profile_id = \"new\"\nprofile_ids = [\"new\"]\n",
+		)
+		.expect("next conf");
+		fs::write(root.join(PROFILE_TRANSACTION_MARKER), "prepared\n").expect("marker");
+
+		let loaded = store.load();
+
+		assert_eq!(loaded.selected_profile_id, "new");
+		assert_eq!(
+			loaded.profiles.iter().map(|profile| profile.id.as_str()).collect::<Vec<_>>(),
+			vec!["new"]
+		);
+		assert!(!previous.exists());
+		assert!(!next.exists());
+		assert!(!root.join(NEXT_CONF_FILE).exists());
+		assert!(!root.join(PROFILE_TRANSACTION_MARKER).exists());
 	}
 
 	#[test]
