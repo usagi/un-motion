@@ -340,9 +340,9 @@ async fn events_stream(state: web::Data<CoreControlState>) -> HttpResponse {
 }
 
 async fn events_response(state: web::Data<CoreControlState>) -> HttpResponse {
-	let initial_event = state.snapshot_event().await;
+	let (initial_event, receiver) = subscribe_before_snapshot(&state).await;
 	let initial = stream::once(async move { Ok::<Bytes, Error>(format_sse_event(&initial_event)) });
-	let event_stream = stream::unfold((state.clone(), state.subscribe()), |(state, mut receiver)| async move {
+	let event_stream = stream::unfold((state.clone(), receiver), |(state, mut receiver)| async move {
 		match classify_event_delivery(receiver.recv().await) {
 			EventDelivery::Event(event) => Some((Ok::<Bytes, Error>(format_sse_event(&event)), (state, receiver))),
 			EventDelivery::Snapshot => {
@@ -354,6 +354,12 @@ async fn events_response(state: web::Data<CoreControlState>) -> HttpResponse {
 	});
 
 	sse_response(initial.chain(event_stream))
+}
+
+async fn subscribe_before_snapshot(state: &CoreControlState) -> (CoreEvent, tokio::sync::broadcast::Receiver<CoreEvent>) {
+	let receiver = state.subscribe();
+	let snapshot = state.snapshot_event().await;
+	(snapshot, receiver)
 }
 
 enum EventDelivery {
@@ -406,6 +412,17 @@ mod tests {
 			classify_event_delivery(Err(tokio::sync::broadcast::error::RecvError::Lagged(7))),
 			EventDelivery::Snapshot
 		));
+	}
+
+	#[actix_web::test]
+	async fn event_subscription_is_active_after_initial_snapshot() {
+		let state = CoreControlState::default();
+		let (_, mut receiver) = subscribe_before_snapshot(&state).await;
+
+		state.start_runtime().await;
+		let event = receiver.recv().await.expect("runtime event");
+		assert_eq!(event.kind, crate::CoreEventKind::RuntimeStarted);
+		state.stop_runtime().await;
 	}
 
 	#[actix_web::test]
