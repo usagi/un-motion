@@ -354,11 +354,22 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
 }
 
 pub fn normalize_profile_document(mut document: CoreProfileDocument) -> CoreProfileDocument {
-	document.profiles.retain(|profile| !profile.id.trim().is_empty());
+	for profile in &mut document.profiles {
+		profile.id = profile.id.trim().to_string();
+	}
+	let mut seen_profile_ids = HashSet::with_capacity(document.profiles.len());
+	document
+		.profiles
+		.retain(|profile| !profile.id.is_empty() && seen_profile_ids.insert(profile.id.clone()));
 	let profile_ids = document.profiles.iter().map(|profile| profile.id.clone()).collect::<HashSet<_>>();
+	for source in &mut document.profile_sources {
+		source.id = source.id.trim().to_string();
+		source.profile_id = source.profile_id.trim().to_string();
+	}
+	let mut seen_source_ids = HashSet::with_capacity(document.profile_sources.len());
 	document
 		.profile_sources
-		.retain(|source| !source.id.trim().is_empty() && profile_ids.contains(&source.profile_id));
+		.retain(|source| !source.id.is_empty() && profile_ids.contains(&source.profile_id) && seen_source_ids.insert(source.id.clone()));
 	for source in &mut document.profile_sources {
 		source.kind = normalize_source_kind(&source.kind);
 		source.protocol = normalize_source_protocol(source.protocol.as_deref(), &source.kind);
@@ -407,6 +418,7 @@ pub fn normalize_profile_document(mut document: CoreProfileDocument) -> CoreProf
 			});
 		}
 	}
+	document.selected_profile_id = document.selected_profile_id.trim().to_string();
 	if !profile_ids.contains(&document.selected_profile_id) {
 		document.selected_profile_id = document.profiles.first().map(|profile| profile.id.clone()).unwrap_or_default();
 	}
@@ -960,6 +972,38 @@ mirrorCorrectionEnabled = true
 		assert_eq!(normalized.selected_profile_id, "");
 		assert_eq!(normalized.next_profile_index, default_next_profile_index());
 		assert_eq!(normalized.next_source_index, default_next_source_index());
+	}
+
+	#[test]
+	fn normalize_trims_and_deduplicates_profile_and_source_ids() {
+		let source = |id: &str, profile_id: &str| CoreProfileDocumentSource {
+			id: id.to_string(),
+			profile_id: profile_id.to_string(),
+			kind: "vmc-osc".to_string(),
+			label: id.to_string(),
+			protocol: None,
+			host: None,
+			port: None,
+			mirror_correction_enabled: false,
+		};
+		let normalized = normalize_profile_document(CoreProfileDocument {
+			selected_profile_id: " p1 ".to_string(),
+			profiles: vec![test_document_profile(" p1 ", "first"), test_document_profile("p1", "duplicate")],
+			profile_sources: vec![
+				source(" source-1 ", " p1 "),
+				source("source-1", "p1"),
+				source("source-2", "missing"),
+			],
+			..CoreProfileDocument::default()
+		});
+
+		assert_eq!(normalized.profiles.len(), 1);
+		assert_eq!(normalized.profiles[0].id, "p1");
+		assert_eq!(normalized.profiles[0].name, "first");
+		assert_eq!(normalized.profile_sources.len(), 1);
+		assert_eq!(normalized.profile_sources[0].id, "source-1");
+		assert_eq!(normalized.profile_sources[0].profile_id, "p1");
+		assert_eq!(normalized.selected_profile_id, "p1");
 	}
 
 	#[test]
