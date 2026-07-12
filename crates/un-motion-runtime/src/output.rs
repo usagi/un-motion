@@ -4,7 +4,7 @@ use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{
-	Arc,
+	Arc, Mutex,
 	mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
 };
 use std::thread::{self, JoinHandle};
@@ -23,6 +23,33 @@ use crate::{ModifierConfig, ModifierPipeline, vmc_bone_name_to_humanoid_bone};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutputDisconnected;
+
+pub(crate) struct LatestFrameSlot<T> {
+	inner: Arc<Mutex<Option<T>>>,
+}
+
+impl<T> Clone for LatestFrameSlot<T> {
+	fn clone(&self) -> Self {
+		Self { inner: self.inner.clone() }
+	}
+}
+
+impl<T> LatestFrameSlot<T> {
+	pub(crate) fn new() -> Self {
+		Self {
+			inner: Arc::new(Mutex::new(None)),
+		}
+	}
+
+	pub(crate) fn replace(&self, value: T) -> Result<(), OutputDisconnected> {
+		*self.inner.lock().map_err(|_| OutputDisconnected)? = Some(value);
+		Ok(())
+	}
+
+	pub(crate) fn take(&self) -> Option<T> {
+		self.inner.lock().ok()?.take()
+	}
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct VmcOutputConfig {
@@ -76,7 +103,7 @@ impl From<Arc<UNMotionFrame>> for VmcOutputFrame {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum VmcOutputCommand {
-	Send(VmcOutputFrame),
+	FrameReady,
 	Shutdown,
 }
 
@@ -231,14 +258,15 @@ fn vmc_message_enabled(message: &OscMessage, modifier: &ModifierConfig) -> bool 
 pub struct VmcOutputWorkerHandle {
 	pub target_addr: SocketAddr,
 	command_tx: SyncSender<VmcOutputCommand>,
+	latest_frame: LatestFrameSlot<VmcOutputFrame>,
 	join: Option<JoinHandle<()>>,
 }
 
 impl VmcOutputWorkerHandle {
 	pub fn send(&self, frame: impl Into<VmcOutputFrame>) -> Result<bool, OutputDisconnected> {
-		match self.command_tx.try_send(VmcOutputCommand::Send(frame.into())) {
-			Ok(()) => Ok(true),
-			Err(TrySendError::Full(_)) => Ok(false),
+		self.latest_frame.replace(frame.into())?;
+		match self.command_tx.try_send(VmcOutputCommand::FrameReady) {
+			Ok(()) | Err(TrySendError::Full(_)) => Ok(true),
 			Err(TrySendError::Disconnected(_)) => Err(OutputDisconnected),
 		}
 	}
@@ -413,16 +441,19 @@ impl Drop for FileOutputWorkerHandle {
 pub fn spawn_vmc_output_worker(config: VmcOutputConfig, event_tx: Sender<VmcOutputEvent>) -> anyhow::Result<VmcOutputWorkerHandle> {
 	let mut worker = VmcOutputWorker::bind(config)?;
 	let target_addr = worker.target_addr();
+	let latest_frame = LatestFrameSlot::new();
+	let worker_latest_frame = latest_frame.clone();
 	info!(
 		target: "un_motion_runtime::vmc_output",
 		target_addr = %target_addr,
 		"VMC output worker bound",
 	);
 	let (command_tx, command_rx) = mpsc::sync_channel(1);
-	let join = thread::spawn(move || run_vmc_output_worker(&mut worker, command_rx, event_tx));
+	let join = thread::spawn(move || run_vmc_output_worker(&mut worker, command_rx, worker_latest_frame, event_tx));
 	Ok(VmcOutputWorkerHandle {
 		target_addr,
 		command_tx,
+		latest_frame,
 		join: Some(join),
 	})
 }
@@ -491,7 +522,7 @@ impl From<Arc<UNMotionFrame>> for VrcOscOutputFrame {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum VrcOscOutputCommand {
-	Send(VrcOscOutputFrame),
+	FrameReady,
 	Shutdown,
 }
 
@@ -671,14 +702,15 @@ impl VrcOscOutputWorker {
 pub struct VrcOscOutputWorkerHandle {
 	pub target_addr: SocketAddr,
 	command_tx: SyncSender<VrcOscOutputCommand>,
+	latest_frame: LatestFrameSlot<VrcOscOutputFrame>,
 	join: Option<JoinHandle<()>>,
 }
 
 impl VrcOscOutputWorkerHandle {
 	pub fn send(&self, frame: impl Into<VrcOscOutputFrame>) -> Result<bool, OutputDisconnected> {
-		match self.command_tx.try_send(VrcOscOutputCommand::Send(frame.into())) {
-			Ok(()) => Ok(true),
-			Err(TrySendError::Full(_)) => Ok(false),
+		self.latest_frame.replace(frame.into())?;
+		match self.command_tx.try_send(VrcOscOutputCommand::FrameReady) {
+			Ok(()) | Err(TrySendError::Full(_)) => Ok(true),
 			Err(TrySendError::Disconnected(_)) => Err(OutputDisconnected),
 		}
 	}
@@ -705,16 +737,19 @@ pub fn spawn_vrc_osc_output_worker(
 ) -> anyhow::Result<VrcOscOutputWorkerHandle> {
 	let mut worker = VrcOscOutputWorker::bind(config)?;
 	let target_addr = worker.target_addr();
+	let latest_frame = LatestFrameSlot::new();
+	let worker_latest_frame = latest_frame.clone();
 	info!(
 		target: "un_motion_runtime::vrc_osc_output",
 		target_addr = %target_addr,
 		"VRC OSC output worker bound",
 	);
 	let (command_tx, command_rx) = mpsc::sync_channel(1);
-	let join = thread::spawn(move || run_vrc_osc_output_worker(&mut worker, command_rx, event_tx));
+	let join = thread::spawn(move || run_vrc_osc_output_worker(&mut worker, command_rx, worker_latest_frame, event_tx));
 	Ok(VrcOscOutputWorkerHandle {
 		target_addr,
 		command_tx,
+		latest_frame,
 		join: Some(join),
 	})
 }
@@ -722,41 +757,45 @@ pub fn spawn_vrc_osc_output_worker(
 fn run_vrc_osc_output_worker(
 	worker: &mut VrcOscOutputWorker,
 	command_rx: Receiver<VrcOscOutputCommand>,
+	latest_frame: LatestFrameSlot<VrcOscOutputFrame>,
 	event_tx: Sender<VrcOscOutputEvent>,
 ) {
 	const SEND_LOG_INTERVAL: u64 = 30;
 	let target_addr = worker.target_addr();
 	for command in command_rx {
 		match command {
-			VrcOscOutputCommand::Send(frame) => match worker.send_frame(frame) {
-				Ok(event) => {
-					let stats = worker.stats();
-					if stats.sent_datagrams == 1 || stats.sent_datagrams % SEND_LOG_INTERVAL == 0 {
-						debug!(
+			VrcOscOutputCommand::FrameReady => {
+				let Some(frame) = latest_frame.take() else { continue };
+				match worker.send_frame(frame) {
+					Ok(event) => {
+						let stats = worker.stats();
+						if stats.sent_datagrams == 1 || stats.sent_datagrams % SEND_LOG_INTERVAL == 0 {
+							debug!(
+								target: "un_motion_runtime::vrc_osc_output",
+								target_addr = %target_addr,
+								sent_datagrams = stats.sent_datagrams,
+								sent_packets = stats.sent_packets,
+								skipped_frames = stats.skipped_frames,
+								vrchat_detected = worker.vrchat_detected(),
+								"VRC OSC output event",
+							);
+						}
+						let _ = event_tx.send(event);
+					}
+					Err(error) => {
+						warn!(
 							target: "un_motion_runtime::vrc_osc_output",
 							target_addr = %target_addr,
-							sent_datagrams = stats.sent_datagrams,
-							sent_packets = stats.sent_packets,
-							skipped_frames = stats.skipped_frames,
-							vrchat_detected = worker.vrchat_detected(),
-							"VRC OSC output event",
+							error = %error,
+							"VRC OSC datagram send failed",
 						);
+						let _ = event_tx.send(VrcOscOutputEvent::Error {
+							target_addr,
+							message: error.to_string(),
+						});
 					}
-					let _ = event_tx.send(event);
 				}
-				Err(error) => {
-					warn!(
-						target: "un_motion_runtime::vrc_osc_output",
-						target_addr = %target_addr,
-						error = %error,
-						"VRC OSC datagram send failed",
-					);
-					let _ = event_tx.send(VrcOscOutputEvent::Error {
-						target_addr,
-						message: error.to_string(),
-					});
-				}
-			},
+			}
 			VrcOscOutputCommand::Shutdown => break,
 		}
 	}
@@ -856,40 +895,48 @@ pub fn spawn_file_output_worker(config: FileOutputConfig, event_tx: Sender<FileO
 	})
 }
 
-fn run_vmc_output_worker(worker: &mut VmcOutputWorker, command_rx: Receiver<VmcOutputCommand>, event_tx: Sender<VmcOutputEvent>) {
+fn run_vmc_output_worker(
+	worker: &mut VmcOutputWorker,
+	command_rx: Receiver<VmcOutputCommand>,
+	latest_frame: LatestFrameSlot<VmcOutputFrame>,
+	event_tx: Sender<VmcOutputEvent>,
+) {
 	// Phase E e2e Step B: 1 秒に 1 回程度 (30 fps 想定で 30 datagram 毎) で send が
 	// 進んでいるか debug log に流す。「送信側で詰まっているか」の切り分けに使う。
 	const SEND_LOG_INTERVAL: u64 = 30;
 	let target_addr = worker.target_addr();
 	for command in command_rx {
 		match command {
-			VmcOutputCommand::Send(frame) => match worker.send_frame(frame) {
-				Ok(event) => {
-					let stats = worker.stats();
-					if stats.sent_datagrams == 1 || stats.sent_datagrams % SEND_LOG_INTERVAL == 0 {
-						debug!(
+			VmcOutputCommand::FrameReady => {
+				let Some(frame) = latest_frame.take() else { continue };
+				match worker.send_frame(frame) {
+					Ok(event) => {
+						let stats = worker.stats();
+						if stats.sent_datagrams == 1 || stats.sent_datagrams % SEND_LOG_INTERVAL == 0 {
+							debug!(
+								target: "un_motion_runtime::vmc_output",
+								target_addr = %target_addr,
+								sent_datagrams = stats.sent_datagrams,
+								sent_packets = stats.sent_packets,
+								"VMC datagram sent",
+							);
+						}
+						let _ = event_tx.send(event);
+					}
+					Err(error) => {
+						warn!(
 							target: "un_motion_runtime::vmc_output",
 							target_addr = %target_addr,
-							sent_datagrams = stats.sent_datagrams,
-							sent_packets = stats.sent_packets,
-							"VMC datagram sent",
+							error = %error,
+							"VMC datagram send failed",
 						);
+						let _ = event_tx.send(VmcOutputEvent::Error {
+							target_addr,
+							message: error.to_string(),
+						});
 					}
-					let _ = event_tx.send(event);
 				}
-				Err(error) => {
-					warn!(
-						target: "un_motion_runtime::vmc_output",
-						target_addr = %target_addr,
-						error = %error,
-						"VMC datagram send failed",
-					);
-					let _ = event_tx.send(VmcOutputEvent::Error {
-						target_addr,
-						message: error.to_string(),
-					});
-				}
-			},
+			}
 			VmcOutputCommand::Shutdown => break,
 		}
 	}
@@ -986,16 +1033,22 @@ mod tests {
 	}
 
 	#[test]
-	fn live_output_queue_drops_excess_frames_without_reporting_disconnect() {
+	fn live_output_queue_replaces_pending_frame_with_latest() {
 		let (command_tx, command_rx) = mpsc::sync_channel(1);
+		let latest_frame = LatestFrameSlot::new();
 		let handle = VmcOutputWorkerHandle {
 			target_addr: "127.0.0.1:39540".parse().expect("target"),
 			command_tx,
+			latest_frame: latest_frame.clone(),
 			join: None,
 		};
 
 		assert_eq!(handle.send(UNMotionFrame::new(1)), Ok(true));
-		assert_eq!(handle.send(UNMotionFrame::new(2)), Ok(false));
+		assert_eq!(handle.send(UNMotionFrame::new(2)), Ok(true));
+		let VmcOutputFrame::UnmotionFrame(frame) = latest_frame.take().expect("latest frame") else {
+			panic!("expected owned frame");
+		};
+		assert_eq!(frame.header.sequence, 2);
 		drop(command_rx);
 		assert_eq!(handle.send(UNMotionFrame::new(3)), Err(OutputDisconnected));
 	}
