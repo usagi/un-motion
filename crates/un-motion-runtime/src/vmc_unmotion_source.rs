@@ -88,8 +88,10 @@ pub struct VmcUnmotionSource {
 	/// bone 名 (VMC 規約上は HumanoidBone enum と 1:1 の "Hips", "Spine" 等) →
 	/// 最新の VmcBoneSample。
 	pending_bones: BTreeMap<String, VmcBoneSample>,
-	/// blendshape 名 → 最新値。VMC `/VMC/Ext/Blend/Val` の累積。
+	/// blendshape 名 → Apply 済みの最新値。
 	pending_blendshapes: BTreeMap<String, f32>,
+	/// `/VMC/Ext/Blend/Val` で受信し、次の Apply まで公開しない値。
+	staged_blendshapes: BTreeMap<String, f32>,
 	/// 最新の受信 unix timestamp ns。emit する UNMotionFrame の
 	/// `capture_timestamp_ns` / `frame_timestamp_ns` に使う。
 	pending_received_ts: u64,
@@ -135,6 +137,7 @@ impl VmcUnmotionSource {
 			pending_root: None,
 			pending_bones: BTreeMap::new(),
 			pending_blendshapes: BTreeMap::new(),
+			staged_blendshapes: BTreeMap::new(),
 			pending_received_ts: 0,
 			pending_dirty: false,
 			telemetry: SourceTelemetryHandle::new("vmc-receive", source_id),
@@ -157,15 +160,19 @@ impl VmcUnmotionSource {
 		}
 		for blend in &frame.blendshapes {
 			let valid_name = !blend.name.is_empty() && blend.name.len() <= MAX_VMC_NAME_BYTES;
-			let has_capacity = self.pending_blendshapes.contains_key(&blend.name) || self.pending_blendshapes.len() < MAX_VMC_BLENDSHAPES;
+			let has_capacity = self.staged_blendshapes.contains_key(&blend.name) || self.staged_blendshapes.len() < MAX_VMC_BLENDSHAPES;
 			if valid_name && has_capacity {
-				self.pending_blendshapes.insert(blend.name.clone(), blend.value);
+				self.staged_blendshapes.insert(blend.name.clone(), blend.value);
 			}
+		}
+		if frame.blend_apply {
+			self.pending_blendshapes.append(&mut self.staged_blendshapes);
 		}
 		if frame.received_timestamp_ns > self.pending_received_ts {
 			self.pending_received_ts = frame.received_timestamp_ns;
 		}
-		if frame.has_vmc_payload() || frame.blend_apply {
+		let has_immediate_payload = frame.ok.is_some() || frame.root.is_some() || !frame.bones.is_empty();
+		if has_immediate_payload || frame.blend_apply {
 			self.pending_dirty = true;
 			self.telemetry.atomics.bundles_merged.fetch_add(1, Ordering::Relaxed);
 		}
@@ -869,7 +876,38 @@ mod tests {
 		}
 		source.merge_bundle(&frame);
 		assert!(source.pending_bones.is_empty());
-		assert_eq!(source.pending_blendshapes.len(), MAX_VMC_BLENDSHAPES);
+		assert_eq!(source.staged_blendshapes.len(), MAX_VMC_BLENDSHAPES);
+	}
+
+	#[test]
+	fn accumulator_publishes_blendshapes_only_on_apply() {
+		let mut source = VmcUnmotionSource::bind("blend-apply", "127.0.0.1:0".parse().unwrap()).expect("bind");
+		let mut frame = VmcInputFrame {
+			source_id: "blend-apply".to_string(),
+			received_timestamp_ns: 1,
+			raw_datagram: None,
+			ok: None,
+			root: None,
+			bones: Vec::new(),
+			blendshapes: vec![VmcBlendshapeSample {
+				name: "Joy".to_string(),
+				value: 0.75,
+			}],
+			blend_apply: false,
+			message_count: 1,
+		};
+
+		source.merge_bundle(&frame);
+		assert!(!source.pending_dirty);
+		assert!(source.pending_blendshapes.is_empty());
+		assert_eq!(source.staged_blendshapes.get("Joy"), Some(&0.75));
+
+		frame.blendshapes.clear();
+		frame.blend_apply = true;
+		source.merge_bundle(&frame);
+		assert!(source.pending_dirty);
+		assert_eq!(source.pending_blendshapes.get("Joy"), Some(&0.75));
+		assert!(source.staged_blendshapes.is_empty());
 	}
 
 	#[test]
