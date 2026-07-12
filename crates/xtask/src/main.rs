@@ -3831,7 +3831,7 @@ fn build_native_mediapipe(repo: &Path, raw_args: Vec<OsString>) -> Result<()> {
 	copy_native_bridge(repo, &media_pipe_root)?;
 	patch_mediapipe_sources(repo, &media_pipe_root, opencv.as_ref().map(|opencv| opencv.build_path.as_path()))?;
 	let python_env = prepare_bazel_python(repo)?;
-	let halide_runtime = find_halide_runtime()?;
+	let halide_runtime = find_halide_runtime(&media_pipe_root, &bazelisk, &python_env)?;
 	let built = build_mediapipe_dll(
 		repo,
 		&media_pipe_root,
@@ -4407,18 +4407,31 @@ fn find_python() -> Result<PathBuf> {
 	bail!("could not find a runnable Python executable for Bazel")
 }
 
-fn find_halide_runtime() -> Result<Option<PathBuf>> {
-	let Some(home) = std::env::var_os("USERPROFILE").map(PathBuf::from) else {
-		return Ok(None);
-	};
-	let bazel_root = home.join("_bazel_the");
-	if !bazel_root.exists() {
+fn find_halide_runtime(media_pipe_root: &Path, bazelisk: &Path, python_env: &BazelPythonEnv) -> Result<Option<PathBuf>> {
+	if !cfg!(windows) {
 		return Ok(None);
 	}
-	Ok(find_file_recursive(&bazel_root, "Halide.dll")?
-		.into_iter()
-		.find(|path| path.to_string_lossy().contains("windows_halide"))
-		.and_then(|path| path.parent().map(Path::to_path_buf)))
+	let mut cmd = Command::new(bazelisk);
+	cmd.current_dir(media_pipe_root)
+		.env("PATH", &python_env.path)
+		.args(["info", "output_base"]);
+	if let Some(bazel_sh) = &python_env.bazel_sh {
+		cmd.env("BAZEL_SH", bazel_sh);
+	}
+	let output = cmd.output().context("failed to query Bazel output_base")?;
+	if !output.status.success() {
+		return Ok(None);
+	}
+	let stdout = String::from_utf8_lossy(&output.stdout);
+	let Some(output_base) = stdout.lines().map(str::trim).find(|line| !line.is_empty()) else {
+		return Ok(None);
+	};
+	Ok(halide_runtime_in_output_base(Path::new(output_base)))
+}
+
+fn halide_runtime_in_output_base(output_base: &Path) -> Option<PathBuf> {
+	let runtime = output_base.join("external/windows_halide/bin/Release");
+	runtime.join("Halide.dll").is_file().then_some(runtime)
 }
 
 fn find_file_recursive(root: &Path, file_name: &str) -> Result<Vec<PathBuf>> {
@@ -7597,6 +7610,23 @@ mod tests {
 	fn parse_rgba_accepts_rgb_and_rgba_hex() {
 		assert_eq!(parse_rgba("112233").unwrap(), Rgba([0x11, 0x22, 0x33, 0xff]));
 		assert_eq!(parse_rgba("#11223344").unwrap(), Rgba([0x11, 0x22, 0x33, 0x44]));
+	}
+
+	#[test]
+	fn halide_runtime_is_resolved_only_from_the_selected_output_base() {
+		let root = env::temp_dir().join(format!("unmotion-xtask-halide-test-{}", now_unix_ms()));
+		let selected = root.join("selected");
+		let other = root.join("other");
+		let selected_runtime = selected.join("external/windows_halide/bin/Release");
+		let other_runtime = other.join("external/windows_halide/bin/Release");
+		fs::create_dir_all(&selected_runtime).expect("selected runtime");
+		fs::create_dir_all(&other_runtime).expect("other runtime");
+		fs::write(selected_runtime.join("Halide.dll"), b"selected").expect("selected dll");
+		fs::write(other_runtime.join("Halide.dll"), b"other").expect("other dll");
+
+		assert_eq!(halide_runtime_in_output_base(&selected), Some(selected_runtime));
+		assert_eq!(halide_runtime_in_output_base(&root.join("missing")), None);
+		fs::remove_dir_all(root).expect("cleanup");
 	}
 
 	#[test]
