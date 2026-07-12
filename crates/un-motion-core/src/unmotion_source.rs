@@ -248,13 +248,9 @@ where
 		let debug_input_image_path = self.write_debug_input_image_if_active(&image);
 		let submitted = SubmittedImageFrame::from_image(&image, debug_input_image_path);
 		if self.live_stream_mode {
-			self.pending_live_stream_inputs.push_back(submitted.clone());
-			while self.pending_live_stream_inputs.len() > LIVE_STREAM_PENDING_INPUT_CAPACITY {
-				self.pending_live_stream_inputs.pop_front();
-			}
 			let native = self.engine.process_rgb_frame(&image)?;
 			self.update_native_live_stream_stats();
-			if native.return_code != 0 && native.return_code != 30 {
+			if !record_live_submission_if_accepted(&mut self.pending_live_stream_inputs, submitted, native.return_code) {
 				self.telemetry.atomics.decode_errors.fetch_add(1, Ordering::Relaxed);
 			}
 			return Ok(None);
@@ -266,6 +262,21 @@ where
 	fn telemetry_handle(&self) -> Option<SourceTelemetryHandle> {
 		Some(self.telemetry.clone())
 	}
+}
+
+fn record_live_submission_if_accepted(
+	pending: &mut VecDeque<SubmittedImageFrame>,
+	submitted: SubmittedImageFrame,
+	return_code: i32,
+) -> bool {
+	if return_code != 0 {
+		return false;
+	}
+	pending.push_back(submitted);
+	while pending.len() > LIVE_STREAM_PENDING_INPUT_CAPACITY {
+		pending.pop_front();
+	}
+	true
 }
 
 impl<I> CoreImageMotionFrameSource<I>
@@ -1066,5 +1077,34 @@ mod tests {
 		assert_eq!(first_out.data[12], 0);
 		assert!(second_out.data[12] > 0);
 		assert!(second_out.data[12] < 100);
+	}
+
+	#[test]
+	fn live_submission_tracking_keeps_only_successful_bounded_inputs() {
+		let mut pending = VecDeque::new();
+		for sequence in 0..=LIVE_STREAM_PENDING_INPUT_CAPACITY as u64 {
+			assert!(record_live_submission_if_accepted(
+				&mut pending,
+				SubmittedImageFrame {
+					timestamp_ms: sequence as i64,
+					sequence,
+					capture_timestamp_ns: sequence * 1_000_000,
+					width: 1,
+					height: 1,
+					source_label: None,
+					debug_input_image_path: None,
+				},
+				0,
+			));
+		}
+		let rejected = pending.back().cloned().expect("tracked frame");
+		assert!(!record_live_submission_if_accepted(&mut pending, rejected, 52));
+
+		assert_eq!(pending.len(), LIVE_STREAM_PENDING_INPUT_CAPACITY);
+		assert_eq!(pending.front().map(|frame| frame.sequence), Some(1));
+		assert_eq!(
+			pending.back().map(|frame| frame.sequence),
+			Some(LIVE_STREAM_PENDING_INPUT_CAPACITY as u64)
+		);
 	}
 }
