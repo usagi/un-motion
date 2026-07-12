@@ -60,6 +60,13 @@ pub struct MotionFrameStreamWorker<S> {
 	state: Arc<StreamState>,
 }
 
+struct MotionFrameStreamSinglePoll {
+	stream_id: StreamId,
+	frame: Option<UNMotionFrame>,
+	state: Arc<StreamState>,
+	snapshot: StreamSnapshot,
+}
+
 impl<S> MotionFrameStreamWorker<S>
 where
 	S: MotionFrameSource,
@@ -78,18 +85,27 @@ where
 	}
 
 	pub fn poll_once(&mut self) -> anyhow::Result<MotionFrameStreamPoll> {
+		let poll = self.poll_single_once()?;
+		Ok(MotionFrameStreamPoll {
+			stream_id: poll.stream_id,
+			frames: poll.frame.into_iter().collect(),
+			state: poll.state,
+			snapshot: poll.snapshot,
+		})
+	}
+
+	fn poll_single_once(&mut self) -> anyhow::Result<MotionFrameStreamSinglePoll> {
 		let observed_at_ns = now_unix_ns();
-		let mut frames = Vec::new();
-		if let Some(frame) = self.source.next_frame()? {
+		let frame = self.source.next_frame()?;
+		if let Some(frame) = frame.as_ref() {
 			let mut next_state = next_stream_state(&self.state);
-			apply_unmotion_frame_to_stream_state(&mut next_state, &frame, observed_at_ns);
+			apply_unmotion_frame_to_stream_state(&mut next_state, frame, observed_at_ns);
 			self.state = Arc::new(next_state);
-			frames.push(frame);
 		}
 
-		Ok(MotionFrameStreamPoll {
+		Ok(MotionFrameStreamSinglePoll {
 			stream_id: self.config.stream_id.clone(),
-			frames,
+			frame,
 			state: Arc::clone(&self.state),
 			snapshot: self.state.snapshot_at(now_unix_ns(), self.config.stale_after_ns),
 		})
@@ -316,10 +332,10 @@ fn run_latest_frame_stream_worker<S>(
 			break;
 		}
 
-		match worker.poll_once() {
-			Ok(mut poll) => {
-				let idle = poll.is_idle();
-				if let Some(frame) = poll.frames.pop() {
+		match worker.poll_single_once() {
+			Ok(poll) => {
+				let idle = poll.frame.is_none();
+				if let Some(frame) = poll.frame {
 					slot.store(LatestMotionFrame {
 						stream_id: poll.stream_id,
 						frame: Arc::new(frame),
