@@ -293,6 +293,10 @@ impl CoreControlState {
 
 	pub async fn set_profile_document(&self, profile_document: CoreProfileDocument) -> anyhow::Result<CoreProfileDocument> {
 		let _mutation = self.inner.mutation.lock().await;
+		self.set_profile_document_locked(profile_document).await
+	}
+
+	async fn set_profile_document_locked(&self, profile_document: CoreProfileDocument) -> anyhow::Result<CoreProfileDocument> {
 		let normalized = if let Some(store) = &self.inner.profile_store {
 			store.save(profile_document)?
 		} else {
@@ -459,6 +463,7 @@ impl CoreControlState {
 	}
 
 	pub async fn calibrate_neutral(&self, valid_sample_count: usize, pose: Option<&str>) -> anyhow::Result<CoreProfileDocument> {
+		let _mutation = self.inner.mutation.lock().await;
 		let pose = NeutralCalibrationPose::parse(pose)?;
 		let handle = self.runtime_handle()?;
 		let result = run_blocking_runtime_operation(move || handle.calibrate_neutral(valid_sample_count, pose)).await?;
@@ -478,10 +483,11 @@ impl CoreControlState {
 			modifier.neutral_calibration_pose = Some(pose.as_profile_value().to_string());
 			document
 		};
-		self.set_profile_document(document).await
+		self.set_profile_document_locked(document).await
 	}
 
 	pub async fn clear_neutral_calibration(&self) -> anyhow::Result<CoreProfileDocument> {
+		let _mutation = self.inner.mutation.lock().await;
 		let document = {
 			let state = self.inner.state.read().await;
 			let mut document = state.profile_document.clone();
@@ -498,10 +504,11 @@ impl CoreControlState {
 			modifier.neutral_calibration_pose = None;
 			document
 		};
-		self.set_profile_document(document).await
+		self.set_profile_document_locked(document).await
 	}
 
 	pub async fn build_face_pose_model(&self, valid_sample_count: usize) -> anyhow::Result<CoreProfileDocument> {
+		let _mutation = self.inner.mutation.lock().await;
 		let handle = self.runtime_handle()?;
 		let result = run_blocking_runtime_operation(move || handle.build_face_pose_model(valid_sample_count)).await?;
 		let document = {
@@ -524,7 +531,7 @@ impl CoreControlState {
 			});
 			document
 		};
-		self.set_profile_document(document).await
+		self.set_profile_document_locked(document).await
 	}
 
 	pub async fn capture_unmotion_frame(&self) -> anyhow::Result<UNMotionFrame> {
@@ -738,6 +745,38 @@ mod tests {
 		assert!(tokio::time::timeout(std::time::Duration::from_millis(20), &mut task).await.is_err());
 		drop(gate);
 		task.await.expect("mutation task").expect("profile mutation");
+	}
+
+	#[tokio::test]
+	async fn calibration_operations_wait_for_the_shared_operation_gate() {
+		let state = CoreControlState::default();
+		let gate = state.inner.mutation.lock().await;
+		let calibration_state = state.clone();
+		let mut calibration = tokio::spawn(async move { calibration_state.calibrate_neutral(1, None).await });
+		let model_state = state.clone();
+		let mut model = tokio::spawn(async move { model_state.build_face_pose_model(1).await });
+		let clear_state = state.clone();
+		let mut clear = tokio::spawn(async move { clear_state.clear_neutral_calibration().await });
+
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(20), &mut calibration)
+				.await
+				.is_err()
+		);
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(20), &mut model)
+				.await
+				.is_err()
+		);
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(20), &mut clear)
+				.await
+				.is_err()
+		);
+		drop(gate);
+		assert!(calibration.await.expect("calibration task").is_err());
+		assert!(model.await.expect("model task").is_err());
+		clear.await.expect("clear task").expect("clear calibration");
 	}
 
 	#[tokio::test]
