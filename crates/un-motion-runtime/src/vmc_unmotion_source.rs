@@ -751,6 +751,51 @@ mod tests {
 		assert_eq!(face.expressions.len(), 12, "face.expressions should have 12 blendshapes");
 	}
 
+	#[test]
+	fn vmc_unmotion_source_does_not_emit_partial_blendshape_frames() {
+		let mut source = VmcUnmotionSource::bind("test-blend-boundary", "127.0.0.1:0".parse().unwrap()).expect("bind");
+		let bound = source.local_addr().expect("local_addr");
+		let sender = UdpSocket::bind("127.0.0.1:0").expect("sender bind");
+		let val = rosc::OscPacket::Message(OscMessage {
+			addr: "/VMC/Ext/Blend/Val".to_string(),
+			args: vec![OscType::String("Joy".to_string()), OscType::Float(0.8)],
+		});
+		sender
+			.send_to(&encoder::encode(&val).expect("encode val"), bound)
+			.expect("send val");
+
+		let deadline = Instant::now() + Duration::from_secs(1);
+		while source.telemetry.atomics.raw_received.load(Ordering::Relaxed) < 1 && Instant::now() < deadline {
+			assert!(
+				source.next_frame().expect("poll val").is_none(),
+				"Blend/Val must not emit before Apply"
+			);
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		assert_eq!(source.telemetry.atomics.raw_received.load(Ordering::Relaxed), 1);
+		assert_eq!(source.telemetry.atomics.frames_emitted.load(Ordering::Relaxed), 0);
+
+		let apply = rosc::OscPacket::Message(OscMessage {
+			addr: "/VMC/Ext/Blend/Apply".to_string(),
+			args: Vec::new(),
+		});
+		sender
+			.send_to(&encoder::encode(&apply).expect("encode apply"), bound)
+			.expect("send apply");
+		let deadline = Instant::now() + Duration::from_secs(1);
+		let emitted = loop {
+			if let Some(frame) = source.next_frame().expect("poll apply") {
+				break frame;
+			}
+			assert!(Instant::now() < deadline, "Apply did not emit a frame");
+			std::thread::sleep(Duration::from_millis(10));
+		};
+		let face = emitted.face.expect("Apply frame face");
+		assert_eq!(face.expressions.len(), 1);
+		assert_eq!(face.expressions[0].name, "Joy");
+		assert_eq!(source.telemetry.atomics.frames_emitted.load(Ordering::Relaxed), 1);
+	}
+
 	/// `/MP/` (Waidayo MotionPath 拡張) datagram は silent drop されるが、
 	/// `non_vmc_dropped` カウンタは加算される。これによりログに
 	/// 「VMC 受信 engine dropped non-VMC datagrams」が出てユーザーが
