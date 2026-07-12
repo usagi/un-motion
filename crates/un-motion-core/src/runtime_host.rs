@@ -2652,7 +2652,6 @@ mod tests {
 		slot.store(LatestMotionFrame {
 			stream_id: StreamId::new("unmotion:mediapipe-main"),
 			frame: Arc::new(frame),
-			snapshot: state.snapshot_at(observed_at_ns, STALE_AFTER_NS),
 			state: Arc::new(state),
 		});
 		let mut packet_count = 0;
@@ -2703,7 +2702,6 @@ mod tests {
 			slot.store(LatestMotionFrame {
 				stream_id: StreamId::new("unmotion:vmc-main"),
 				frame: Arc::new(frame),
-				snapshot: state.snapshot_at(observed_at_ns, STALE_AFTER_NS),
 				state: Arc::new(state),
 			});
 		}

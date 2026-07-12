@@ -64,7 +64,6 @@ struct MotionFrameStreamSinglePoll {
 	stream_id: StreamId,
 	frame: Option<UNMotionFrame>,
 	state: Arc<StreamState>,
-	snapshot: StreamSnapshot,
 }
 
 impl<S> MotionFrameStreamWorker<S>
@@ -86,11 +85,12 @@ where
 
 	pub fn poll_once(&mut self) -> anyhow::Result<MotionFrameStreamPoll> {
 		let poll = self.poll_single_once()?;
+		let snapshot = poll.state.snapshot_at(now_unix_ns(), self.config.stale_after_ns);
 		Ok(MotionFrameStreamPoll {
 			stream_id: poll.stream_id,
 			frames: poll.frame.into_iter().collect(),
 			state: poll.state,
-			snapshot: poll.snapshot,
+			snapshot,
 		})
 	}
 
@@ -107,7 +107,6 @@ where
 			stream_id: self.config.stream_id.clone(),
 			frame,
 			state: Arc::clone(&self.state),
-			snapshot: self.state.snapshot_at(now_unix_ns(), self.config.stale_after_ns),
 		})
 	}
 }
@@ -156,7 +155,6 @@ pub struct LatestMotionFrame {
 	pub stream_id: StreamId,
 	pub frame: Arc<UNMotionFrame>,
 	pub state: Arc<StreamState>,
-	pub snapshot: StreamSnapshot,
 }
 
 #[derive(Clone)]
@@ -340,7 +338,6 @@ fn run_latest_frame_stream_worker<S>(
 						stream_id: poll.stream_id,
 						frame: Arc::new(frame),
 						state: poll.state,
-						snapshot: poll.snapshot,
 					});
 				}
 				if idle {
