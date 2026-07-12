@@ -423,33 +423,34 @@ fn native_live_stream_frame_counters(options: NativeMediaPipeOptions, stats: Nat
 			callbacks: stats.holistic_callback_count,
 		};
 	}
-	let mut submissions = Vec::new();
-	let mut submission_errors = Vec::new();
-	let mut callbacks = Vec::new();
+	let mut submissions = None;
+	let mut submission_errors = 0;
+	let mut callbacks = None;
+	let mut include = |submitted: u64, errors: u64, completed: u64| {
+		submissions = Some(submissions.map_or(submitted, |current: u64| current.min(submitted)));
+		submission_errors = submission_errors.max(errors);
+		callbacks = Some(callbacks.map_or(completed, |current: u64| current.min(completed)));
+	};
 	if options.enable_pose != 0 {
-		submissions.push(stats.pose_submit_count);
-		submission_errors.push(stats.pose_submit_error_count);
-		callbacks.push(stats.pose_callback_count);
+		include(stats.pose_submit_count, stats.pose_submit_error_count, stats.pose_callback_count);
 	}
 	if options.enable_hands != 0 {
-		submissions.push(stats.hands_submit_count);
-		submission_errors.push(stats.hands_submit_error_count);
-		callbacks.push(stats.hands_callback_count);
+		include(stats.hands_submit_count, stats.hands_submit_error_count, stats.hands_callback_count);
 	}
 	if options.enable_face != 0 {
-		submissions.push(stats.face_submit_count);
-		submission_errors.push(stats.face_submit_error_count);
-		callbacks.push(stats.face_callback_count);
+		include(stats.face_submit_count, stats.face_submit_error_count, stats.face_callback_count);
 	}
 	if options.enable_gestures != 0 {
-		submissions.push(stats.gestures_submit_count);
-		submission_errors.push(stats.gestures_submit_error_count);
-		callbacks.push(stats.gestures_callback_count);
+		include(
+			stats.gestures_submit_count,
+			stats.gestures_submit_error_count,
+			stats.gestures_callback_count,
+		);
 	}
 	NativeLiveStreamFrameCounters {
-		submissions: submissions.into_iter().min().unwrap_or(0),
-		submission_errors: submission_errors.into_iter().max().unwrap_or(0),
-		callbacks: callbacks.into_iter().min().unwrap_or(0),
+		submissions: submissions.unwrap_or(0),
+		submission_errors,
+		callbacks: callbacks.unwrap_or(0),
 	}
 }
 
@@ -1106,5 +1107,32 @@ mod tests {
 			pending.back().map(|frame| frame.sequence),
 			Some(LIVE_STREAM_PENDING_INPUT_CAPACITY as u64)
 		);
+	}
+
+	#[test]
+	fn native_live_stream_counters_aggregate_enabled_tasks_without_allocating_lists() {
+		let options = NativeMediaPipeOptions {
+			enable_holistic: 0,
+			enable_pose: 1,
+			enable_hands: 1,
+			enable_face: 0,
+			enable_gestures: 0,
+			..Default::default()
+		};
+		let stats = NativeLiveStreamStats {
+			pose_submit_count: 12,
+			pose_submit_error_count: 1,
+			pose_callback_count: 10,
+			hands_submit_count: 11,
+			hands_submit_error_count: 3,
+			hands_callback_count: 9,
+			..Default::default()
+		};
+
+		let counters = native_live_stream_frame_counters(options, stats);
+
+		assert_eq!(counters.submissions, 11);
+		assert_eq!(counters.submission_errors, 3);
+		assert_eq!(counters.callbacks, 9);
 	}
 }
