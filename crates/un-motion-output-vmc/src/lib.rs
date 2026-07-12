@@ -8,6 +8,7 @@ use un_motion_frame::{Finger, HandMotion, HumanoidBone, MotionSignalValue, Quatf
 use un_motion_interfaces::OutputSink;
 
 pub const VMC_MAX_DATAGRAM_BYTES: usize = 1_200;
+pub const VMC_MAX_NAME_BYTES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BlendshapeRoute {
@@ -300,6 +301,9 @@ fn vmc_packets_for_frame_with_options(
 			} else {
 				(expression.name.clone(), expression.value.clamp(0.0, 1.0))
 			};
+			if !valid_vmc_name(&name) {
+				continue;
+			}
 			packets.push(OscPacket::Message(OscMessage {
 				addr: "/VMC/Ext/Blend/Val".to_string(),
 				args: vec![OscType::String(name), OscType::Float(value)],
@@ -316,6 +320,10 @@ fn vmc_packets_for_frame_with_options(
 	}
 
 	packets
+}
+
+fn valid_vmc_name(name: &str) -> bool {
+	!name.is_empty() && name.len() <= VMC_MAX_NAME_BYTES
 }
 
 fn vmc_tracking_ok(frame: &UNMotionFrame) -> i32 {
@@ -2298,6 +2306,52 @@ mod tests {
 			100
 		);
 		assert_eq!(addresses.last().map(String::as_str), Some("/VMC/Ext/Blend/Apply"));
+	}
+
+	#[test]
+	fn invalid_expression_names_do_not_drop_the_vmc_frame() {
+		let mut frame = UNMotionFrame::new(1);
+		frame.face = Some(FaceMotion {
+			tracking_state: TrackingState::Valid,
+			confidence: 1.0,
+			head: None,
+			expressions: vec![
+				ExpressionSample {
+					name: String::new(),
+					value: 0.25,
+					confidence: 1.0,
+					source_index: None,
+					state: SampleState::Valid,
+				},
+				ExpressionSample {
+					name: "x".repeat(VMC_MAX_NAME_BYTES + 1),
+					value: 0.5,
+					confidence: 1.0,
+					source_index: None,
+					state: SampleState::Valid,
+				},
+				ExpressionSample {
+					name: "Joy".to_string(),
+					value: 0.75,
+					confidence: 1.0,
+					source_index: None,
+					state: SampleState::Valid,
+				},
+			],
+		});
+
+		let datagrams = encode_vmc_datagrams(vmc_packets_for_frame(&frame)).expect("encode valid remainder");
+		let messages = datagrams
+			.iter()
+			.flat_map(|datagram| {
+				let (_, packet) = decoder::decode_udp(datagram).expect("decode datagram");
+				flatten_messages(packet)
+			})
+			.collect::<Vec<_>>();
+
+		assert_eq!(messages.iter().filter(|message| message.addr == "/VMC/Ext/Blend/Val").count(), 1);
+		assert_eq!(find_message(&messages, "/VMC/Ext/Blend/Val", "Joy").args[1], OscType::Float(0.75));
+		assert!(messages.iter().any(|message| message.addr == "/VMC/Ext/Blend/Apply"));
 	}
 
 	#[test]
