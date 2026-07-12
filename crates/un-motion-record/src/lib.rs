@@ -81,15 +81,16 @@ impl<W: Write> MessagePackStreamRecorder<W> {
 
 pub fn decode_framed_stream<R: Read>(mut reader: R) -> anyhow::Result<Vec<UNMotionFrame>> {
 	let mut out = Vec::new();
+	let mut payload = Vec::new();
 
-	while let Some(frame) = decode_next_frame(&mut reader)? {
+	while let Some(frame) = decode_next_frame(&mut reader, &mut payload)? {
 		out.push(frame);
 	}
 
 	Ok(out)
 }
 
-fn decode_next_frame<R: Read>(reader: &mut R) -> anyhow::Result<Option<UNMotionFrame>> {
+fn decode_next_frame<R: Read>(reader: &mut R, payload: &mut Vec<u8>) -> anyhow::Result<Option<UNMotionFrame>> {
 	let Some(len_buf) = read_frame_length_prefix(reader)? else {
 		return Ok(None);
 	};
@@ -97,9 +98,9 @@ fn decode_next_frame<R: Read>(reader: &mut R) -> anyhow::Result<Option<UNMotionF
 	if payload_len > MAX_FRAME_PAYLOAD_BYTES {
 		anyhow::bail!("frame payload exceeds {MAX_FRAME_PAYLOAD_BYTES} byte limit: {payload_len}");
 	}
-	let mut payload = vec![0_u8; payload_len];
-	reader.read_exact(&mut payload).context("failed to read frame payload")?;
-	let frame = rmp_serde::from_slice(&payload).context("messagepack decode failed")?;
+	payload.resize(payload_len, 0);
+	reader.read_exact(payload).context("failed to read frame payload")?;
+	let frame = rmp_serde::from_slice(payload).context("messagepack decode failed")?;
 	Ok(Some(frame))
 }
 
@@ -119,7 +120,8 @@ fn read_frame_length_prefix<R: Read>(reader: &mut R) -> anyhow::Result<Option<[u
 
 pub fn replay_framed_stream_to_sink<R: Read, S: OutputSink<UNMotionFrame>>(mut reader: R, sink: &mut S) -> anyhow::Result<usize> {
 	let mut sent_count = 0_usize;
-	while let Some(frame) = decode_next_frame(&mut reader)? {
+	let mut payload = Vec::new();
+	while let Some(frame) = decode_next_frame(&mut reader, &mut payload)? {
 		sink.send(&frame)
 			.with_context(|| format!("failed to send replay frame sequence={}", frame.header.sequence))?;
 		sent_count += 1;
@@ -242,5 +244,23 @@ mod tests {
 		let error = replay_framed_stream_to_sink(bytes.as_slice(), &mut RejectingSink).expect_err("sink must fail first");
 
 		assert!(error.to_string().contains("failed to send replay frame sequence=1"));
+	}
+
+	#[test]
+	fn decoder_reuses_payload_capacity() {
+		let mut recorder = MessagePackStreamRecorder::new(Vec::<u8>::new());
+		recorder.write_frame(&UNMotionFrame::new(1)).expect("first frame");
+		recorder.write_frame(&UNMotionFrame::new(2)).expect("second frame");
+		let bytes = recorder.into_inner();
+		let mut reader = bytes.as_slice();
+		let mut payload = Vec::new();
+
+		decode_next_frame(&mut reader, &mut payload).expect("decode first").expect("first");
+		let capacity = payload.capacity();
+		decode_next_frame(&mut reader, &mut payload)
+			.expect("decode second")
+			.expect("second");
+
+		assert_eq!(payload.capacity(), capacity);
 	}
 }
