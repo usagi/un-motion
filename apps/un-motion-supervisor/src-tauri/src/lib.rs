@@ -81,6 +81,11 @@ fn command_without_console(command: &mut Command) -> &mut Command {
 /// 1 行平均 200 byte でも total 160KB/Capturer 程度なのでメモリ影響は軽微。
 const MAX_CAPTURER_LOG_LINES: usize = 800;
 const MAX_STOPPED_CAPTURER_HISTORY: usize = 20;
+static PROFILE_STORE_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_profile_store() -> Result<std::sync::MutexGuard<'static, ()>, String> {
+	PROFILE_STORE_LOCK.lock().map_err(|_| "profile store lock poisoned".to_string())
+}
 
 /// Capturer 起動後に `/healthz` が ok を返すまで待つ最大時間。
 const HEALTHZ_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
@@ -848,6 +853,7 @@ fn build_capturer_face_pose_model(
 }
 
 fn save_profile_from_capturer_selection(profile_id: &str, capturer_document: CoreProfileDocument) -> Result<CoreProfileDocument, String> {
+	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
 	let user_document = merge_profile_from_capturer_selection(profile_id, store.load(), capturer_document)?;
 	store.save(user_document).map_err(|error| error.to_string())
@@ -1784,6 +1790,7 @@ fn selected_profile_id(_state: State<'_, Mutex<SupervisorState>>) -> Result<Stri
 /// プロセス単位で決める。
 #[tauri::command]
 fn set_selected_profile_id(profile_id: Option<String>, _state: State<'_, Mutex<SupervisorState>>) -> Result<(), String> {
+	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
 	let mut doc = store.load();
 	let normalized = profile_id
@@ -1806,6 +1813,7 @@ fn set_selected_profile_id(profile_id: Option<String>, _state: State<'_, Mutex<S
 /// を OFF で開始する。
 #[tauri::command]
 fn create_profile(name: String, _state: State<'_, Mutex<SupervisorState>>) -> Result<ProfileDetail, String> {
+	let _profile_guard = lock_profile_store()?;
 	let trimmed = name.trim();
 	let name = if trimmed.is_empty() {
 		"New Profile".to_string()
@@ -1882,6 +1890,7 @@ fn new_profile_runtime_defaults() -> ProfileRuntimeSettings {
 /// Profile を削除する。最後の 1 件も削除できる。空になったら launch default は空文字にする。
 #[tauri::command]
 fn delete_profile(profile_id: String, state: State<'_, Mutex<SupervisorState>>) -> Result<(), String> {
+	let _profile_guard = lock_profile_store()?;
 	let state = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
 	let store = user_profile_store();
 	let mut doc = store.load();
@@ -1908,6 +1917,7 @@ fn delete_profile(profile_id: String, state: State<'_, Mutex<SupervisorState>>) 
 /// Profile を複製する。新しい id / 表示名は元のものから ` copy` を付けて自動採番する。
 #[tauri::command]
 fn duplicate_profile(profile_id: String, _state: State<'_, Mutex<SupervisorState>>) -> Result<ProfileDetail, String> {
+	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
 	let mut doc = store.load();
 	let original = doc
@@ -1937,6 +1947,7 @@ fn duplicate_profile(profile_id: String, _state: State<'_, Mutex<SupervisorState
 
 #[tauri::command]
 fn reorder_profiles(profile_ids: Vec<String>, _state: State<'_, Mutex<SupervisorState>>) -> Result<Vec<ProfileSummary>, String> {
+	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
 	let mut doc = store.load();
 	let mut ordered = Vec::with_capacity(doc.profiles.len());
@@ -1972,6 +1983,7 @@ fn update_profile_field(
 	value: serde_json::Value,
 	state: State<'_, Mutex<SupervisorState>>,
 ) -> Result<ProfileDetail, String> {
+	let _profile_guard = lock_profile_store()?;
 	let state_guard = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
 	let store = user_profile_store();
 	let mut doc = store.load();
