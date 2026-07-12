@@ -420,11 +420,17 @@ struct ManagedCapturer {
 	child: Child,
 	bind_addr: SocketAddr,
 	started_at: Instant,
-	stderr_tail: Arc<Mutex<Vec<String>>>,
+	stderr_tail: Arc<Mutex<CapturerLogTail>>,
 	/// Phase E telemetry: 前回 `capturer_runtime_status` で観測した累積カウンタ。
 	/// 次回観測時に Δcount / Δt で FPS を算出する。値が無い間は FPS = 0 を返す
 	/// (まだ「2 サンプル目が無い」状態)。Supervisor の 1.5s poll cadence で更新される。
 	prev_telemetry: Option<TelemetrySample>,
+}
+
+#[derive(Default)]
+struct CapturerLogTail {
+	base_index: u64,
+	lines: Vec<String>,
 }
 
 /// Capturer の `output_telemetry` を時刻と一緒に切り取った 1 サンプル。
@@ -464,6 +470,15 @@ pub struct CapturerInstance {
 	pub last_stderr: Option<String>,
 	pub stderr_tail: Vec<String>,
 	pub exit_code: Option<i32>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CapturerLogChunk {
+	id: u32,
+	base_index: u64,
+	next_index: u64,
+	lines: Vec<String>,
 }
 
 #[derive(Clone, Serialize, PartialEq, Eq)]
@@ -540,6 +555,32 @@ fn list_capturers(state: State<'_, Mutex<SupervisorState>>) -> Result<Vec<Captur
 	let mut state = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
 	refresh_capturers(&mut state);
 	Ok(state.capturers.values().map(|capturer| capturer.info.clone()).collect())
+}
+
+fn capturer_log_chunk(id: u32, after_index: u64, tail: &CapturerLogTail) -> CapturerLogChunk {
+	let next_index = tail.base_index.saturating_add(tail.lines.len() as u64);
+	let start_index = after_index.max(tail.base_index).min(next_index);
+	let offset = (start_index - tail.base_index) as usize;
+	CapturerLogChunk {
+		id,
+		base_index: tail.base_index,
+		next_index,
+		lines: tail.lines[offset..].to_vec(),
+	}
+}
+
+/// `after_index` 以降に追加された stderr 行だけを返す。
+#[tauri::command]
+fn capturer_logs(id: u32, after_index: Option<u64>, state: State<'_, Mutex<SupervisorState>>) -> Result<CapturerLogChunk, String> {
+	let stderr_tail = state
+		.lock()
+		.map_err(|_| "supervisor state poisoned".to_string())?
+		.capturers
+		.get(&id)
+		.map(|capturer| Arc::clone(&capturer.stderr_tail))
+		.ok_or_else(|| format!("capturer {id} not found"))?;
+	let tail = stderr_tail.lock().map_err(|_| "capturer stderr tail poisoned".to_string())?;
+	Ok(capturer_log_chunk(id, after_index.unwrap_or(0), &tail))
 }
 
 /// Capturer プロセスを spawn して HTTP API の起動を待ち、インスタンス情報を返す。
@@ -625,7 +666,7 @@ fn launch_capturer(
 	// healthz を待つ前にプロセスが死ぬケースを早期検出する。
 	if let Err(e) = wait_for_healthz(&http_client, bind_addr, &mut child, &stderr_tail) {
 		let _ = force_stop_capturer_child(&mut child, "launch_capturer: healthz failed, abort spawn");
-		let tail = stderr_tail.lock().map(|tail| tail.clone()).unwrap_or_default();
+		let tail = stderr_tail.lock().map(|tail| tail.lines.clone()).unwrap_or_default();
 		let exit_code = child.try_wait().ok().flatten().and_then(|status| status.code());
 		state_handle
 			.lock()
@@ -2641,6 +2682,7 @@ pub fn run() {
 		.manage(Mutex::new(load_app_settings()))
 		.invoke_handler(tauri::generate_handler![
 			list_capturers,
+			capturer_logs,
 			launch_capturer,
 			stop_capturer,
 			stop_all_capturers,
@@ -3443,8 +3485,8 @@ fn refresh_capturers(state: &mut SupervisorState) {
 		}
 		capturer.info.uptime_secs = capturer.started_at.elapsed().as_secs();
 		if let Ok(tail) = capturer.stderr_tail.lock() {
-			capturer.info.stderr_tail = tail.clone();
-			capturer.info.last_stderr = tail.last().cloned();
+			capturer.info.stderr_tail.clear();
+			capturer.info.last_stderr = tail.lines.last().cloned();
 		}
 	}
 	prune_stopped_capturer_history(state);
@@ -3524,8 +3566,8 @@ fn refresh_capturer_stderr(capturer: &mut ManagedCapturer) {
 	let Ok(tail) = capturer.stderr_tail.lock() else {
 		return;
 	};
-	capturer.info.stderr_tail = tail.clone();
-	capturer.info.last_stderr = tail.last().cloned();
+	capturer.info.stderr_tail.clear();
+	capturer.info.last_stderr = tail.lines.last().cloned();
 }
 
 /// `runtime_snapshot.output_telemetry` JSON から `TelemetrySample` を切り出す。
@@ -3635,18 +3677,14 @@ fn wait_for_healthz(
 	http_client: &reqwest::blocking::Client,
 	bind_addr: SocketAddr,
 	child: &mut Child,
-	stderr_tail: &Arc<Mutex<Vec<String>>>,
+	stderr_tail: &Arc<Mutex<CapturerLogTail>>,
 ) -> Result<(), String> {
 	let url = format!("http://{}/healthz", bind_addr);
 	let started = Instant::now();
 	loop {
 		match child.try_wait() {
 			Ok(Some(status)) => {
-				let tail_text = stderr_tail
-					.lock()
-					.ok()
-					.map(|tail| tail.iter().cloned().collect::<Vec<_>>().join("\n"))
-					.unwrap_or_default();
+				let tail_text = stderr_tail.lock().ok().map(|tail| tail.lines.join("\n")).unwrap_or_default();
 				return Err(format!(
 					"capturer exited before healthz (exit={:?})\n--- stderr tail ---\n{tail_text}",
 					status.code()
@@ -3664,11 +3702,7 @@ fn wait_for_healthz(
 			return Ok(());
 		}
 		if started.elapsed() >= HEALTHZ_WAIT_TIMEOUT {
-			let tail_text = stderr_tail
-				.lock()
-				.ok()
-				.map(|tail| tail.iter().cloned().collect::<Vec<_>>().join("\n"))
-				.unwrap_or_default();
+			let tail_text = stderr_tail.lock().ok().map(|tail| tail.lines.join("\n")).unwrap_or_default();
 			return Err(format!(
 				"capturer healthz timeout after {:.1}s\n--- stderr tail ---\n{tail_text}",
 				started.elapsed().as_secs_f32()
@@ -3684,8 +3718,8 @@ fn reserve_loopback_address() -> Result<SocketAddr, String> {
 	listener.local_addr().map_err(|e| format!("loopback local addr: {e}"))
 }
 
-fn spawn_stderr_tail(stderr: Option<ChildStderr>) -> Arc<Mutex<Vec<String>>> {
-	let tail = Arc::new(Mutex::new(Vec::new()));
+fn spawn_stderr_tail(stderr: Option<ChildStderr>) -> Arc<Mutex<CapturerLogTail>> {
+	let tail = Arc::new(Mutex::new(CapturerLogTail::default()));
 	let Some(stderr) = stderr else {
 		return tail;
 	};
@@ -3695,10 +3729,11 @@ fn spawn_stderr_tail(stderr: Option<ChildStderr>) -> Arc<Mutex<Vec<String>>> {
 			let Ok(mut tail) = thread_tail.lock() else {
 				return;
 			};
-			tail.push(line);
-			let overflow = tail.len().saturating_sub(MAX_CAPTURER_LOG_LINES);
+			tail.lines.push(line);
+			let overflow = tail.lines.len().saturating_sub(MAX_CAPTURER_LOG_LINES);
 			if overflow > 0 {
-				tail.drain(0..overflow);
+				tail.lines.drain(0..overflow);
+				tail.base_index = tail.base_index.saturating_add(overflow as u64);
 			}
 		}
 	});
@@ -3985,6 +4020,31 @@ fn exe_name(name: &str) -> String {
 mod tests {
 	use super::*;
 	use serde_json::json;
+
+	#[test]
+	fn capturer_log_chunk_returns_only_unread_lines() {
+		let tail = CapturerLogTail {
+			base_index: 10,
+			lines: vec!["a".into(), "b".into(), "c".into()],
+		};
+		let chunk = capturer_log_chunk(7, 11, &tail);
+		assert_eq!(chunk.id, 7);
+		assert_eq!(chunk.base_index, 10);
+		assert_eq!(chunk.next_index, 13);
+		assert_eq!(chunk.lines, ["b", "c"]);
+	}
+
+	#[test]
+	fn capturer_log_chunk_resets_reader_behind_truncated_tail() {
+		let tail = CapturerLogTail {
+			base_index: 20,
+			lines: vec!["new-a".into(), "new-b".into()],
+		};
+		let chunk = capturer_log_chunk(3, 5, &tail);
+		assert_eq!(chunk.base_index, 20);
+		assert_eq!(chunk.next_index, 22);
+		assert_eq!(chunk.lines, ["new-a", "new-b"]);
+	}
 
 	#[test]
 	fn capturer_launch_reservation_is_released_on_scope_exit() {

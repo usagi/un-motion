@@ -44,6 +44,13 @@
 		exitCode: number | null;
 	}
 
+	interface CapturerLogChunk {
+		id: number;
+		baseIndex: number;
+		nextIndex: number;
+		lines: string[];
+	}
+
 	interface CapturerRuntimeStatus {
 		id: number;
 		state: CapturerState;
@@ -640,6 +647,8 @@
 	let pollHandle: ReturnType<typeof setInterval> | null = null;
 	let refreshCapturersPromise: Promise<void> | null = null;
 	let refreshRuntimeStatusesPromise: Promise<void> | null = null;
+	let refreshCapturerLogsPromise: Promise<void> | null = null;
+	const capturerLogCursors = new Map<number, number>();
 	let capturerListGeneration = 0;
 
 	function updateProfileHintFromEvent(event: Event): void {
@@ -899,9 +908,10 @@
 		appVersion = await invoke<string>("app_version").catch(() => "?");
 		availableLocales = await invoke<string[]>("i18n_available_locales").catch(() => ["ja-JP", "en-US"]);
 		await Promise.all([loadBackendSettings(), refreshCapturers(), refreshProfiles()]);
+		await refreshCapturerLogs();
 		await maybeAutoLaunchSelectedOnStartup();
 		pollHandle = setInterval(() => {
-			void refreshCapturers().then(refreshRuntimeStatuses);
+			void refreshCapturers().then(() => Promise.all([refreshRuntimeStatuses(), refreshCapturerLogs()]));
 		}, 1500);
 	});
 
@@ -914,7 +924,12 @@
 		if (refreshCapturersPromise) return refreshCapturersPromise;
 		refreshCapturersPromise = (async () => {
 			try {
-				capturers = await invoke<CapturerInstance[]>("list_capturers");
+				const existingLogs = new Map(capturers.map((capturer) => [capturer.id, capturer.stderrTail]));
+				const listed = await invoke<CapturerInstance[]>("list_capturers");
+				capturers = listed.map((capturer) => ({
+					...capturer,
+					stderrTail: existingLogs.get(capturer.id) ?? capturer.stderrTail,
+				}));
 				capturerListGeneration += 1;
 			} catch (error) {
 				errorMessage = `list_capturers failed: ${String(error)}`;
@@ -923,6 +938,38 @@
 			refreshCapturersPromise = null;
 		});
 		return refreshCapturersPromise;
+	}
+
+	function refreshCapturerLogs(): Promise<void> {
+		if (refreshCapturerLogsPromise) return refreshCapturerLogsPromise;
+		refreshCapturerLogsPromise = (async () => {
+			const ids = new Set(capturers.map((capturer) => capturer.id));
+			for (const id of capturerLogCursors.keys()) {
+				if (!ids.has(id)) capturerLogCursors.delete(id);
+			}
+			const chunks = await Promise.all(
+				capturers.map((capturer) =>
+					invoke<CapturerLogChunk>("capturer_logs", {
+						id: capturer.id,
+						afterIndex: capturerLogCursors.get(capturer.id) ?? 0,
+					}).catch(() => null),
+				),
+			);
+			const chunksById = new Map(chunks.filter((chunk): chunk is CapturerLogChunk => chunk !== null).map((chunk) => [chunk.id, chunk]));
+			capturers = capturers.map((capturer) => {
+				const chunk = chunksById.get(capturer.id);
+				if (!chunk) return capturer;
+				const previousIndex = capturerLogCursors.get(capturer.id) ?? 0;
+				capturerLogCursors.set(capturer.id, chunk.nextIndex);
+				const stderrTail = previousIndex < chunk.baseIndex
+					? chunk.lines
+					: [...capturer.stderrTail, ...chunk.lines].slice(-800);
+				return { ...capturer, stderrTail };
+			});
+		})().finally(() => {
+			refreshCapturerLogsPromise = null;
+		});
+		return refreshCapturerLogsPromise;
 	}
 
 	async function refreshProfiles() {
