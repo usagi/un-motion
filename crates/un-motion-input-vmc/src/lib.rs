@@ -372,11 +372,13 @@ fn normalize_input_quaternion(rotation: [f32; 4]) -> Option<[f32; 4]> {
 	}
 	let inverse_length = length_squared.sqrt().recip();
 	let normalized = rotation.map(|value| value * inverse_length);
-	Some(if normalized[3] < 0.0 {
-		normalized.map(|value| -value)
-	} else {
-		normalized
-	})
+	let negate = normalized[3] < 0.0
+		|| (normalized[3] == 0.0
+			&& normalized[..3]
+				.iter()
+				.find(|value| **value != 0.0)
+				.is_some_and(|value| *value < 0.0));
+	Some(if negate { normalized.map(|value| -value) } else { normalized })
 }
 
 fn osc_string(value: &OscType) -> Option<&str> {
@@ -490,6 +492,9 @@ mod tests {
 
 		assert_eq!(positive, negative);
 		assert!(positive[3] >= 0.0);
+		let half_turn = normalize_input_quaternion([1.0, 0.0, 0.0, 0.0]).expect("half-turn quaternion");
+		let negated_half_turn = normalize_input_quaternion([-1.0, -0.0, -0.0, -0.0]).expect("negated half-turn quaternion");
+		assert_eq!(half_turn, negated_half_turn);
 	}
 
 	#[test]
