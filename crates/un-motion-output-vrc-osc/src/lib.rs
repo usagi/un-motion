@@ -95,16 +95,41 @@ impl VrcOscAvatarParameters {
 		let parameter = normalized_avatar_parameter_key(parameter);
 		let bits = [1_u8, 2, 4, 8]
 			.into_iter()
-			.filter(|bit| self.bool_parameters.contains(&format!("{parameter}{bit}")))
+			.filter(|bit| {
+				contains_parameter_suffix(
+					&self.bool_parameters,
+					parameter,
+					match bit {
+						1 => "1",
+						2 => "2",
+						4 => "4",
+						8 => "8",
+						_ => unreachable!(),
+					},
+				)
+			})
 			.count() as u8;
 		if bits == 0 {
 			return None;
 		}
 		Some(BinaryParameterSpec {
 			bits,
-			negative: self.bool_parameters.contains(&format!("{parameter}Negative")),
+			negative: contains_parameter_suffix(&self.bool_parameters, parameter, "Negative"),
 		})
 	}
+}
+
+fn contains_parameter_suffix(parameters: &BTreeSet<String>, parameter: &str, suffix: &str) -> bool {
+	let mut key = [0_u8; MAX_VRC_PARAMETER_NAME_BYTES + 8];
+	let Some(total_len) = parameter.len().checked_add(suffix.len()).filter(|length| *length <= key.len()) else {
+		return false;
+	};
+	key[..parameter.len()].copy_from_slice(parameter.as_bytes());
+	key[parameter.len()..total_len].copy_from_slice(suffix.as_bytes());
+	let Ok(key) = std::str::from_utf8(&key[..total_len]) else {
+		return false;
+	};
+	parameters.contains(key)
 }
 
 fn normalized_avatar_parameter_key(parameter: &str) -> &str {
