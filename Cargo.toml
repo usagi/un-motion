@@ -47,6 +47,7 @@ serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 thiserror = "2"
 toml = "0.8"
+tempfile = "3"
 winresource = "0.1"
 
 [patch.crates-io]

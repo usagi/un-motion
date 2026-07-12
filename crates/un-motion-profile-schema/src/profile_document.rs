@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -264,21 +265,7 @@ impl CoreProfileDocumentStore {
 			.with_context(|| format!("failed to create profiles directory {}", self.profiles_dir.display()))?;
 		let expected_files = normalized.profiles.iter().map(profile_file_name).collect::<HashSet<_>>();
 
-		if let Ok(entries) = fs::read_dir(&self.profiles_dir) {
-			for entry in entries.flatten() {
-				let path = entry.path();
-				if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
-					continue;
-				}
-				let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-					continue;
-				};
-				if !expected_files.contains(file_name) {
-					fs::remove_file(&path).with_context(|| format!("failed to remove stale profile {}", path.display()))?;
-				}
-			}
-		}
-
+		let mut profile_files = Vec::with_capacity(normalized.profiles.len());
 		for profile in &normalized.profiles {
 			let sources = normalized
 				.profile_sources
@@ -309,7 +296,10 @@ impl CoreProfileDocumentStore {
 			};
 			let raw = toml::to_string_pretty(&file).context("failed to format profile TOML")?;
 			let path = self.profiles_dir.join(profile_file_name(profile));
-			fs::write(&path, raw).with_context(|| format!("failed to write profile {}", path.display()))?;
+			profile_files.push((path, raw));
+		}
+		for (path, raw) in profile_files {
+			atomic_write(&path, raw.as_bytes()).with_context(|| format!("failed to write profile {}", path.display()))?;
 		}
 
 		save_profile_metadata(
@@ -317,8 +307,45 @@ impl CoreProfileDocumentStore {
 			&normalized.selected_profile_id,
 			&normalized.profiles.iter().map(|profile| profile.id.clone()).collect::<Vec<_>>(),
 		)?;
+
+		if let Ok(entries) = fs::read_dir(&self.profiles_dir) {
+			for entry in entries.flatten() {
+				let path = entry.path();
+				if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+					continue;
+				}
+				let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+					continue;
+				};
+				if !expected_files.contains(file_name) {
+					fs::remove_file(&path).with_context(|| format!("failed to remove stale profile {}", path.display()))?;
+				}
+			}
+		}
 		Ok(normalized)
 	}
+}
+
+pub fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+	let parent = path
+		.parent()
+		.filter(|parent| !parent.as_os_str().is_empty())
+		.unwrap_or_else(|| Path::new("."));
+	fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+	let mut temporary =
+		tempfile::NamedTempFile::new_in(parent).with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
+	temporary
+		.write_all(contents)
+		.with_context(|| format!("failed to write temporary file for {}", path.display()))?;
+	temporary
+		.as_file_mut()
+		.sync_all()
+		.with_context(|| format!("failed to sync temporary file for {}", path.display()))?;
+	temporary
+		.persist(path)
+		.map_err(|error| error.error)
+		.with_context(|| format!("failed to replace {}", path.display()))?;
+	Ok(())
 }
 
 pub fn normalize_profile_document(mut document: CoreProfileDocument) -> CoreProfileDocument {
@@ -724,12 +751,24 @@ fn save_profile_metadata(path: &Path, active_profile_id: &str, profile_order: &[
 		toml::Value::Array(profile_order.iter().map(|id| toml::Value::String(id.clone())).collect()),
 	);
 	let raw = toml::to_string_pretty(&doc).context("failed to format conf.toml")?;
-	fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))
+	atomic_write(path, raw.as_bytes()).with_context(|| format!("failed to write {}", path.display()))
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn atomic_write_replaces_existing_file_without_leaving_temporary_files() {
+		let root = temp_root("atomic-write");
+		let path = root.join("settings.toml");
+		fs::write(&path, b"old").expect("seed destination");
+
+		atomic_write(&path, b"new").expect("atomic replace");
+
+		assert_eq!(fs::read(&path).expect("replacement"), b"new");
+		assert_eq!(fs::read_dir(&root).expect("root entries").count(), 2);
+	}
 
 	fn temp_root(label: &str) -> PathBuf {
 		let root = std::env::temp_dir().join(format!("un-motion-core-{label}-{}-{}", std::process::id(), now_millis()));

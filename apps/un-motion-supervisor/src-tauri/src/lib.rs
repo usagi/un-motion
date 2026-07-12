@@ -395,7 +395,7 @@ fn write_app_settings(settings: &AppRuntimeSettings) -> Result<(), String> {
 		fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
 	}
 	let text = toml::to_string_pretty(settings).map_err(|e| format!("serialize settings.toml: {e}"))?;
-	fs::write(&path, text).map_err(|e| format!("write {}: {e}", path.display()))
+	un_motion_profile_schema::profile_document::atomic_write(&path, text.as_bytes()).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 /// 起動中の Capturer プロセス本体。`un-motion-capturer` を spawn して `Child` を保持し、
