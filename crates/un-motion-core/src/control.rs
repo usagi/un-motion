@@ -7,6 +7,7 @@ use std::sync::{
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow, bail};
+use arc_swap::ArcSwapOption;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, RwLock, broadcast};
 use un_motion_frame::UNMotionFrame;
@@ -215,6 +216,7 @@ struct CoreControlInner {
 	mutation: AsyncMutex<()>,
 	profile_store: Option<CoreProfileDocumentStore>,
 	runtime_host: Mutex<Option<CoreRuntimeHost>>,
+	pending_runtime_status: ArcSwapOption<CoreRuntimeStatusUpdate>,
 	events: broadcast::Sender<CoreEvent>,
 	next_event_sequence: AtomicU64,
 }
@@ -260,6 +262,7 @@ impl CoreControlState {
 				mutation: AsyncMutex::new(()),
 				profile_store,
 				runtime_host: Mutex::new(None),
+				pending_runtime_status: ArcSwapOption::empty(),
 				events,
 				next_event_sequence: AtomicU64::new(1),
 			}),
@@ -267,6 +270,7 @@ impl CoreControlState {
 	}
 
 	pub async fn snapshot(&self) -> CoreSnapshot {
+		self.apply_pending_runtime_status().await;
 		let state = self.inner.state.read().await;
 		CoreSnapshot {
 			status: state.status.clone(),
@@ -381,6 +385,7 @@ impl CoreControlState {
 		if self.runtime_host_is_running() {
 			return self.status().await;
 		}
+		self.inner.pending_runtime_status.store(None);
 		let status_callback = self.runtime_status_callback();
 		let host = match core_runtime_config_from_document(&document) {
 			Ok(config) => run_blocking_runtime_operation(move || CoreRuntimeHost::spawn(config, status_callback)).await,
@@ -624,6 +629,7 @@ impl CoreControlState {
 		let host = self.inner.runtime_host.lock().ok().and_then(|mut host| host.take());
 		if let Some(host) = host {
 			let _ = tokio::task::spawn_blocking(move || host.join()).await;
+			self.inner.pending_runtime_status.store(None);
 			true
 		} else {
 			false
@@ -636,17 +642,24 @@ impl CoreControlState {
 			let Some(inner) = inner.upgrade() else {
 				return;
 			};
-			let mut state = inner.state.blocking_write();
-			if state.status.active_profile_id != update.active_profile_id {
-				return;
-			}
-			state.status.running = update.running;
-			state.status.health = update.health;
-			state.status.frame_count = update.frame_count;
-			state.status.packet_count = update.packet_count;
-			state.runtime_snapshot = update.runtime_snapshot;
-			state.status.updated_at_ms = now_unix_ms();
+			inner.pending_runtime_status.store(Some(Arc::new(update)));
 		})
+	}
+
+	async fn apply_pending_runtime_status(&self) {
+		let Some(update) = self.inner.pending_runtime_status.swap(None) else {
+			return;
+		};
+		let mut state = self.inner.state.write().await;
+		if state.status.active_profile_id != update.active_profile_id {
+			return;
+		}
+		state.status.running = update.running;
+		state.status.health.clone_from(&update.health);
+		state.status.frame_count = update.frame_count;
+		state.status.packet_count = update.packet_count;
+		state.runtime_snapshot.clone_from(&update.runtime_snapshot);
+		state.status.updated_at_ms = now_unix_ms();
 	}
 }
 
@@ -690,6 +703,28 @@ mod tests {
 		.await
 		.expect("async timer must remain responsive");
 		assert_eq!(operation.await.expect("operation task").expect("blocking operation"), 42);
+	}
+
+	#[tokio::test]
+	async fn runtime_status_callback_does_not_wait_for_state_lock() {
+		let state = CoreControlState::default();
+		let callback = state.runtime_status_callback();
+		let state_guard = state.inner.state.write().await;
+		callback(CoreRuntimeStatusUpdate {
+			active_profile_id: "default".to_string(),
+			running: true,
+			health: "running".to_string(),
+			frame_count: 12,
+			packet_count: 34,
+			runtime_snapshot: None,
+		});
+		assert!(state.inner.pending_runtime_status.load().is_some());
+		drop(state_guard);
+
+		let status = state.status().await;
+		assert!(status.running);
+		assert_eq!(status.frame_count, 12);
+		assert_eq!(status.packet_count, 34);
 	}
 
 	#[tokio::test]

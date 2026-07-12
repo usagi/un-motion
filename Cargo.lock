@@ -6889,6 +6889,7 @@ dependencies = [
  "actix-cors",
  "actix-web",
  "anyhow",
+ "arc-swap",
  "futures-util",
  "image",
  "rosc",
