@@ -1,5 +1,3 @@
-use std::fmt::Write as _;
-
 use un_motion_engine_mediapipe_types::MediaPipeRawOutput;
 use un_motion_frame::{
 	BodyMotion, BoneSample, CoordinateSpace, ExpressionSample, FaceMotion, Finger, FingerPose, HandMotion, HumanoidBone, HumanoidPose,
@@ -208,21 +206,6 @@ impl MediaPipePostProcessor {
 			apply_anatomical_constraints(&mut frame);
 		}
 		self.stabilizer.apply(&mut frame, &observation_quality, &self.config.rules);
-		frame.metadata.notes.push(format!(
-			"mediapipe.post_process native_return_code={} pose={} hands={} face={} holistic_pose={} holistic_left_hand={} holistic_right_hand={} holistic_face={}",
-			native.return_code,
-			native.pose.landmark_count,
-			native.hands.hand_count,
-			native.face.landmark_count,
-			native.holistic.pose.landmark_count,
-			native.holistic.left_hand.landmark_count,
-			native.holistic.right_hand.landmark_count,
-			native.holistic.face.landmark_count
-		));
-		frame.metadata.notes.push(format!(
-			"mediapipe.post_process rules={}",
-			post_process_rules_summary(&self.config.rules)
-		));
 		frame.metadata.notes.push(observation_quality.summary_note());
 		if let Some(note) = pose_head_note {
 			frame.metadata.notes.push(note);
@@ -241,7 +224,7 @@ impl MediaPipePostProcessor {
 		&self,
 		output_sequence: u64,
 		capture_timestamp_ns: u64,
-		native: &NativeMediaPipeOutput,
+		_native: &NativeMediaPipeOutput,
 	) -> UNMotionFrame {
 		let mut frame = UNMotionFrame::new(output_sequence);
 		frame.header.timestamp_basis = TimestampBasis::SourceLocal;
@@ -259,10 +242,6 @@ impl MediaPipePostProcessor {
 			latency_ns: None,
 			state: TrackingState::Lost,
 		});
-		frame.metadata.notes.push(format!(
-			"post_process=none native_return_code={} pose={} hands={} face={}",
-			native.return_code, native.pose.landmark_count, native.hands.hand_count, native.face.landmark_count
-		));
 		frame
 	}
 }
@@ -2385,14 +2364,6 @@ fn lost_signal_behavior(value: &str) -> LostSignalBehavior {
 	}
 }
 
-fn lost_signal_behavior_name(value: &str) -> &'static str {
-	match lost_signal_behavior(value) {
-		LostSignalBehavior::RestPose => "rest-pose",
-		LostSignalBehavior::Hold => "hold",
-		LostSignalBehavior::Drop => "drop",
-	}
-}
-
 fn lost_signal_part_behavior(rules: &MediaPipePostProcessRules, part: LostSignalPart) -> &str {
 	match part {
 		LostSignalPart::Head => non_empty_or(&rules.lost_signal_head_behavior, &rules.lost_signal_behavior),
@@ -3510,45 +3481,6 @@ fn average_confidence(signals: &[MotionSignal]) -> f32 {
 	} else {
 		signals.iter().map(|signal| signal.confidence).sum::<f32>() / signals.len() as f32
 	}
-}
-
-fn post_process_rules_summary(rules: &MediaPipePostProcessRules) -> String {
-	let entries = [
-		("anatomical_constraints", rules.anatomical_constraints),
-		("hold_lost_landmarks", rules.hold_lost_landmarks),
-		("ease_recovery", rules.ease_recovery),
-		("limit_rotation_jumps", rules.limit_rotation_jumps),
-		("head_source_switch_blend", rules.head_source_switch_blend),
-		("head_from_pose", rules.head_from_pose),
-		("head_from_face_matrix", rules.head_from_face_matrix),
-		("head_reconcile", rules.head_reconcile),
-		("neutral_eye_fallback", rules.neutral_eye_fallback),
-		("hand_camera_target", rules.hand_camera_target),
-		("hand_orientation", rules.hand_orientation),
-		("finger_derived", rules.finger_derived),
-		("arm_from_pose", rules.arm_from_pose),
-		("arm_ik_from_hands", rules.arm_ik_from_hands),
-		("crossed_hand_heuristic", rules.crossed_hand_heuristic),
-		("coordinate_correction", rules.coordinate_correction),
-		("final_clamp", rules.final_clamp),
-	];
-	let mut out = String::with_capacity(360);
-	for (index, (name, enabled)) in entries.into_iter().enumerate() {
-		if index > 0 {
-			out.push(',');
-		}
-		out.push_str(name);
-		out.push(':');
-		out.push_str(if enabled { "on" } else { "off" });
-	}
-	let _ = write!(
-		out,
-		",lost_signal_behavior:{},lost_signal_rest_pose_blend:{:.2},lost_signal_hold_seconds:{:.1}",
-		lost_signal_behavior_name(&rules.lost_signal_behavior),
-		rules.lost_signal_rest_pose_blend.clamp(0.0, 1.0),
-		rules.lost_signal_hold_seconds.clamp(0.0, 30.0)
-	);
-	out
 }
 
 fn apply_tracking_transforms(signals: Vec<MotionSignal>, config: &MediaPipePostProcessConfig) -> Vec<MotionSignal> {
@@ -5243,6 +5175,14 @@ mod tests {
 		let frame = MediaPipePostProcessor::default().process_native_output(&input, &native);
 		assert!(frame.signals.is_empty());
 		assert_eq!(frame.sources[0].state, TrackingState::Lost);
+		assert_eq!(frame.metadata.notes.len(), 1);
+		assert!(frame.metadata.notes[0].starts_with("mediapipe.quality "));
+	}
+
+	#[test]
+	fn raw_passthrough_omits_redundant_per_frame_diagnostics() {
+		let frame = MediaPipePostProcessor::default().native_raw_passthrough_frame(7, 123, &NativeMediaPipeOutput::default());
+		assert!(frame.metadata.notes.is_empty());
 	}
 
 	#[test]

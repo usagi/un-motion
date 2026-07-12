@@ -314,23 +314,13 @@ where
 	fn process_native_output_for_submitted(&mut self, submitted: SubmittedImageFrame, native: &NativeMediaPipeOutput) -> UNMotionFrame {
 		self.post_processor.config.input_width = submitted.width;
 		self.post_processor.config.input_height = submitted.height;
-		let mut frame = if self.post_process_component == "none" {
+		let frame = if self.post_process_component == "none" {
 			self.post_processor
 				.native_raw_passthrough_frame(submitted.sequence, submitted.capture_timestamp_ns, native)
 		} else {
-			let mut frame =
-				self.post_processor
-					.process_native_output_with_sequence(submitted.sequence, submitted.capture_timestamp_ns, native);
-			frame.metadata.notes.push(format!("post_process={}", self.post_process_component));
-			frame
+			self.post_processor
+				.process_native_output_with_sequence(submitted.sequence, submitted.capture_timestamp_ns, native)
 		};
-		frame.metadata.notes.push(format!(
-			"core_unmotion input={} engine={} native_return_code={} image={}x{}",
-			self.input_component, self.runtime_engine, native.return_code, submitted.width, submitted.height
-		));
-		if let Some(source_label) = submitted.source_label.as_deref() {
-			frame.metadata.notes.push(format!("input_source={source_label}"));
-		}
 		self.telemetry.atomics.frames_emitted.fetch_add(1, Ordering::Relaxed);
 		self.push_debug_analysis_sample(&submitted, native, &frame);
 		frame
