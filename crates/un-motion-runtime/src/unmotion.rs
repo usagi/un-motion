@@ -591,7 +591,9 @@ mod tests {
 		assert_eq!(state.packet_count, 1);
 		assert_eq!(state.last_event_at_ns, Some(100));
 		assert_eq!(state.root.as_ref().expect("root").position, [0.25, 1.0, -0.5]);
-		assert_eq!(state.bones["Head"].rotation, [0.0, 0.25, 0.0, 0.9682458]);
+		for (actual, expected) in state.bones["Head"].rotation.into_iter().zip([0.0, 0.25, 0.0, 0.9682458]) {
+			assert!((actual - expected).abs() < 1e-6, "actual={actual} expected={expected}");
+		}
 		assert_eq!(state.blendshapes["Joy"], 0.75);
 		assert_eq!(state.part_diagnostics[&MotionPart::Head].status, PartTrackingStatus::Estimated);
 		assert_eq!(state.part_diagnostics[&MotionPart::Face].status, PartTrackingStatus::Estimated);

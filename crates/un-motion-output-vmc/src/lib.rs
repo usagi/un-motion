@@ -7,6 +7,8 @@ use rosc::{OscBundle, OscMessage, OscPacket, OscTime, OscType, encoder};
 use un_motion_frame::{Finger, HandMotion, HumanoidBone, MotionSignalValue, Quatf, TransformSample, UNMotionFrame, Vec3f};
 use un_motion_interfaces::OutputSink;
 
+pub const VMC_MAX_DATAGRAM_BYTES: usize = 1_200;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct BlendshapeRoute {
 	pub blendshape_name: String,
@@ -199,14 +201,6 @@ impl VmcOutputSink {
 		self.chest_stabilization = ChestStabilizationOptions::new(enabled, strength);
 	}
 
-	fn send_packet(&self, packet: OscPacket) -> anyhow::Result<()> {
-		let encoded = encoder::encode(&packet).context("OSC encode failed")?;
-		self.socket
-			.send_to(&encoded, self.target)
-			.with_context(|| format!("VMC UDP send failed: {}", self.target))?;
-		Ok(())
-	}
-
 	pub fn send_raw_datagram(&self, datagram: &[u8]) -> anyhow::Result<()> {
 		self.socket
 			.send_to(datagram, self.target)
@@ -215,11 +209,48 @@ impl VmcOutputSink {
 	}
 
 	fn send_packets_as_bundle(&self, packets: Vec<OscPacket>) -> anyhow::Result<()> {
-		self.send_packet(OscPacket::Bundle(OscBundle {
-			timetag: OscTime { seconds: 0, fractional: 1 },
-			content: packets,
-		}))
+		for datagram in encode_vmc_datagrams(packets)? {
+			self.socket
+				.send_to(&datagram, self.target)
+				.with_context(|| format!("VMC UDP send failed: {}", self.target))?;
+		}
+		Ok(())
 	}
+}
+
+pub fn encode_vmc_datagrams(packets: Vec<OscPacket>) -> anyhow::Result<Vec<Vec<u8>>> {
+	let mut datagrams = Vec::new();
+	let mut current = Vec::new();
+	for packet in packets {
+		current.push(packet);
+		let encoded = encode_vmc_bundle(&current)?;
+		if encoded.len() <= VMC_MAX_DATAGRAM_BYTES {
+			continue;
+		}
+		let last = current.pop().expect("current contains the packet just pushed");
+		if current.is_empty() {
+			anyhow::bail!("VMC OSC packet exceeds {VMC_MAX_DATAGRAM_BYTES} byte datagram limit");
+		}
+		datagrams.push(encode_vmc_bundle(&current)?);
+		current.clear();
+		current.push(last);
+		let encoded = encode_vmc_bundle(&current)?;
+		if encoded.len() > VMC_MAX_DATAGRAM_BYTES {
+			anyhow::bail!("VMC OSC packet exceeds {VMC_MAX_DATAGRAM_BYTES} byte datagram limit");
+		}
+	}
+	if !current.is_empty() {
+		datagrams.push(encode_vmc_bundle(&current)?);
+	}
+	Ok(datagrams)
+}
+
+fn encode_vmc_bundle(packets: &[OscPacket]) -> anyhow::Result<Vec<u8>> {
+	encoder::encode(&OscPacket::Bundle(OscBundle {
+		timetag: OscTime { seconds: 0, fractional: 1 },
+		content: packets.to_vec(),
+	}))
+	.context("VMC OSC encode failed")
 }
 
 impl OutputSink<UNMotionFrame> for VmcOutputSink {
@@ -2116,9 +2147,18 @@ mod tests {
 	};
 
 	fn recv_messages(receiver: &UdpSocket, buf: &mut [u8]) -> Vec<OscMessage> {
-		let (len, _) = receiver.recv_from(buf).expect("packet");
-		let (_, packet) = decoder::decode_udp(&buf[..len]).expect("decode");
-		flatten_messages(packet)
+		let mut messages = Vec::new();
+		loop {
+			match receiver.recv_from(buf) {
+				Ok((len, _)) => {
+					let (_, packet) = decoder::decode_udp(&buf[..len]).expect("decode");
+					messages.extend(flatten_messages(packet));
+				}
+				Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break,
+				Err(error) => panic!("receive VMC datagram: {error}"),
+			}
+		}
+		messages
 	}
 
 	fn flatten_messages(packet: OscPacket) -> Vec<OscMessage> {
@@ -2225,6 +2265,39 @@ mod tests {
 		assert_eq!(normalize_quat([0.0, 0.0, 0.0, 2.0]), IDENTITY_QUAT);
 		assert_eq!(normalize_quat([0.0, 0.0, 0.0, f32::NAN]), IDENTITY_QUAT);
 		assert_eq!(normalize_quat([0.0; 4]), IDENTITY_QUAT);
+	}
+
+	#[test]
+	fn large_vmc_frames_split_into_bounded_ordered_datagrams() {
+		let mut frame = UNMotionFrame::new(1);
+		frame.face = Some(FaceMotion {
+			tracking_state: TrackingState::Valid,
+			confidence: 1.0,
+			head: None,
+			expressions: (0..100)
+				.map(|index| ExpressionSample {
+					name: format!("Blend{index}"),
+					value: 0.5,
+					confidence: 1.0,
+					source_index: None,
+					state: SampleState::Valid,
+				})
+				.collect(),
+		});
+		let datagrams = encode_vmc_datagrams(vmc_packets_for_frame(&frame)).expect("encode split VMC frame");
+
+		assert!(datagrams.len() > 1);
+		assert!(datagrams.iter().all(|datagram| datagram.len() <= VMC_MAX_DATAGRAM_BYTES));
+		let mut addresses = Vec::new();
+		for datagram in &datagrams {
+			let (_, packet) = decoder::decode_udp(datagram).expect("decode datagram");
+			addresses.extend(flatten_messages(packet).into_iter().map(|message| message.addr));
+		}
+		assert_eq!(
+			addresses.iter().filter(|address| address.as_str() == "/VMC/Ext/Blend/Val").count(),
+			100
+		);
+		assert_eq!(addresses.last().map(String::as_str), Some("/VMC/Ext/Blend/Apply"));
 	}
 
 	#[test]

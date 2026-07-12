@@ -11,10 +11,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use rosc::{OscBundle, OscMessage, OscPacket, OscTime, OscType, encoder};
+use rosc::{OscMessage, OscPacket, OscType};
 use tracing::{debug, info, warn};
 use un_motion_frame::UNMotionFrame;
-use un_motion_output_vmc::{vmc_packets_for_frame, vmc_packets_for_frame_without_ok};
+use un_motion_output_vmc::{encode_vmc_datagrams, vmc_packets_for_frame, vmc_packets_for_frame_without_ok};
 use un_motion_output_vrc_osc::{VrcOscAvatarParameters, VrcOscOutputOptions, VrcOscOutputSink};
 use un_motion_record::MessagePackStreamRecorder;
 
@@ -202,19 +202,18 @@ impl VmcOutputWorker {
 			});
 		}
 		let packet_count = packets.len() as u64;
-		let encoded = encoder::encode(&OscPacket::Bundle(OscBundle {
-			timetag: OscTime { seconds: 0, fractional: 1 },
-			content: packets,
-		}))
-		.context("VMC OSC encode failed")?;
-		self.socket
-			.send_to(&encoded, self.config.target_addr)
-			.with_context(|| format!("VMC UDP send failed: {}", self.config.target_addr))?;
-		self.stats.sent_datagrams += 1;
+		let datagrams = encode_vmc_datagrams(packets)?;
+		for encoded in &datagrams {
+			self.socket
+				.send_to(encoded, self.config.target_addr)
+				.with_context(|| format!("VMC UDP send failed: {}", self.config.target_addr))?;
+		}
+		let datagram_count = datagrams.len() as u64;
+		self.stats.sent_datagrams += datagram_count;
 		self.stats.sent_packets += packet_count;
 		Ok(VmcOutputEvent::Sent {
 			target_addr: self.config.target_addr,
-			datagrams: 1,
+			datagrams: datagram_count,
 			packets: packet_count,
 		})
 	}
@@ -989,10 +988,17 @@ mod tests {
 
 	fn recv_messages(receiver: &UdpSocket) -> Vec<OscMessage> {
 		let mut buf = [0_u8; 65535];
-		let (len, _) = receiver.recv_from(&mut buf).expect("recv");
-		let (_, packet) = decoder::decode_udp(&buf[..len]).expect("decode");
 		let mut messages = Vec::new();
-		collect_messages(packet, &mut messages);
+		loop {
+			match receiver.recv_from(&mut buf) {
+				Ok((len, _)) => {
+					let (_, packet) = decoder::decode_udp(&buf[..len]).expect("decode");
+					collect_messages(packet, &mut messages);
+				}
+				Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break,
+				Err(error) => panic!("receive VMC datagram: {error}"),
+			}
+		}
 		messages
 	}
 
