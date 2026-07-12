@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use un_motion_frame::{
 	BodyMotion, BoneSample, CoordinateSpace, EyeMotion, FaceMotion, GazeSample, Handedness, HumanoidBone, HumanoidPose, LengthUnit,
@@ -13,6 +13,7 @@ pub const IFACIALMOCAP_UDP_PORT: u16 = 49983;
 pub const IFACIALMOCAP_TCP_PORT: u16 = 49986;
 const TCP_REASSEMBLY_MAX_BYTES: usize = 64 * 1024;
 const MAX_RECEIVES_PER_POLL: usize = 64;
+const TCP_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const TCP_FRAME_DELIMITER: &str = "___iFacialMocap";
 const IFACIALMOCAP_EYE_ROTATION_SCALE: f32 = 0.35;
 const IFACIALMOCAP_EYE_ROTATION_CLAMP_DEG: f32 = 8.0;
@@ -179,6 +180,7 @@ pub struct IfacialMocapInputSource {
 	config: IfacialMocapInputConfig,
 	udp_socket: Option<UdpSocket>,
 	tcp_stream: Option<TcpStream>,
+	tcp_reconnect_after: Option<Instant>,
 	tcp_reassembly_buffer: Vec<u8>,
 	receive_buffer: [u8; 8192],
 	tcp_read_buffer: [u8; 4096],
@@ -190,6 +192,7 @@ impl IfacialMocapInputSource {
 			config,
 			udp_socket: None,
 			tcp_stream: None,
+			tcp_reconnect_after: None,
 			tcp_reassembly_buffer: Vec::with_capacity(4096),
 			receive_buffer: [0; 8192],
 			tcp_read_buffer: [0; 4096],
@@ -249,6 +252,7 @@ impl IfacialMocapInputSource {
 		let stream = TcpStream::connect(remote_addr)?;
 		stream.set_nonblocking(true)?;
 		self.tcp_stream = Some(stream);
+		self.tcp_reconnect_after = None;
 		Ok(())
 	}
 
@@ -280,6 +284,12 @@ impl IfacialMocapInputSource {
 
 	fn poll_tcp(&mut self) -> anyhow::Result<IfacialMocapPollBatch> {
 		let mut batch = IfacialMocapPollBatch::default();
+		if self.tcp_stream.is_none() && self.tcp_reconnect_after.is_some_and(|retry_at| Instant::now() >= retry_at) {
+			self.tcp_reconnect_after = Some(Instant::now() + TCP_RECONNECT_DELAY);
+			if let Err(error) = self.connect_tcp() {
+				push_decode_error(&mut batch, format!("TCP reconnect failed: {error}"));
+			}
+		}
 		let Some(mut stream) = self.tcp_stream.as_ref().and_then(|stream| stream.try_clone().ok()) else {
 			return Ok(batch);
 		};
@@ -289,6 +299,7 @@ impl IfacialMocapInputSource {
 			match stream.read(&mut self.tcp_read_buffer) {
 				Ok(0) => {
 					self.tcp_stream = None;
+					self.tcp_reconnect_after = Some(Instant::now() + TCP_RECONNECT_DELAY);
 					push_decode_error(&mut batch, "TCP stream closed by peer".to_string());
 					break;
 				}
@@ -1716,5 +1727,42 @@ mod tests {
 		assert_eq!(closed.decode_error_examples, vec!["TCP stream closed by peer"]);
 		assert_eq!(source.poll_batch().expect("poll after close").decode_errors, 0);
 		assert!(source.local_addr().is_err());
+	}
+
+	#[test]
+	fn tcp_receiver_reconnects_after_peer_close() {
+		let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+		let remote_addr = listener.local_addr().expect("listener addr");
+		let writer = thread::spawn(move || {
+			drop(listener.accept().expect("first accept"));
+			let (mut stream, _) = listener.accept().expect("second accept");
+			stream
+				.write_all(b"head#4,2,1|leftEye#0,0,0|rightEye#0,0,0___iFacialMocap")
+				.expect("write reconnected frame");
+		});
+		let mut source = IfacialMocapInputSource::bind(IfacialMocapInputConfig::tcp(remote_addr)).expect("connect tcp");
+
+		let mut closed = false;
+		for _ in 0..20 {
+			if source.poll_batch().expect("poll close").decode_errors != 0 {
+				closed = true;
+				break;
+			}
+			thread::sleep(Duration::from_millis(10));
+		}
+		assert!(closed, "first peer close must be observed");
+		source.tcp_reconnect_after = Some(Instant::now());
+		let mut frames = Vec::new();
+		for _ in 0..20 {
+			frames.extend(source.poll_batch().expect("poll reconnect").frames);
+			if !frames.is_empty() {
+				break;
+			}
+			thread::sleep(Duration::from_millis(10));
+		}
+		writer.join().expect("writer");
+
+		assert_eq!(frames.len(), 1);
+		assert_eq!(frames[0].head.pitch, 4.0);
 	}
 }
