@@ -966,10 +966,6 @@ fn run_core_runtime(
 	);
 
 	loop {
-		// drain / cadence いずれが先に snapshot を発行しても `output_telemetry.sources` が
-		// 直近の値を反映するよう、ループ先頭で 1 回 atomic load する。worker 側は fetch_add のみで
-		// 競合せず、Supervisor 側はこれを 1.5s 周期で差分→FPS 計算する。
-		workers.refresh_source_telemetry(&mut output_telemetry);
 		let control = drain_control_messages(
 			&control_rx,
 			&workers,
@@ -984,6 +980,7 @@ fn run_core_runtime(
 		}
 		if apply_frame_stream_startup_errors(&workers.frame_stream_errors, &mut latest_states, &mut health) {
 			last_runtime_snapshot_at = Instant::now();
+			workers.refresh_source_telemetry(&mut output_telemetry);
 			status_callback(CoreRuntimeStatusUpdate {
 				active_profile_id: active_profile_id.clone(),
 				running: true,
