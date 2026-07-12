@@ -650,56 +650,67 @@ fn launch_capturer(
 		profile_id: resolved_profile_id.clone(),
 	};
 
-	let bind_addr = reserve_loopback_address()?;
-	let mut command = capturer_command(
-		bind_addr,
-		allow_non_loopback.unwrap_or(false),
-		resolved_profile_id.as_deref(),
-		api_worker_threads,
-	)?;
-	configure_hidden_child(&mut command);
-	let mut child = command
-		.stdin(Stdio::null())
-		.stdout(Stdio::null())
-		.stderr(Stdio::piped())
-		.spawn()
-		.map_err(|e| format!("launch capturer: {e}"))?;
-	let stderr_tail = spawn_stderr_tail(child.stderr.take());
+	let (child, bind_addr, stderr_tail, started_at) = {
+		let mut attempt = 0;
+		loop {
+			attempt += 1;
+			let bind_addr = reserve_loopback_address()?;
+			let mut command = capturer_command(
+				bind_addr,
+				allow_non_loopback.unwrap_or(false),
+				resolved_profile_id.as_deref(),
+				api_worker_threads,
+			)?;
+			configure_hidden_child(&mut command);
+			let mut child = command
+				.stdin(Stdio::null())
+				.stdout(Stdio::null())
+				.stderr(Stdio::piped())
+				.spawn()
+				.map_err(|e| format!("launch capturer: {e}"))?;
+			let stderr_tail = spawn_stderr_tail(child.stderr.take());
+			let started_at = Instant::now();
+			match wait_for_healthz(&http_client, bind_addr, &mut child, &stderr_tail) {
+				Ok(()) => break (child, bind_addr, stderr_tail, started_at),
+				Err(error) => {
+					let _ = force_stop_capturer_child(&mut child, "launch_capturer: healthz failed, abort spawn");
+					let tail = stderr_tail.lock().map(|tail| tail.lines.clone()).unwrap_or_default();
+					if attempt < 3 && capturer_bind_conflict(&error, &tail) {
+						continue;
+					}
+					let exit_code = child.try_wait().ok().flatten().and_then(|status| status.code());
+					state_handle
+						.lock()
+						.map_err(|_| "supervisor state poisoned".to_string())?
+						.capturers
+						.insert(
+							id,
+							ManagedCapturer {
+								info: CapturerInstance {
+									id,
+									name: format!("Capturer #{id}"),
+									state: CapturerState::Crashed,
+									pid: None,
+									bind_addr: Some(bind_addr.to_string()),
+									profile_id: resolved_profile_id.clone(),
+									uptime_secs: started_at.elapsed().as_secs(),
+									last_stderr: tail.last().cloned(),
+									stderr_tail: tail,
+									exit_code,
+								},
+								child,
+								bind_addr,
+								started_at,
+								stderr_tail,
+								prev_telemetry: None,
+							},
+						);
+					return Err(error);
+				}
+			}
+		}
+	};
 	let pid = child.id();
-	let started_at = Instant::now();
-	// healthz を待つ前にプロセスが死ぬケースを早期検出する。
-	if let Err(e) = wait_for_healthz(&http_client, bind_addr, &mut child, &stderr_tail) {
-		let _ = force_stop_capturer_child(&mut child, "launch_capturer: healthz failed, abort spawn");
-		let tail = stderr_tail.lock().map(|tail| tail.lines.clone()).unwrap_or_default();
-		let exit_code = child.try_wait().ok().flatten().and_then(|status| status.code());
-		state_handle
-			.lock()
-			.map_err(|_| "supervisor state poisoned".to_string())?
-			.capturers
-			.insert(
-				id,
-				ManagedCapturer {
-					info: CapturerInstance {
-						id,
-						name: format!("Capturer #{id}"),
-						state: CapturerState::Crashed,
-						pid: None,
-						bind_addr: Some(bind_addr.to_string()),
-						profile_id: resolved_profile_id,
-						uptime_secs: started_at.elapsed().as_secs(),
-						last_stderr: tail.last().cloned(),
-						stderr_tail: tail,
-						exit_code,
-					},
-					child,
-					bind_addr,
-					started_at,
-					stderr_tail,
-					prev_telemetry: None,
-				},
-			);
-		return Err(e);
-	}
 	let info = CapturerInstance {
 		id,
 		name: format!("Capturer #{id}"),
@@ -3728,6 +3739,14 @@ fn reserve_loopback_address() -> Result<SocketAddr, String> {
 	listener.local_addr().map_err(|e| format!("loopback local addr: {e}"))
 }
 
+fn capturer_bind_conflict(error: &str, stderr_lines: &[String]) -> bool {
+	let error = error.to_ascii_lowercase();
+	let stderr = stderr_lines.join("\n").to_ascii_lowercase();
+	["address already in use", "os error 10048", "only one usage of each socket address"]
+		.iter()
+		.any(|needle| error.contains(needle) || stderr.contains(needle))
+}
+
 fn spawn_stderr_tail(stderr: Option<ChildStderr>) -> Arc<Mutex<CapturerLogTail>> {
 	let tail = Arc::new(Mutex::new(CapturerLogTail::default()));
 	let Some(stderr) = stderr else {
@@ -4030,6 +4049,15 @@ fn exe_name(name: &str) -> String {
 mod tests {
 	use super::*;
 	use serde_json::json;
+
+	#[test]
+	fn capturer_bind_conflicts_are_retryable() {
+		assert!(capturer_bind_conflict(
+			"capturer exited",
+			&["Address already in use (os error 10048)".to_string()]
+		));
+		assert!(!capturer_bind_conflict("profile parse failed", &["invalid profile".to_string()]));
+	}
 
 	#[test]
 	fn capturer_log_chunk_returns_only_unread_lines() {
