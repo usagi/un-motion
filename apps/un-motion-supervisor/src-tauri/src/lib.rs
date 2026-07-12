@@ -674,7 +674,40 @@ fn launch_capturer(
 			match wait_for_healthz(&http_client, bind_addr, &mut child, &stderr_tail) {
 				Ok(()) => break (child, bind_addr, stderr_tail, stderr_join, started_at),
 				Err(error) => {
-					let _ = force_stop_capturer_child_if_running(&mut child, "launch_capturer: healthz failed, abort spawn");
+					if let Err(stop_error) =
+						force_stop_capturer_child_if_running(&mut child, "launch_capturer: healthz failed, abort spawn")
+					{
+						let tail = stderr_tail.lock().map(|tail| tail.lines.clone()).unwrap_or_default();
+						let pid = child.id();
+						state_handle
+							.lock()
+							.map_err(|_| "supervisor state poisoned".to_string())?
+							.capturers
+							.insert(
+								id,
+								ManagedCapturer {
+									info: CapturerInstance {
+										id,
+										name: format!("Capturer #{id}"),
+										state: CapturerState::Stopping,
+										pid: Some(pid),
+										bind_addr: Some(bind_addr.to_string()),
+										profile_id: resolved_profile_id.clone(),
+										uptime_secs: started_at.elapsed().as_secs(),
+										last_stderr: tail.last().cloned(),
+										stderr_tail: tail,
+										exit_code: None,
+									},
+									child,
+									bind_addr,
+									started_at,
+									stderr_tail,
+									stderr_join,
+									prev_telemetry: None,
+								},
+							);
+						return Err(format!("{error}; Capturer cleanup failed: {stop_error}"));
+					}
 					if let Some(join) = stderr_join.take() {
 						let _ = join.join();
 					}
