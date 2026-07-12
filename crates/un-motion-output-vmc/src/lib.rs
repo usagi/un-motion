@@ -250,7 +250,7 @@ fn vmc_packets_for_frame_with_options(
 	if send_ok_packet {
 		packets.push(OscPacket::Message(OscMessage {
 			addr: "/VMC/Ext/OK".to_string(),
-			args: vec![OscType::Int(1)],
+			args: vec![OscType::Int(vmc_tracking_ok(frame))],
 		}));
 	}
 
@@ -285,6 +285,21 @@ fn vmc_packets_for_frame_with_options(
 	}
 
 	packets
+}
+
+fn vmc_tracking_ok(frame: &UNMotionFrame) -> i32 {
+	let states = [
+		frame.body.as_ref().map(|body| body.tracking_state),
+		frame.face.as_ref().map(|face| face.tracking_state),
+	];
+	let mut observed = false;
+	for state in states.into_iter().flatten() {
+		observed = true;
+		if state != un_motion_frame::TrackingState::Lost {
+			return 1;
+		}
+	}
+	if observed { 0 } else { 1 }
 }
 
 fn vmc_packet_capacity_hint(frame: &UNMotionFrame, send_ok_packet: bool) -> usize {
@@ -2181,6 +2196,28 @@ mod tests {
 		for (actual, expected) in actual.into_iter().zip(expected) {
 			assert!((actual - expected).abs() <= epsilon, "actual={actual:?} expected={expected:?}");
 		}
+	}
+
+	#[test]
+	fn vmc_packets_report_tracking_loss_as_ok_zero() {
+		let mut frame = UNMotionFrame::new(1);
+		frame.body = Some(BodyMotion {
+			tracking_state: TrackingState::Lost,
+			confidence: 0.0,
+			humanoid: None,
+		});
+		frame.face = Some(FaceMotion {
+			tracking_state: TrackingState::Lost,
+			confidence: 0.0,
+			head: None,
+			expressions: Vec::new(),
+		});
+		let messages = flatten_messages(OscPacket::Bundle(OscBundle {
+			timetag: OscTime { seconds: 0, fractional: 1 },
+			content: vmc_packets_for_frame(&frame),
+		}));
+		let ok = messages.iter().find(|message| message.addr == "/VMC/Ext/OK").expect("OK packet");
+		assert_eq!(ok.args, vec![OscType::Int(0)]);
 	}
 
 	#[test]
