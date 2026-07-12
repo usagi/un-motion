@@ -4,6 +4,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use un_motion_interfaces::{ImageFrame, ImageFrameMetadata, ImageInputSource, PixelFormat, TimestampBasis};
 
+const MAX_RGB_FRAME_DIMENSION: u32 = 16_384;
+const MAX_RGB_FRAME_BYTES: usize = 128 * 1024 * 1024;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WebcamDeviceInfo {
 	pub id: String,
@@ -900,6 +903,7 @@ fn resize_ccap_frame_to_rgb8(frame: &PendingDirectShowFrame, dst_width: u32, dst
 	if frame.width == 0 || frame.height == 0 || dst_width == 0 || dst_height == 0 {
 		anyhow::bail!("invalid RGB resize dimensions");
 	}
+	let dst_len = checked_rgb8_output_len(dst_width, dst_height)?;
 	if frame.width == dst_width && frame.height == dst_height {
 		return convert_ccap_frame_to_rgb8(frame);
 	}
@@ -923,7 +927,7 @@ fn resize_ccap_frame_to_rgb8(frame: &PendingDirectShowFrame, dst_width: u32, dst
 	let x_map = (0..dst_width)
 		.map(|x| (x as u64 * frame.width as u64 / dst_width as u64) as usize)
 		.collect::<Vec<_>>();
-	let mut dst = vec![0_u8; dst_width_usize * dst_height_usize * 3];
+	let mut dst = vec![0_u8; dst_len];
 	for y in 0..dst_height_usize {
 		let mapped_y = y * src_height / dst_height_usize;
 		let src_y = match frame.orientation {
@@ -937,6 +941,23 @@ fn resize_ccap_frame_to_rgb8(frame: &PendingDirectShowFrame, dst_width: u32, dst
 		}
 	}
 	Ok(dst)
+}
+
+fn checked_rgb8_output_len(width: u32, height: u32) -> anyhow::Result<usize> {
+	if width == 0 || height == 0 {
+		anyhow::bail!("RGB output dimensions must be non-zero");
+	}
+	if width > MAX_RGB_FRAME_DIMENSION || height > MAX_RGB_FRAME_DIMENSION {
+		anyhow::bail!("RGB output dimensions exceed {MAX_RGB_FRAME_DIMENSION}: {width}x{height}");
+	}
+	let bytes = (width as usize)
+		.checked_mul(height as usize)
+		.and_then(|pixels| pixels.checked_mul(3))
+		.ok_or_else(|| anyhow::anyhow!("RGB output size overflow for {width}x{height}"))?;
+	if bytes > MAX_RGB_FRAME_BYTES {
+		anyhow::bail!("RGB output exceeds {} bytes: {width}x{height}", MAX_RGB_FRAME_BYTES);
+	}
+	Ok(bytes)
 }
 
 #[cfg(windows)]
@@ -1512,6 +1533,13 @@ fn now_unix_ns() -> u64 {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn rgb8_output_size_accepts_8k_and_rejects_unbounded_dimensions() {
+		assert_eq!(checked_rgb8_output_len(7680, 4320).expect("8K frame"), 99_532_800);
+		assert!(checked_rgb8_output_len(u32::MAX, 1).is_err());
+		assert!(checked_rgb8_output_len(16_384, 16_384).is_err());
+	}
 
 	#[derive(Default)]
 	struct MockBackend {
