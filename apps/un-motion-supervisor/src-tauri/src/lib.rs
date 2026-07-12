@@ -15,7 +15,7 @@
 //! * Svelte UI 骨組み (D4-c) も次の commit で UN Avatar から移植。
 
 use std::backtrace::Backtrace;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::io::{BufRead, BufReader};
@@ -102,6 +102,7 @@ const HTTP_RUNTIME_ACTION_TIMEOUT: Duration = Duration::from_secs(15);
 struct SupervisorState {
 	next_id: u32,
 	capturers: BTreeMap<u32, ManagedCapturer>,
+	launching_profiles: BTreeSet<Option<String>>,
 	http_client: reqwest::blocking::Client,
 }
 
@@ -114,7 +115,21 @@ impl SupervisorState {
 		Self {
 			next_id: 0,
 			capturers: BTreeMap::new(),
+			launching_profiles: BTreeSet::new(),
 			http_client,
+		}
+	}
+}
+
+struct CapturerLaunchReservation<'a> {
+	state: &'a Mutex<SupervisorState>,
+	profile_id: Option<String>,
+}
+
+impl Drop for CapturerLaunchReservation<'_> {
+	fn drop(&mut self) {
+		if let Ok(mut state) = self.state.lock() {
+			state.launching_profiles.remove(&self.profile_id);
 		}
 	}
 }
@@ -543,7 +558,7 @@ fn launch_capturer(
 	state: State<'_, Mutex<SupervisorState>>,
 	app_settings: State<'_, Mutex<AppRuntimeSettings>>,
 ) -> Result<CapturerInstance, String> {
-	let state_handle = &state;
+	let state_handle: &Mutex<SupervisorState> = &state;
 	let api_worker_threads = app_settings
 		.lock()
 		.map(|settings| normalize_api_worker_threads(settings.api_worker_threads))
@@ -574,10 +589,21 @@ fn launch_capturer(
 	} else if let Some(existing) = state.capturers.values().find(|c| is_live(c) && c.info.profile_id.is_none()) {
 		return Ok(existing.info.clone());
 	}
+	if state.launching_profiles.contains(&resolved_profile_id) {
+		return Err(match &resolved_profile_id {
+			Some(profile_id) => format!("capturer launch already in progress for profile: {profile_id}"),
+			None => "capturer launch already in progress for default profile".to_string(),
+		});
+	}
+	state.launching_profiles.insert(resolved_profile_id.clone());
 	state.next_id = state.next_id.saturating_add(1);
 	let id = state.next_id;
 	let http_client = state.http_client.clone();
 	drop(state);
+	let _launch_reservation = CapturerLaunchReservation {
+		state: state_handle,
+		profile_id: resolved_profile_id.clone(),
+	};
 
 	let bind_addr = reserve_loopback_address()?;
 	let mut command = capturer_command(
@@ -3959,6 +3985,21 @@ fn exe_name(name: &str) -> String {
 mod tests {
 	use super::*;
 	use serde_json::json;
+
+	#[test]
+	fn capturer_launch_reservation_is_released_on_scope_exit() {
+		let state = Mutex::new(SupervisorState::new());
+		let profile_id = Some("profile-a".to_string());
+		state.lock().expect("state").launching_profiles.insert(profile_id.clone());
+		{
+			let _reservation = CapturerLaunchReservation {
+				state: &state,
+				profile_id: profile_id.clone(),
+			};
+			assert!(state.lock().expect("state").launching_profiles.contains(&profile_id));
+		}
+		assert!(!state.lock().expect("state").launching_profiles.contains(&profile_id));
+	}
 
 	fn make_profile(id: &str, name: &str) -> CoreProfileDocumentProfile {
 		CoreProfileDocumentProfile {
