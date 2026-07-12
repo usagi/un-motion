@@ -673,7 +673,7 @@ fn launch_capturer(
 			match wait_for_healthz(&http_client, bind_addr, &mut child, &stderr_tail) {
 				Ok(()) => break (child, bind_addr, stderr_tail, started_at),
 				Err(error) => {
-					let _ = force_stop_capturer_child(&mut child, "launch_capturer: healthz failed, abort spawn");
+					let _ = force_stop_capturer_child_if_running(&mut child, "launch_capturer: healthz failed, abort spawn");
 					let tail = stderr_tail.lock().map(|tail| tail.lines.clone()).unwrap_or_default();
 					if attempt < 3 && capturer_bind_conflict(&error, &tail) {
 						continue;
@@ -3579,6 +3579,17 @@ fn wait_capturer_exit(child: &mut Child, timeout: Duration) -> Result<bool, Stri
 	}
 }
 
+fn force_stop_capturer_child_if_running(child: &mut Child, context: &str) -> Result<bool, String> {
+	match child.try_wait() {
+		Ok(Some(_)) => Ok(false),
+		Ok(None) => {
+			force_stop_capturer_child(child, context)?;
+			Ok(true)
+		}
+		Err(error) => Err(format!("{context}: failed to query child status: {error}")),
+	}
+}
+
 /// UN Avatar の `stop_managed_renderer` の HTTP 版。`POST /api/core/exit` で
 /// graceful 終了を試み、`wait_capturer_exit` で待つ。失敗時は `force_stop_capturer_child`
 /// でプロセス木ごと強制終了する。
@@ -4073,6 +4084,17 @@ mod tests {
 			&["Address already in use (os error 10048)".to_string()]
 		));
 		assert!(!capturer_bind_conflict("profile parse failed", &["invalid profile".to_string()]));
+	}
+
+	#[test]
+	fn exited_capturer_is_not_force_stopped() {
+		#[cfg(windows)]
+		let mut child = Command::new("cmd").args(["/C", "exit", "0"]).spawn().expect("spawn exited child");
+		#[cfg(not(windows))]
+		let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn().expect("spawn exited child");
+		child.wait().expect("wait child");
+
+		assert!(!force_stop_capturer_child_if_running(&mut child, "test").expect("query exited child"));
 	}
 
 	#[test]
