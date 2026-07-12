@@ -7,6 +7,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context;
 use std::sync::atomic::Ordering;
@@ -484,7 +485,7 @@ struct TemporalIirFrame {
 	height: u32,
 	stride_bytes: u32,
 	capture_timestamp_ns: u64,
-	data: Vec<u8>,
+	data: Arc<[u8]>,
 }
 
 fn denoise_rgb8_image(
@@ -519,13 +520,13 @@ fn apply_temporal_iir_denoise(input: &ImageFrame, state: &mut InputDenoiseState,
 			&& input.metadata.capture_timestamp_ns > previous.capture_timestamp_ns
 	});
 	if compatible_previous.is_none() {
-		let data = source.to_vec();
+		let data = Arc::<[u8]>::from(source.to_vec());
 		state.previous_temporal = Some(TemporalIirFrame {
 			width: input.width,
 			height: input.height,
 			stride_bytes: input.stride_bytes,
 			capture_timestamp_ns: input.metadata.capture_timestamp_ns,
-			data: data.clone(),
+			data: Arc::clone(&data),
 		});
 		return image_frame_with_data(input, data);
 	};
@@ -536,23 +537,24 @@ fn apply_temporal_iir_denoise(input: &ImageFrame, state: &mut InputDenoiseState,
 	let rc = 1.0 / (2.0 * std::f64::consts::PI * cutoff_hz.max(0.1));
 	let alpha = ((dt_seconds / (rc + dt_seconds)).clamp(0.0, 1.0) * 256.0).round() as i32;
 	let inverse_alpha = 256 - alpha;
+	let filtered_data = Arc::make_mut(&mut previous.data);
 	for (index, current) in source.iter().copied().enumerate() {
-		let filtered = (previous.data[index] as i32 * inverse_alpha + current as i32 * alpha + 128) >> 8;
-		previous.data[index] = filtered.clamp(0, 255) as u8;
+		let filtered = (filtered_data[index] as i32 * inverse_alpha + current as i32 * alpha + 128) >> 8;
+		filtered_data[index] = filtered.clamp(0, 255) as u8;
 	}
 	previous.capture_timestamp_ns = input.metadata.capture_timestamp_ns;
-	let data = previous.data.clone();
+	let data = Arc::clone(&previous.data);
 	image_frame_with_data(input, data)
 }
 
-fn image_frame_with_data(input: &ImageFrame, data: Vec<u8>) -> ImageFrame {
+fn image_frame_with_data(input: &ImageFrame, data: Arc<[u8]>) -> ImageFrame {
 	ImageFrame {
 		metadata: input.metadata.clone(),
 		width: input.width,
 		height: input.height,
 		stride_bytes: input.stride_bytes,
 		pixel_format: input.pixel_format,
-		data: data.into(),
+		data,
 	}
 }
 
@@ -1080,6 +1082,25 @@ mod tests {
 		assert_eq!(first_out.data[12], 0);
 		assert!(second_out.data[12] > 0);
 		assert!(second_out.data[12] < 100);
+	}
+
+	#[test]
+	fn temporal_iir_reuses_unshared_history_buffer() {
+		let first = ImageFrame::new_rgb8(1, 1, "test", 3, 3, vec![0; 27]).expect("frame");
+		let mut second = ImageFrame::new_rgb8(2, 33_333_333, "test", 3, 3, vec![100; 27]).expect("frame");
+		second.metadata.capture_timestamp_ns = 33_333_333;
+		let mut state = InputDenoiseState::default();
+		let first_out = denoise_rgb8_image(&first, InputDenoiseMode::TemporalIir, 10.0, &mut state).expect("first denoise");
+		let history_ptr = first_out.data.as_ptr();
+		assert!(Arc::ptr_eq(
+			&first_out.data,
+			&state.previous_temporal.as_ref().expect("history").data
+		));
+		drop(first_out);
+
+		let second_out = denoise_rgb8_image(&second, InputDenoiseMode::TemporalIir, 10.0, &mut state).expect("second denoise");
+
+		assert_eq!(second_out.data.as_ptr(), history_ptr);
 	}
 
 	#[test]
