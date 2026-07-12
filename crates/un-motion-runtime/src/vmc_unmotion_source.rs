@@ -166,7 +166,7 @@ impl VmcUnmotionSource {
 			}
 		}
 		if frame.blend_apply {
-			self.pending_blendshapes.append(&mut self.staged_blendshapes);
+			self.pending_blendshapes = std::mem::take(&mut self.staged_blendshapes);
 		}
 		if frame.received_timestamp_ns > self.pending_received_ts {
 			self.pending_received_ts = frame.received_timestamp_ns;
@@ -908,6 +908,35 @@ mod tests {
 		assert!(source.pending_dirty);
 		assert_eq!(source.pending_blendshapes.get("Joy"), Some(&0.75));
 		assert!(source.staged_blendshapes.is_empty());
+	}
+
+	#[test]
+	fn accumulator_replaces_previous_blendshape_set_on_apply() {
+		let mut source = VmcUnmotionSource::bind("blend-replace", "127.0.0.1:0".parse().unwrap()).expect("bind");
+		let mut frame = VmcInputFrame {
+			source_id: "blend-replace".to_string(),
+			received_timestamp_ns: 1,
+			raw_datagram: None,
+			ok: None,
+			root: None,
+			bones: Vec::new(),
+			blendshapes: vec![VmcBlendshapeSample {
+				name: "Joy".to_string(),
+				value: 0.75,
+			}],
+			blend_apply: true,
+			message_count: 2,
+		};
+		source.merge_bundle(&frame);
+		assert_eq!(source.pending_blendshapes.get("Joy"), Some(&0.75));
+
+		frame.blendshapes = vec![VmcBlendshapeSample {
+			name: "Blink".to_string(),
+			value: 1.0,
+		}];
+		source.merge_bundle(&frame);
+		assert!(!source.pending_blendshapes.contains_key("Joy"));
+		assert_eq!(source.pending_blendshapes.get("Blink"), Some(&1.0));
 	}
 
 	#[test]
