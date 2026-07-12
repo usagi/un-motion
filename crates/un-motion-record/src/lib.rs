@@ -8,24 +8,35 @@ pub const MAX_FRAME_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct MessagePackStreamRecorder<W: Write> {
 	writer: W,
+	payload_buffer: Vec<u8>,
 }
 
 impl<W: Write> MessagePackStreamRecorder<W> {
 	pub fn new(writer: W) -> Self {
-		Self { writer }
+		Self {
+			writer,
+			payload_buffer: Vec::new(),
+		}
 	}
 
 	pub fn write_frame(&mut self, frame: &UNMotionFrame) -> anyhow::Result<()> {
-		let payload = rmp_serde::to_vec_named(frame).context("messagepack encode failed")?;
-		if payload.len() > MAX_FRAME_PAYLOAD_BYTES {
+		self.payload_buffer.clear();
+		rmp_serde::encode::write_named(&mut self.payload_buffer, frame).context("messagepack encode failed")?;
+		if self.payload_buffer.len() > MAX_FRAME_PAYLOAD_BYTES {
 			anyhow::bail!("frame payload exceeds {MAX_FRAME_PAYLOAD_BYTES} byte limit");
 		}
-		let payload_len: u32 = payload.len().try_into().context("frame payload too large for u32 length prefix")?;
+		let payload_len: u32 = self
+			.payload_buffer
+			.len()
+			.try_into()
+			.context("frame payload too large for u32 length prefix")?;
 
 		self.writer
 			.write_all(&payload_len.to_le_bytes())
 			.context("failed to write frame length prefix")?;
-		self.writer.write_all(&payload).context("failed to write frame payload")?;
+		self.writer
+			.write_all(&self.payload_buffer)
+			.context("failed to write frame payload")?;
 		Ok(())
 	}
 
@@ -117,6 +128,17 @@ mod tests {
 		assert_eq!(frames.len(), 2);
 		assert_eq!(frames[0].header.sequence, 10);
 		assert_eq!(frames[1].header.sequence, 11);
+	}
+
+	#[test]
+	fn recorder_reuses_messagepack_payload_capacity() {
+		let mut recorder = MessagePackStreamRecorder::new(Vec::<u8>::new());
+		recorder.write_frame(&UNMotionFrame::new(1)).expect("first frame");
+		let capacity = recorder.payload_buffer.capacity();
+
+		recorder.write_frame(&UNMotionFrame::new(2)).expect("second frame");
+
+		assert_eq!(recorder.payload_buffer.capacity(), capacity);
 	}
 
 	#[test]
