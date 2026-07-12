@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,6 +15,7 @@ const PROFILE_TRANSACTION_MARKER: &str = ".profiles-transaction";
 const NEXT_PROFILES_DIR: &str = ".profiles-next";
 const PREVIOUS_PROFILES_DIR: &str = ".profiles-previous";
 const NEXT_CONF_FILE: &str = ".conf.toml.next";
+const PROFILE_STORE_LOCK_FILE: &str = ".profiles.lock";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -209,7 +210,16 @@ impl CoreProfileDocumentStore {
 	}
 
 	pub fn load(&self) -> CoreProfileDocument {
-		let _ = self.recover_profile_transaction();
+		self.try_load().unwrap_or_else(|_| CoreProfileDocument::default())
+	}
+
+	pub fn try_load(&self) -> anyhow::Result<CoreProfileDocument> {
+		let _store_lock = self.acquire_store_lock()?;
+		self.recover_profile_transaction()?;
+		Ok(self.load_unlocked())
+	}
+
+	fn load_unlocked(&self) -> CoreProfileDocument {
 		let mut profiles = Vec::new();
 		let mut profile_sources = Vec::new();
 		let profile_manifest = load_profile_manifest(&self.conf_path);
@@ -269,6 +279,7 @@ impl CoreProfileDocumentStore {
 	}
 
 	pub fn save(&self, document: CoreProfileDocument) -> anyhow::Result<CoreProfileDocument> {
+		let _store_lock = self.acquire_store_lock()?;
 		self.recover_profile_transaction()?;
 		let normalized = normalize_profile_document(document);
 		let root = self.store_root();
@@ -351,6 +362,22 @@ impl CoreProfileDocumentStore {
 			.parent()
 			.filter(|path| !path.as_os_str().is_empty())
 			.unwrap_or_else(|| Path::new("."))
+	}
+
+	fn acquire_store_lock(&self) -> anyhow::Result<File> {
+		let root = self.store_root();
+		fs::create_dir_all(root).with_context(|| format!("failed to create profile store {}", root.display()))?;
+		let lock_path = root.join(PROFILE_STORE_LOCK_FILE);
+		let lock = OpenOptions::new()
+			.read(true)
+			.write(true)
+			.create(true)
+			.truncate(false)
+			.open(&lock_path)
+			.with_context(|| format!("failed to open profile store lock {}", lock_path.display()))?;
+		lock.lock()
+			.with_context(|| format!("failed to lock profile store {}", lock_path.display()))?;
+		Ok(lock)
 	}
 
 	fn recover_profile_transaction(&self) -> anyhow::Result<()> {
@@ -1037,6 +1064,28 @@ mirrorCorrectionEnabled = true
 		assert!(!next.exists());
 		assert!(!root.join(NEXT_CONF_FILE).exists());
 		assert!(!root.join(PROFILE_TRANSACTION_MARKER).exists());
+	}
+
+	#[test]
+	fn store_load_waits_for_process_wide_file_lock() {
+		let root = temp_root("profile-store-lock");
+		let store = CoreProfileDocumentStore::from_root(&root);
+		let held_lock = store.acquire_store_lock().expect("hold store lock");
+		let (tx, rx) = std::sync::mpsc::channel();
+		let load_root = root.clone();
+		let join = std::thread::spawn(move || {
+			let result = CoreProfileDocumentStore::from_root(load_root).try_load();
+			tx.send(result).expect("send load result");
+		});
+
+		assert!(rx.recv_timeout(std::time::Duration::from_millis(30)).is_err());
+		drop(held_lock);
+		assert!(
+			rx.recv_timeout(std::time::Duration::from_secs(1))
+				.expect("load after unlock")
+				.is_ok()
+		);
+		join.join().expect("load thread");
 	}
 
 	#[test]
