@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{
 	Arc,
-	mpsc::{self, Receiver, Sender},
+	mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -227,13 +227,17 @@ fn vmc_message_enabled(message: &OscMessage, modifier: &ModifierConfig) -> bool 
 
 pub struct VmcOutputWorkerHandle {
 	pub target_addr: SocketAddr,
-	command_tx: Sender<VmcOutputCommand>,
+	command_tx: SyncSender<VmcOutputCommand>,
 	join: Option<JoinHandle<()>>,
 }
 
 impl VmcOutputWorkerHandle {
-	pub fn send(&self, frame: impl Into<VmcOutputFrame>) -> Result<(), std::sync::mpsc::SendError<VmcOutputCommand>> {
-		self.command_tx.send(VmcOutputCommand::Send(frame.into()))
+	pub fn send(&self, frame: impl Into<VmcOutputFrame>) -> Result<bool, ()> {
+		match self.command_tx.try_send(VmcOutputCommand::Send(frame.into())) {
+			Ok(()) => Ok(true),
+			Err(TrySendError::Full(_)) => Ok(false),
+			Err(TrySendError::Disconnected(_)) => Err(()),
+		}
 	}
 
 	pub fn shutdown(&self) {
@@ -372,17 +376,17 @@ impl FileOutputWorker {
 
 pub struct FileOutputWorkerHandle {
 	pub path: PathBuf,
-	command_tx: Sender<FileOutputCommand>,
+	command_tx: SyncSender<FileOutputCommand>,
 	join: Option<JoinHandle<()>>,
 }
 
 impl FileOutputWorkerHandle {
-	pub fn write_frame(&self, frame: UNMotionFrame) -> Result<(), std::sync::mpsc::SendError<FileOutputCommand>> {
-		self.command_tx.send(FileOutputCommand::WriteFrame(frame))
+	pub fn write_frame(&self, frame: UNMotionFrame) -> Result<(), ()> {
+		self.command_tx.send(FileOutputCommand::WriteFrame(frame)).map_err(|_| ())
 	}
 
-	pub fn flush(&self) -> Result<(), std::sync::mpsc::SendError<FileOutputCommand>> {
-		self.command_tx.send(FileOutputCommand::Flush)
+	pub fn flush(&self) -> Result<(), ()> {
+		self.command_tx.send(FileOutputCommand::Flush).map_err(|_| ())
 	}
 
 	pub fn shutdown(&self) {
@@ -409,7 +413,7 @@ pub fn spawn_vmc_output_worker(config: VmcOutputConfig, event_tx: Sender<VmcOutp
 		target_addr = %target_addr,
 		"VMC output worker bound",
 	);
-	let (command_tx, command_rx) = mpsc::channel();
+	let (command_tx, command_rx) = mpsc::sync_channel(1);
 	let join = thread::spawn(move || run_vmc_output_worker(&mut worker, command_rx, event_tx));
 	Ok(VmcOutputWorkerHandle {
 		target_addr,
@@ -654,13 +658,17 @@ impl VrcOscOutputWorker {
 
 pub struct VrcOscOutputWorkerHandle {
 	pub target_addr: SocketAddr,
-	command_tx: Sender<VrcOscOutputCommand>,
+	command_tx: SyncSender<VrcOscOutputCommand>,
 	join: Option<JoinHandle<()>>,
 }
 
 impl VrcOscOutputWorkerHandle {
-	pub fn send(&self, frame: impl Into<VrcOscOutputFrame>) -> Result<(), std::sync::mpsc::SendError<VrcOscOutputCommand>> {
-		self.command_tx.send(VrcOscOutputCommand::Send(frame.into()))
+	pub fn send(&self, frame: impl Into<VrcOscOutputFrame>) -> Result<bool, ()> {
+		match self.command_tx.try_send(VrcOscOutputCommand::Send(frame.into())) {
+			Ok(()) => Ok(true),
+			Err(TrySendError::Full(_)) => Ok(false),
+			Err(TrySendError::Disconnected(_)) => Err(()),
+		}
 	}
 
 	pub fn shutdown(&self) {
@@ -690,7 +698,7 @@ pub fn spawn_vrc_osc_output_worker(
 		target_addr = %target_addr,
 		"VRC OSC output worker bound",
 	);
-	let (command_tx, command_rx) = mpsc::channel();
+	let (command_tx, command_rx) = mpsc::sync_channel(1);
 	let join = thread::spawn(move || run_vrc_osc_output_worker(&mut worker, command_rx, event_tx));
 	Ok(VrcOscOutputWorkerHandle {
 		target_addr,
@@ -827,7 +835,7 @@ Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
 pub fn spawn_file_output_worker(config: FileOutputConfig, event_tx: Sender<FileOutputEvent>) -> anyhow::Result<FileOutputWorkerHandle> {
 	let mut worker = FileOutputWorker::open(config)?;
 	let path = worker.path().clone();
-	let (command_tx, command_rx) = mpsc::channel();
+	let (command_tx, command_rx) = mpsc::sync_channel(1);
 	let join = thread::spawn(move || run_file_output_worker(&mut worker, command_rx, event_tx));
 	Ok(FileOutputWorkerHandle {
 		path,
@@ -963,6 +971,21 @@ mod tests {
 			.iter()
 			.find(|message| message.addr == addr && message.args.first() == Some(&OscType::String(name.to_string())))
 			.expect("message")
+	}
+
+	#[test]
+	fn live_output_queue_drops_excess_frames_without_reporting_disconnect() {
+		let (command_tx, command_rx) = mpsc::sync_channel(1);
+		let handle = VmcOutputWorkerHandle {
+			target_addr: "127.0.0.1:39540".parse().expect("target"),
+			command_tx,
+			join: None,
+		};
+
+		assert_eq!(handle.send(UNMotionFrame::new(1)), Ok(true));
+		assert_eq!(handle.send(UNMotionFrame::new(2)), Ok(false));
+		drop(command_rx);
+		assert_eq!(handle.send(UNMotionFrame::new(3)), Err(()));
 	}
 
 	#[test]

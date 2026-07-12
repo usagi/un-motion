@@ -11,7 +11,7 @@
 
 use std::sync::{
 	Arc,
-	mpsc::{self, Receiver, Sender},
+	mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -364,13 +364,17 @@ fn diagnostic_finger_quat_summary(hand: Option<&un_motion_frame::HandMotion>) ->
 
 pub struct ZenohOutputWorkerHandle {
 	pub base_key_expr: String,
-	command_tx: Sender<ZenohOutputCommand>,
+	command_tx: SyncSender<ZenohOutputCommand>,
 	join: Option<JoinHandle<()>>,
 }
 
 impl ZenohOutputWorkerHandle {
-	pub fn send(&self, frame: impl Into<ZenohOutputFrame>) -> Result<(), std::sync::mpsc::SendError<ZenohOutputCommand>> {
-		self.command_tx.send(ZenohOutputCommand::Send(frame.into()))
+	pub fn send(&self, frame: impl Into<ZenohOutputFrame>) -> Result<bool, ()> {
+		match self.command_tx.try_send(ZenohOutputCommand::Send(frame.into())) {
+			Ok(()) => Ok(true),
+			Err(TrySendError::Full(_)) => Ok(false),
+			Err(TrySendError::Disconnected(_)) => Err(()),
+		}
 	}
 
 	pub fn shutdown(&self) {
@@ -401,7 +405,7 @@ pub fn spawn_zenoh_output_worker(config: ZenohOutputConfig, event_tx: Sender<Zen
 		stream_id = stream_id.as_deref().unwrap_or("-"),
 		"Zenoh output worker started",
 	);
-	let (command_tx, command_rx) = mpsc::channel();
+	let (command_tx, command_rx) = mpsc::sync_channel(1);
 	let join = thread::spawn(move || run_zenoh_output_worker(worker, command_rx, event_tx));
 	Ok(ZenohOutputWorkerHandle {
 		base_key_expr,
