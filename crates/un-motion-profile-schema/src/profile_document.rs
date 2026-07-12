@@ -196,28 +196,51 @@ impl CoreProfileDocumentStore {
 		let next_profiles = root.join(NEXT_PROFILES_DIR);
 		let previous_profiles = root.join(PREVIOUS_PROFILES_DIR);
 		let marker = root.join(PROFILE_TRANSACTION_MARKER);
-		remove_path_if_exists(&next_profiles)?;
-		remove_path_if_exists(&previous_profiles)?;
-		fs::create_dir(&next_profiles)
-			.with_context(|| format!("failed to create staged profiles directory {}", next_profiles.display()))?;
-		let mut copied = false;
-		for entry in fs::read_dir(template_dir)
-			.with_context(|| format!("failed to read template dir {}", template_dir.display()))?
-			.flatten()
-		{
+		let mut templates = Vec::new();
+		let mut profile_ids = HashSet::new();
+		let mut source_ids = HashSet::new();
+		for entry in fs::read_dir(template_dir).with_context(|| format!("failed to read template dir {}", template_dir.display()))? {
+			let entry = entry.with_context(|| format!("failed to read entry in template dir {}", template_dir.display()))?;
 			let path = entry.path();
 			if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
 				continue;
 			}
-			let Some(file_name) = path.file_name() else { continue };
-			let dest = next_profiles.join(file_name);
-			let raw = fs::read(&path).with_context(|| format!("failed to read template {}", path.display()))?;
-			atomic_write(&dest, &raw).with_context(|| format!("failed to stage template {} -> {}", path.display(), dest.display()))?;
-			copied = true;
+			let raw = fs::read_to_string(&path).with_context(|| format!("failed to read template {}", path.display()))?;
+			let profile =
+				toml::from_str::<CoreProfileFile>(&raw).with_context(|| format!("failed to parse profile template {}", path.display()))?;
+			let profile_id = profile.id.trim();
+			if profile_id.is_empty() {
+				bail!("profile template {} has an empty profile id", path.display());
+			}
+			if !profile_ids.insert(profile_id.to_string()) {
+				bail!("profile template {} has duplicate profile id '{profile_id}'", path.display());
+			}
+			for source in &profile.sources {
+				let source_id = source.id.trim();
+				if source_id.is_empty() {
+					bail!("profile template {} has an empty source id", path.display());
+				}
+				if !source_ids.insert(source_id.to_string()) {
+					bail!("profile template {} has duplicate source id '{source_id}'", path.display());
+				}
+			}
+			let file_name = path
+				.file_name()
+				.ok_or_else(|| anyhow::anyhow!("profile template has no file name: {}", path.display()))?
+				.to_owned();
+			templates.push((path, file_name, raw));
 		}
-		if !copied {
-			remove_path_if_exists(&next_profiles)?;
+		if templates.is_empty() {
 			return Ok(false);
+		}
+		remove_path_if_exists(&next_profiles)?;
+		remove_path_if_exists(&previous_profiles)?;
+		fs::create_dir(&next_profiles)
+			.with_context(|| format!("failed to create staged profiles directory {}", next_profiles.display()))?;
+		for (path, file_name, raw) in templates {
+			let dest = next_profiles.join(file_name);
+			atomic_write(&dest, raw.as_bytes())
+				.with_context(|| format!("failed to stage template {} -> {}", path.display(), dest.display()))?;
 		}
 		atomic_write(&marker, b"prepared\n")?;
 		if self.profiles_dir.exists() {
@@ -233,7 +256,7 @@ impl CoreProfileDocumentStore {
 			.with_context(|| format!("failed to install seeded profiles {}", self.profiles_dir.display()))?;
 		remove_path_if_exists(&previous_profiles)?;
 		remove_path_if_exists(&marker)?;
-		Ok(copied)
+		Ok(true)
 	}
 
 	pub fn load(&self) -> anyhow::Result<CoreProfileDocument> {
@@ -1448,6 +1471,49 @@ note = "bundled"
 		assert!(!missing.exists());
 		let copied = store.seed_from_templates(&missing).expect("seed no-op");
 		assert!(!copied);
+	}
+
+	#[test]
+	fn seed_from_templates_rejects_invalid_templates_before_publish() {
+		let user_root = temp_root("seed-invalid-user");
+		let template_root = temp_root("seed-invalid-templates");
+		let template_dir = template_root.join("profiles");
+		fs::write(template_dir.join("valid.toml"), "id = \"valid\"\nname = \"Valid\"\n").expect("write valid template");
+		fs::write(template_dir.join("invalid.toml"), "id = [\n").expect("write invalid template");
+		let store = CoreProfileDocumentStore::from_user_dir(&user_root);
+
+		let error = store.seed_from_templates(&template_dir).expect_err("invalid template must fail");
+
+		assert!(error.to_string().contains("failed to parse profile template"));
+		assert_eq!(fs::read_dir(user_root.join("profiles")).expect("user profiles").count(), 0);
+		assert!(!user_root.join(PROFILE_TRANSACTION_MARKER).exists());
+	}
+
+	#[test]
+	fn seed_from_templates_rejects_duplicate_profile_and_source_ids() {
+		for (case, second) in [
+			("profile", "id = \"same\"\nname = \"Second\"\n"),
+			(
+				"source",
+				"id = \"second\"\nname = \"Second\"\n[[sources]]\nid = \"same-source\"\nkind = \"vmc-osc\"\nlabel = \"B\"\n",
+			),
+		] {
+			let user_root = temp_root(&format!("seed-duplicate-{case}-user"));
+			let template_root = temp_root(&format!("seed-duplicate-{case}-templates"));
+			let template_dir = template_root.join("profiles");
+			fs::write(
+				template_dir.join("first.toml"),
+				"id = \"same\"\nname = \"First\"\n[[sources]]\nid = \"same-source\"\nkind = \"vmc-osc\"\nlabel = \"A\"\n",
+			)
+			.expect("write first template");
+			fs::write(template_dir.join("second.toml"), second).expect("write second template");
+			let store = CoreProfileDocumentStore::from_user_dir(&user_root);
+
+			let error = store.seed_from_templates(&template_dir).expect_err("duplicate id must fail");
+
+			assert!(error.to_string().contains("duplicate"), "{error:#}");
+			assert_eq!(fs::read_dir(user_root.join("profiles")).expect("user profiles").count(), 0);
+		}
 	}
 
 	fn test_document_profile(id: &str, name: &str) -> CoreProfileDocumentProfile {
