@@ -52,6 +52,7 @@ pub struct FileVideoInputSource {
 	stdout: Option<ChildStdout>,
 	sequence: u64,
 	frame_len: usize,
+	exhausted: bool,
 }
 
 impl FileVideoInputSource {
@@ -64,6 +65,7 @@ impl FileVideoInputSource {
 			stdout: None,
 			sequence: 0,
 			frame_len,
+			exhausted: false,
 		};
 		source.spawn_ffmpeg()?;
 		Ok(source)
@@ -110,14 +112,21 @@ impl FileVideoInputSource {
 	}
 
 	fn next_rgb_bytes(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+		if self.exhausted {
+			return Ok(None);
+		}
 		let Some(stdout) = self.stdout.as_mut() else {
+			self.exhausted = true;
 			return Ok(None);
 		};
 		let mut data = vec![0_u8; self.frame_len];
 		let mut offset = 0;
 		while offset < data.len() {
 			match stdout.read(&mut data[offset..]) {
-				Ok(0) => return Ok(None),
+				Ok(0) => {
+					self.exhausted = true;
+					return Ok(None);
+				}
 				Ok(read) => offset += read,
 				Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
 				Err(error) => return Err(error.into()),
@@ -212,5 +221,21 @@ mod tests {
 		let config = FileVideoInputConfig::new("clip.mp4", 0, 480, 24);
 		let err = validate_config(&config).expect_err("zero width should fail");
 		assert!(err.to_string().contains("dimensions"));
+	}
+
+	#[test]
+	fn exhausted_source_stays_idle() {
+		let config = FileVideoInputConfig::new("clip.mp4", 640, 480, 30);
+		let mut source = FileVideoInputSource {
+			config,
+			child: None,
+			stdout: None,
+			sequence: 0,
+			frame_len: 640 * 480 * 3,
+			exhausted: true,
+		};
+		assert!(source.next_rgb_bytes().expect("first idle poll").is_none());
+		assert!(source.next_rgb_bytes().expect("repeated idle poll").is_none());
+		assert!(source.exhausted);
 	}
 }
