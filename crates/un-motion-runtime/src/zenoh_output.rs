@@ -11,6 +11,7 @@
 
 use std::sync::{
 	Arc,
+	atomic::{AtomicBool, Ordering},
 	mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
 };
 use std::thread::{self, JoinHandle};
@@ -369,6 +370,7 @@ pub struct ZenohOutputWorkerHandle {
 	command_tx: SyncSender<ZenohOutputCommand>,
 	latest_frame: LatestFrameSlot<ZenohOutputFrame>,
 	join: Option<JoinHandle<()>>,
+	stop: Arc<AtomicBool>,
 }
 
 impl ZenohOutputWorkerHandle {
@@ -381,7 +383,8 @@ impl ZenohOutputWorkerHandle {
 	}
 
 	pub fn shutdown(&self) {
-		let _ = self.command_tx.send(ZenohOutputCommand::Shutdown);
+		self.stop.store(true, Ordering::Release);
+		let _ = self.command_tx.try_send(ZenohOutputCommand::Shutdown);
 	}
 
 	pub fn join(mut self) -> thread::Result<()> {
@@ -405,12 +408,15 @@ pub fn spawn_zenoh_output_worker(config: ZenohOutputConfig, event_tx: Sender<Zen
 		"Zenoh output worker started",
 	);
 	let (command_tx, command_rx) = mpsc::sync_channel(1);
-	let join = thread::spawn(move || run_zenoh_output_worker(worker, command_rx, worker_latest_frame, event_tx));
+	let stop = Arc::new(AtomicBool::new(false));
+	let worker_stop = Arc::clone(&stop);
+	let join = thread::spawn(move || run_zenoh_output_worker(worker, command_rx, worker_latest_frame, event_tx, worker_stop));
 	Ok(ZenohOutputWorkerHandle {
 		base_key_expr,
 		command_tx,
 		latest_frame,
 		join: Some(join),
+		stop,
 	})
 }
 
@@ -419,12 +425,16 @@ fn run_zenoh_output_worker(
 	command_rx: Receiver<ZenohOutputCommand>,
 	latest_frame: LatestFrameSlot<ZenohOutputFrame>,
 	event_tx: Sender<ZenohOutputEvent>,
+	stop: Arc<AtomicBool>,
 ) {
 	// 1 秒に 1 回程度の頻度で送信状況を debug ログに出す。多すぎると log が溢れ、
 	// 少なすぎると Phase E e2e Step B の切り分けに使えないので保守的に 30 frame 毎。
 	const SEND_LOG_INTERVAL: u64 = 30;
 	let base_key_expr = worker.config.base_key_expr.clone();
 	for command in command_rx {
+		if stop.load(Ordering::Acquire) {
+			break;
+		}
 		match command {
 			ZenohOutputCommand::FrameReady => {
 				let Some(frame) = latest_frame.take() else { continue };

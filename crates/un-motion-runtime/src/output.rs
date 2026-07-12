@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{
 	Arc, Mutex,
+	atomic::{AtomicBool, Ordering},
 	mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
 };
 use std::thread::{self, JoinHandle};
@@ -262,6 +263,7 @@ pub struct VmcOutputWorkerHandle {
 	command_tx: SyncSender<VmcOutputCommand>,
 	latest_frame: LatestFrameSlot<VmcOutputFrame>,
 	join: Option<JoinHandle<()>>,
+	stop: Arc<AtomicBool>,
 }
 
 impl VmcOutputWorkerHandle {
@@ -274,7 +276,8 @@ impl VmcOutputWorkerHandle {
 	}
 
 	pub fn shutdown(&self) {
-		let _ = self.command_tx.send(VmcOutputCommand::Shutdown);
+		self.stop.store(true, Ordering::Release);
+		let _ = self.command_tx.try_send(VmcOutputCommand::Shutdown);
 	}
 
 	pub fn join(mut self) -> thread::Result<()> {
@@ -405,6 +408,7 @@ pub struct FileOutputWorkerHandle {
 	pub path: PathBuf,
 	command_tx: SyncSender<FileOutputCommand>,
 	join: Option<JoinHandle<()>>,
+	stop: Arc<AtomicBool>,
 }
 
 impl FileOutputWorkerHandle {
@@ -419,7 +423,8 @@ impl FileOutputWorkerHandle {
 	}
 
 	pub fn shutdown(&self) {
-		let _ = self.command_tx.send(FileOutputCommand::Shutdown);
+		self.stop.store(true, Ordering::Release);
+		let _ = self.command_tx.try_send(FileOutputCommand::Shutdown);
 	}
 
 	pub fn join(mut self) -> thread::Result<()> {
@@ -439,12 +444,15 @@ pub fn spawn_vmc_output_worker(config: VmcOutputConfig, event_tx: Sender<VmcOutp
 		"VMC output worker bound",
 	);
 	let (command_tx, command_rx) = mpsc::sync_channel(1);
-	let join = thread::spawn(move || run_vmc_output_worker(&mut worker, command_rx, worker_latest_frame, event_tx));
+	let stop = Arc::new(AtomicBool::new(false));
+	let worker_stop = Arc::clone(&stop);
+	let join = thread::spawn(move || run_vmc_output_worker(&mut worker, command_rx, worker_latest_frame, event_tx, worker_stop));
 	Ok(VmcOutputWorkerHandle {
 		target_addr,
 		command_tx,
 		latest_frame,
 		join: Some(join),
+		stop,
 	})
 }
 
@@ -694,6 +702,7 @@ pub struct VrcOscOutputWorkerHandle {
 	command_tx: SyncSender<VrcOscOutputCommand>,
 	latest_frame: LatestFrameSlot<VrcOscOutputFrame>,
 	join: Option<JoinHandle<()>>,
+	stop: Arc<AtomicBool>,
 }
 
 impl VrcOscOutputWorkerHandle {
@@ -706,7 +715,8 @@ impl VrcOscOutputWorkerHandle {
 	}
 
 	pub fn shutdown(&self) {
-		let _ = self.command_tx.send(VrcOscOutputCommand::Shutdown);
+		self.stop.store(true, Ordering::Release);
+		let _ = self.command_tx.try_send(VrcOscOutputCommand::Shutdown);
 	}
 
 	pub fn join(mut self) -> thread::Result<()> {
@@ -729,12 +739,15 @@ pub fn spawn_vrc_osc_output_worker(
 		"VRC OSC output worker bound",
 	);
 	let (command_tx, command_rx) = mpsc::sync_channel(1);
-	let join = thread::spawn(move || run_vrc_osc_output_worker(&mut worker, command_rx, worker_latest_frame, event_tx));
+	let stop = Arc::new(AtomicBool::new(false));
+	let worker_stop = Arc::clone(&stop);
+	let join = thread::spawn(move || run_vrc_osc_output_worker(&mut worker, command_rx, worker_latest_frame, event_tx, worker_stop));
 	Ok(VrcOscOutputWorkerHandle {
 		target_addr,
 		command_tx,
 		latest_frame,
 		join: Some(join),
+		stop,
 	})
 }
 
@@ -743,10 +756,14 @@ fn run_vrc_osc_output_worker(
 	command_rx: Receiver<VrcOscOutputCommand>,
 	latest_frame: LatestFrameSlot<VrcOscOutputFrame>,
 	event_tx: Sender<VrcOscOutputEvent>,
+	stop: Arc<AtomicBool>,
 ) {
 	const SEND_LOG_INTERVAL: u64 = 30;
 	let target_addr = worker.target_addr();
 	for command in command_rx {
+		if stop.load(Ordering::Acquire) {
+			break;
+		}
 		match command {
 			VrcOscOutputCommand::FrameReady => {
 				let Some(frame) = latest_frame.take() else { continue };
@@ -885,11 +902,14 @@ pub fn spawn_file_output_worker(config: FileOutputConfig, event_tx: Sender<FileO
 	let mut worker = FileOutputWorker::open(config)?;
 	let path = worker.path().clone();
 	let (command_tx, command_rx) = mpsc::sync_channel(1);
-	let join = thread::spawn(move || run_file_output_worker(&mut worker, command_rx, event_tx));
+	let stop = Arc::new(AtomicBool::new(false));
+	let worker_stop = Arc::clone(&stop);
+	let join = thread::spawn(move || run_file_output_worker(&mut worker, command_rx, event_tx, worker_stop));
 	Ok(FileOutputWorkerHandle {
 		path,
 		command_tx,
 		join: Some(join),
+		stop,
 	})
 }
 
@@ -898,12 +918,16 @@ fn run_vmc_output_worker(
 	command_rx: Receiver<VmcOutputCommand>,
 	latest_frame: LatestFrameSlot<VmcOutputFrame>,
 	event_tx: Sender<VmcOutputEvent>,
+	stop: Arc<AtomicBool>,
 ) {
 	// Phase E e2e Step B: 1 秒に 1 回程度 (30 fps 想定で 30 datagram 毎) で send が
 	// 進んでいるか debug log に流す。「送信側で詰まっているか」の切り分けに使う。
 	const SEND_LOG_INTERVAL: u64 = 30;
 	let target_addr = worker.target_addr();
 	for command in command_rx {
+		if stop.load(Ordering::Acquire) {
+			break;
+		}
 		match command {
 			VmcOutputCommand::FrameReady => {
 				let Some(frame) = latest_frame.take() else { continue };
@@ -948,8 +972,16 @@ fn run_vmc_output_worker(
 	let _ = event_tx.send(worker.stopped_event());
 }
 
-fn run_file_output_worker(worker: &mut FileOutputWorker, command_rx: Receiver<FileOutputCommand>, event_tx: Sender<FileOutputEvent>) {
+fn run_file_output_worker(
+	worker: &mut FileOutputWorker,
+	command_rx: Receiver<FileOutputCommand>,
+	event_tx: Sender<FileOutputEvent>,
+	stop: Arc<AtomicBool>,
+) {
 	for command in command_rx {
+		if stop.load(Ordering::Acquire) {
+			break;
+		}
 		match command {
 			FileOutputCommand::WriteFrame(frame) => match worker.write_frame(&frame) {
 				Ok(event) => {
@@ -1082,6 +1114,7 @@ mod tests {
 			command_tx,
 			latest_frame: latest_frame.clone(),
 			join: None,
+			stop: Arc::new(AtomicBool::new(false)),
 		};
 
 		assert_eq!(handle.send(UNMotionFrame::new(1)), Ok(true));
@@ -1103,11 +1136,31 @@ mod tests {
 			command_tx,
 			latest_frame: LatestFrameSlot::new(),
 			join: None,
+			stop: Arc::new(AtomicBool::new(false)),
 		};
 
 		drop(handle);
 		assert_eq!(command_rx.recv(), Ok(VmcOutputCommand::FrameReady));
 		assert!(command_rx.recv().is_err());
+	}
+
+	#[test]
+	fn live_output_shutdown_does_not_block_on_full_command_queue() {
+		let (command_tx, command_rx) = mpsc::sync_channel(1);
+		command_tx.send(VmcOutputCommand::FrameReady).expect("fill command queue");
+		let stop = Arc::new(AtomicBool::new(false));
+		let handle = VmcOutputWorkerHandle {
+			target_addr: "127.0.0.1:39540".parse().expect("target"),
+			command_tx,
+			latest_frame: LatestFrameSlot::new(),
+			join: None,
+			stop: Arc::clone(&stop),
+		};
+
+		handle.shutdown();
+
+		assert!(stop.load(Ordering::Acquire));
+		assert_eq!(command_rx.try_recv(), Ok(VmcOutputCommand::FrameReady));
 	}
 
 	#[test]
