@@ -8,6 +8,8 @@ use un_motion_frame::{MotionSignalValue, SampleState, UNMotionFrame};
 
 const AVATAR_PARAMETER_PREFIX: &str = "/avatar/parameters/";
 const MAX_OSC_DATAGRAM_BYTES: usize = 4096;
+const MAX_VRC_PARAMETER_NAME_BYTES: usize = 256;
+const MAX_VRC_PARAMETER_STATES: usize = 1_024;
 const BINARY_PARAMETER_DEADZONE: f32 = 0.15;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,20 +149,29 @@ impl VrcOscOutputSink {
 		let parameters = vrc_osc_parameters_for_frame(frame, &self.options);
 		parameters
 			.into_iter()
+			.filter(|parameter| valid_vrc_parameter_name(&parameter.name))
 			.filter(|parameter| {
 				!self
 					.last_values
 					.get(&parameter.name)
 					.is_some_and(|old| parameter_value_unchanged(*old, parameter.value))
 			})
+			.take(MAX_VRC_PARAMETER_STATES)
 			.collect()
 	}
 
 	fn commit_parameters(&mut self, parameters: Vec<VrcOscParameter>) {
 		for parameter in parameters {
+			if !self.last_values.contains_key(&parameter.name) && self.last_values.len() >= MAX_VRC_PARAMETER_STATES {
+				self.last_values.pop_first();
+			}
 			self.last_values.insert(parameter.name, parameter.value);
 		}
 	}
+}
+
+fn valid_vrc_parameter_name(name: &str) -> bool {
+	!name.is_empty() && name.len() <= MAX_VRC_PARAMETER_NAME_BYTES
 }
 
 fn parameter_value_unchanged(old: VrcOscParameterValue, new: VrcOscParameterValue) -> bool {
@@ -764,6 +775,35 @@ mod tests {
 		assert!(sink.last_values.is_empty());
 		sink.commit_parameters(changed);
 		assert!(sink.changed_parameters_for_frame(&frame).is_empty());
+	}
+
+	#[test]
+	fn oversized_vrc_parameter_names_are_ignored() {
+		let sink = VrcOscOutputSink::new("127.0.0.1:9000".parse().expect("target")).expect("sink");
+		let mut frame = UNMotionFrame::new(1);
+		frame.signals.push(scalar(&"x".repeat(MAX_VRC_PARAMETER_NAME_BYTES + 1), 0.4));
+
+		assert!(sink.changed_parameters_for_frame(&frame).is_empty());
+	}
+
+	#[test]
+	fn parameter_cache_evicts_old_entries_at_capacity() {
+		let mut sink = VrcOscOutputSink::new("127.0.0.1:9000".parse().expect("target")).expect("sink");
+		let parameters = (0..MAX_VRC_PARAMETER_STATES + 10)
+			.map(|index| VrcOscParameter {
+				name: format!("parameter-{index}"),
+				value: VrcOscParameterValue::Float(index as f32),
+			})
+			.collect();
+
+		sink.commit_parameters(parameters);
+
+		assert_eq!(sink.last_values.len(), MAX_VRC_PARAMETER_STATES);
+		assert!(!sink.last_values.contains_key("parameter-0"));
+		assert!(
+			sink.last_values
+				.contains_key(&format!("parameter-{}", MAX_VRC_PARAMETER_STATES + 9))
+		);
 	}
 
 	#[test]
