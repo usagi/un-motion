@@ -517,7 +517,7 @@ fn apply_temporal_iir_denoise(input: &ImageFrame, state: &mut InputDenoiseState,
 			&& input.metadata.capture_timestamp_ns > previous.capture_timestamp_ns
 	});
 	if compatible_previous.is_none() {
-		let data = source.clone();
+		let data = source.to_vec();
 		state.previous_temporal = Some(TemporalIirFrame {
 			width: input.width,
 			height: input.height,
@@ -550,7 +550,7 @@ fn image_frame_with_data(input: &ImageFrame, data: Vec<u8>) -> ImageFrame {
 		height: input.height,
 		stride_bytes: input.stride_bytes,
 		pixel_format: input.pixel_format,
-		data,
+		data: data.into(),
 	}
 }
 
@@ -946,7 +946,7 @@ fn write_debug_rgb_png(image: &ImageFrame, path: &Path) -> anyhow::Result<()> {
 	let stride = image.stride_bytes as usize;
 	let height = image.height as usize;
 	let bytes = if stride == row_bytes {
-		image.data.as_slice()
+		image.data.as_ref()
 	} else {
 		let mut packed = Vec::with_capacity(row_bytes.saturating_mul(height));
 		for y in 0..height {

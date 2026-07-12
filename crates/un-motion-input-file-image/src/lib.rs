@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use image::{ImageBuffer, RgbaImage, imageops};
@@ -36,7 +37,7 @@ impl FileImageInputConfig {
 
 pub struct FileImageInputSource {
 	config: FileImageInputConfig,
-	frame_data: Vec<u8>,
+	frame_data: Arc<[u8]>,
 	width: u32,
 	height: u32,
 	stride_bytes: u32,
@@ -64,7 +65,7 @@ impl FileImageInputSource {
 		};
 		let width = image.width();
 		let height = image.height();
-		let frame_data = rgba_to_rgb(image);
+		let frame_data = Arc::from(rgba_to_rgb(image));
 		Ok(Self {
 			config,
 			frame_data,
@@ -198,6 +199,19 @@ mod tests {
 		assert_eq!(first.height, 1);
 		assert_eq!(first.pixel_format, PixelFormat::Rgb8);
 		assert!(source.next_image_frame().unwrap().is_none());
+		let _ = std::fs::remove_file(path);
+	}
+
+	#[test]
+	fn repeated_frames_share_immutable_pixel_storage() {
+		let path = temp_image_path("shared-repeat-source.png");
+		write_test_image(&path);
+		let mut config = FileImageInputConfig::once(&path);
+		config.emission_mode = FileImageEmissionMode::RepeatFps(60);
+		let mut source = FileImageInputSource::open(config).unwrap();
+		let first = source.build_frame();
+		let second = source.build_frame();
+		assert!(Arc::ptr_eq(&first.data, &second.data));
 		let _ = std::fs::remove_file(path);
 	}
 

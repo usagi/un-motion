@@ -478,7 +478,7 @@ impl ActiveDirectShowCapture {
 			height,
 			stride_bytes: width.saturating_mul(3),
 			pixel_format: PixelFormat::Rgb8,
-			data,
+			data: data.into(),
 		};
 		self.sequence = self.sequence.saturating_add(1);
 		Ok(Some(image))
@@ -912,7 +912,7 @@ fn resize_ccap_frame_to_rgb8(frame: &PendingDirectShowFrame, dst_width: u32, dst
 	let src_height = frame.height as usize;
 	let dst_width_usize = dst_width as usize;
 	let dst_height_usize = dst_height as usize;
-	let src = frame.data.as_slice();
+	let src: &[u8] = frame.data.as_ref();
 	let stride = frame.stride as usize;
 	let row_bytes = ccap_pixel_row_bytes(frame.pixel_format, src_width)?;
 	if stride < row_bytes {
@@ -964,7 +964,7 @@ fn checked_rgb8_output_len(width: u32, height: u32) -> anyhow::Result<usize> {
 fn convert_ccap_frame_to_rgb8(frame: &PendingDirectShowFrame) -> anyhow::Result<Vec<u8>> {
 	let width = frame.width as usize;
 	let height = frame.height as usize;
-	let src = frame.data.as_slice();
+	let src: &[u8] = frame.data.as_ref();
 	let stride = frame.stride as usize;
 	let row_bytes = ccap_pixel_row_bytes(frame.pixel_format, width)?;
 	if stride < row_bytes {

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelFormat {
 	Rgb8,
@@ -109,18 +111,22 @@ pub struct ImageFrame {
 	pub height: u32,
 	pub stride_bytes: u32,
 	pub pixel_format: PixelFormat,
-	pub data: Vec<u8>,
+	pub data: Arc<[u8]>,
 }
 
 impl ImageFrame {
-	pub fn new_rgb8(
+	pub fn new_rgb8<D>(
 		sequence: u64,
 		capture_timestamp_ns: u64,
 		source_id: impl Into<String>,
 		width: u32,
 		height: u32,
-		data: Vec<u8>,
-	) -> anyhow::Result<Self> {
+		data: D,
+	) -> anyhow::Result<Self>
+	where
+		D: Into<Arc<[u8]>>,
+	{
+		let data = data.into();
 		let pixels = checked_image_pixel_count(width, height)?;
 		let stride_bytes = width.checked_mul(3).ok_or_else(|| anyhow::anyhow!("RGB stride overflow"))?;
 		let expected_len = pixels.checked_mul(3).ok_or_else(|| anyhow::anyhow!("RGB frame size overflow"))?;

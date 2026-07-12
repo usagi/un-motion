@@ -116,7 +116,7 @@ mod tests {
 			height: 1,
 			stride_bytes: 4,
 			pixel_format: PixelFormat::Rgba8,
-			data: vec![0, 0, 0, 255],
+			data: vec![0, 0, 0, 255].into(),
 		};
 		let err = image_frame_rgb_ref(&frame).expect_err("rgba must be rejected");
 		assert!(err.to_string().contains("Rgb8"));
@@ -136,7 +136,7 @@ mod tests {
 			height: 2,
 			stride_bytes: 6,
 			pixel_format: PixelFormat::Rgb8,
-			data: vec![0; 11],
+			data: vec![0; 11].into(),
 		};
 		let err = image_frame_rgb_ref(&frame).expect_err("short buffer must be rejected");
 		assert!(err.to_string().contains("stride * height"));

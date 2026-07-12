@@ -308,7 +308,7 @@ fn capture_directshow_frame(args: &Args) -> anyhow::Result<CapturedFrame> {
 		camera_name: selected.name,
 		requested: config.requested_label(),
 		actual,
-		rgb: frame.data,
+		rgb: frame.data.to_vec(),
 		width: frame.width,
 		height: frame.height,
 	})
