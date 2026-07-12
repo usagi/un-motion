@@ -43,12 +43,9 @@ pub fn decode_framed_stream<R: Read>(mut reader: R) -> anyhow::Result<Vec<UNMoti
 	let mut out = Vec::new();
 
 	loop {
-		let mut len_buf = [0_u8; 4];
-		match reader.read_exact(&mut len_buf) {
-			Ok(()) => {}
-			Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
-			Err(err) => return Err(err).context("failed to read frame length prefix"),
-		}
+		let Some(len_buf) = read_frame_length_prefix(&mut reader)? else {
+			break;
+		};
 
 		let payload_len = u32::from_le_bytes(len_buf) as usize;
 		if payload_len > MAX_FRAME_PAYLOAD_BYTES {
@@ -62,6 +59,20 @@ pub fn decode_framed_stream<R: Read>(mut reader: R) -> anyhow::Result<Vec<UNMoti
 	}
 
 	Ok(out)
+}
+
+fn read_frame_length_prefix<R: Read>(reader: &mut R) -> anyhow::Result<Option<[u8; 4]>> {
+	let mut prefix = [0u8; 4];
+	loop {
+		match reader.read(&mut prefix[..1]) {
+			Ok(0) => return Ok(None),
+			Ok(_) => break,
+			Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+			Err(error) => return Err(error).context("failed to read frame length prefix"),
+		}
+	}
+	reader.read_exact(&mut prefix[1..]).context("truncated frame length prefix")?;
+	Ok(Some(prefix))
 }
 
 pub fn replay_framed_stream_to_sink<R: Read, S: OutputSink<UNMotionFrame>>(reader: R, sink: &mut S) -> anyhow::Result<usize> {
@@ -125,6 +136,14 @@ mod tests {
 		let oversized = (MAX_FRAME_PAYLOAD_BYTES as u32 + 1).to_le_bytes();
 		let error = decode_framed_stream(oversized.as_slice()).expect_err("oversized payload must fail");
 		assert!(error.to_string().contains("frame payload exceeds"));
+	}
+
+	#[test]
+	fn decode_rejects_partial_length_prefixes() {
+		for length in 1..4 {
+			let error = decode_framed_stream(&[0u8; 3][..length]).expect_err("partial prefix must fail");
+			assert!(error.to_string().contains("truncated frame length prefix"));
+		}
 	}
 
 	#[test]
