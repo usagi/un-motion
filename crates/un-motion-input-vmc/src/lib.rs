@@ -153,6 +153,7 @@ impl VmcPacketDecoder {
 		if is_unsupported_waidayo_mp_datagram(data) {
 			return Ok(None);
 		}
+		validate_osc_bundle_depth(data)?;
 		let (remaining, packet) = decoder::decode_udp(data)?;
 		if !remaining.is_empty() {
 			anyhow::bail!("VMC OSC datagram has {} trailing byte(s)", remaining.len());
@@ -225,6 +226,44 @@ impl VmcPacketDecoder {
 			_ => {}
 		}
 	}
+}
+
+fn validate_osc_bundle_depth(data: &[u8]) -> anyhow::Result<()> {
+	const BUNDLE_PREFIX: &[u8; 8] = b"#bundle\0";
+	if !data.starts_with(BUNDLE_PREFIX) {
+		return Ok(());
+	}
+	let mut pending = vec![(data, 1_usize)];
+	while let Some((bundle, depth)) = pending.pop() {
+		if depth > MAX_OSC_BUNDLE_DEPTH {
+			anyhow::bail!("VMC OSC bundle depth exceeds {MAX_OSC_BUNDLE_DEPTH}");
+		}
+		if bundle.len() < 16 {
+			continue;
+		}
+		let mut offset = 16_usize;
+		while offset < bundle.len() {
+			let Some(size_bytes) = bundle.get(offset..offset.saturating_add(4)) else {
+				break;
+			};
+			let size = i32::from_be_bytes([size_bytes[0], size_bytes[1], size_bytes[2], size_bytes[3]]);
+			let Ok(size) = usize::try_from(size) else {
+				break;
+			};
+			let element_start = offset + 4;
+			let Some(element_end) = element_start.checked_add(size) else {
+				break;
+			};
+			let Some(element) = bundle.get(element_start..element_end) else {
+				break;
+			};
+			if element.starts_with(BUNDLE_PREFIX) {
+				pending.push((element, depth + 1));
+			}
+			offset = element_end;
+		}
+	}
+	Ok(())
 }
 
 pub struct VmcInputSource {
@@ -460,6 +499,17 @@ mod tests {
 				.decode_packet(&nested_bundle(MAX_OSC_BUNDLE_DEPTH + 1, message()), 2)
 				.is_none()
 		);
+	}
+
+	#[test]
+	fn rejects_excessive_bundle_depth_before_osc_decode() {
+		let packet = nested_bundle(MAX_OSC_BUNDLE_DEPTH + 1, packet_message("/VMC/Ext/OK", vec![OscType::Int(1)]));
+		let data = encoder::encode(&packet).expect("encode nested bundle");
+		let mut decoder = VmcPacketDecoder::new("wire-depth");
+
+		let error = decoder.decode_datagram(&data, 1).expect_err("wire depth must fail");
+
+		assert!(error.to_string().contains("bundle depth exceeds"), "{error:#}");
 	}
 
 	#[test]
