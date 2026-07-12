@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -120,21 +121,31 @@ struct UnMotionMediaPipeContext {
 
 template <typename Queue, typename Item>
 void push_bounded(Queue& queue, Item item) {
-  queue.push_back(item);
+  queue.push_back(std::move(item));
   while (queue.size() > kLiveStreamQueueCapacity) {
     queue.pop_front();
   }
 }
 
-template <typename Queue>
-bool pop_first_at_or_after(Queue& queue, int64_t timestamp_ms, typename Queue::value_type* out) {
+template <typename Queue, typename Value>
+bool pop_first_at_or_after(
+    Queue& queue,
+    int64_t timestamp_ms,
+    Value* out_value,
+    int32_t* out_error,
+    int64_t* out_timestamp_ms) {
   while (!queue.empty() && queue.front().timestamp_ms < timestamp_ms) {
     queue.pop_front();
   }
   if (queue.empty()) {
     return false;
   }
-  *out = queue.front();
+  const auto& item = queue.front();
+  *out_value = item.value;
+  *out_error = item.error;
+  if (out_timestamp_ms != nullptr) {
+    *out_timestamp_ms = item.timestamp_ms;
+  }
   queue.pop_front();
   return true;
 }
@@ -1327,11 +1338,10 @@ int32_t un_motion_mediapipe_poll_latest_at(
   bool all_ready = true;
 
   if (out_pose != nullptr) {
-    QueuedPoseResult item = {};
-    if (pop_first_at_or_after(context->queued_pose, timestamp_ms, &item)) {
-      *out_pose = item.value;
-      if (item.error != 0 && first_error == 0) {
-        first_error = item.error;
+    int32_t error = 0;
+    if (pop_first_at_or_after(context->queued_pose, timestamp_ms, out_pose, &error, nullptr)) {
+      if (error != 0 && first_error == 0) {
+        first_error = error;
       }
     } else {
       std::memset(out_pose, 0, sizeof(*out_pose));
@@ -1340,11 +1350,10 @@ int32_t un_motion_mediapipe_poll_latest_at(
   }
 
   if (out_hands != nullptr) {
-    QueuedHandsResult item = {};
-    if (pop_first_at_or_after(context->queued_hands, timestamp_ms, &item)) {
-      *out_hands = item.value;
-      if (item.error != 0 && first_error == 0) {
-        first_error = item.error;
+    int32_t error = 0;
+    if (pop_first_at_or_after(context->queued_hands, timestamp_ms, out_hands, &error, nullptr)) {
+      if (error != 0 && first_error == 0) {
+        first_error = error;
       }
     } else {
       std::memset(out_hands, 0, sizeof(*out_hands));
@@ -1353,11 +1362,10 @@ int32_t un_motion_mediapipe_poll_latest_at(
   }
 
   if (out_face != nullptr) {
-    QueuedFaceResult item = {};
-    if (pop_first_at_or_after(context->queued_face, timestamp_ms, &item)) {
-      *out_face = item.value;
-      if (item.error != 0 && first_error == 0) {
-        first_error = item.error;
+    int32_t error = 0;
+    if (pop_first_at_or_after(context->queued_face, timestamp_ms, out_face, &error, nullptr)) {
+      if (error != 0 && first_error == 0) {
+        first_error = error;
       }
     } else {
       std::memset(out_face, 0, sizeof(*out_face));
@@ -1366,11 +1374,10 @@ int32_t un_motion_mediapipe_poll_latest_at(
   }
 
   if (out_gestures != nullptr) {
-    QueuedGesturesResult item = {};
-    if (pop_first_at_or_after(context->queued_gestures, timestamp_ms, &item)) {
-      *out_gestures = item.value;
-      if (item.error != 0 && first_error == 0) {
-        first_error = item.error;
+    int32_t error = 0;
+    if (pop_first_at_or_after(context->queued_gestures, timestamp_ms, out_gestures, &error, nullptr)) {
+      if (error != 0 && first_error == 0) {
+        first_error = error;
       }
     } else {
       std::memset(out_gestures, 0, sizeof(*out_gestures));
@@ -1379,11 +1386,10 @@ int32_t un_motion_mediapipe_poll_latest_at(
   }
 
   if (out_holistic != nullptr) {
-    QueuedHolisticResult item = {};
-    if (pop_first_at_or_after(context->queued_holistic, timestamp_ms, &item)) {
-      *out_holistic = item.value;
-      if (item.error != 0 && first_error == 0) {
-        first_error = item.error;
+    int32_t error = 0;
+    if (pop_first_at_or_after(context->queued_holistic, timestamp_ms, out_holistic, &error, nullptr)) {
+      if (error != 0 && first_error == 0) {
+        first_error = error;
       }
     } else {
       std::memset(out_holistic, 0, sizeof(*out_holistic));
@@ -1437,12 +1443,13 @@ int32_t un_motion_mediapipe_poll_latest_timestamp_at(
   int64_t result_timestamp_ms = std::numeric_limits<int64_t>::max();
 
   if (out_pose != nullptr) {
-    QueuedPoseResult item = {};
-    if (pop_first_at_or_after(context->queued_pose, timestamp_ms, &item)) {
-      *out_pose = item.value;
-      result_timestamp_ms = std::min(result_timestamp_ms, item.timestamp_ms);
-      if (item.error != 0 && first_error == 0) {
-        first_error = item.error;
+    int32_t error = 0;
+    int64_t item_timestamp_ms = -1;
+    if (pop_first_at_or_after(context->queued_pose, timestamp_ms, out_pose, &error,
+                              &item_timestamp_ms)) {
+      result_timestamp_ms = std::min(result_timestamp_ms, item_timestamp_ms);
+      if (error != 0 && first_error == 0) {
+        first_error = error;
       }
     } else {
       std::memset(out_pose, 0, sizeof(*out_pose));
@@ -1451,12 +1458,13 @@ int32_t un_motion_mediapipe_poll_latest_timestamp_at(
   }
 
   if (out_hands != nullptr) {
-    QueuedHandsResult item = {};
-    if (pop_first_at_or_after(context->queued_hands, timestamp_ms, &item)) {
-      *out_hands = item.value;
-      result_timestamp_ms = std::min(result_timestamp_ms, item.timestamp_ms);
-      if (item.error != 0 && first_error == 0) {
-        first_error = item.error;
+    int32_t error = 0;
+    int64_t item_timestamp_ms = -1;
+    if (pop_first_at_or_after(context->queued_hands, timestamp_ms, out_hands, &error,
+                              &item_timestamp_ms)) {
+      result_timestamp_ms = std::min(result_timestamp_ms, item_timestamp_ms);
+      if (error != 0 && first_error == 0) {
+        first_error = error;
       }
     } else {
       std::memset(out_hands, 0, sizeof(*out_hands));
@@ -1465,12 +1473,13 @@ int32_t un_motion_mediapipe_poll_latest_timestamp_at(
   }
 
   if (out_face != nullptr) {
-    QueuedFaceResult item = {};
-    if (pop_first_at_or_after(context->queued_face, timestamp_ms, &item)) {
-      *out_face = item.value;
-      result_timestamp_ms = std::min(result_timestamp_ms, item.timestamp_ms);
-      if (item.error != 0 && first_error == 0) {
-        first_error = item.error;
+    int32_t error = 0;
+    int64_t item_timestamp_ms = -1;
+    if (pop_first_at_or_after(context->queued_face, timestamp_ms, out_face, &error,
+                              &item_timestamp_ms)) {
+      result_timestamp_ms = std::min(result_timestamp_ms, item_timestamp_ms);
+      if (error != 0 && first_error == 0) {
+        first_error = error;
       }
     } else {
       std::memset(out_face, 0, sizeof(*out_face));
@@ -1479,12 +1488,13 @@ int32_t un_motion_mediapipe_poll_latest_timestamp_at(
   }
 
   if (out_gestures != nullptr) {
-    QueuedGesturesResult item = {};
-    if (pop_first_at_or_after(context->queued_gestures, timestamp_ms, &item)) {
-      *out_gestures = item.value;
-      result_timestamp_ms = std::min(result_timestamp_ms, item.timestamp_ms);
-      if (item.error != 0 && first_error == 0) {
-        first_error = item.error;
+    int32_t error = 0;
+    int64_t item_timestamp_ms = -1;
+    if (pop_first_at_or_after(context->queued_gestures, timestamp_ms, out_gestures, &error,
+                              &item_timestamp_ms)) {
+      result_timestamp_ms = std::min(result_timestamp_ms, item_timestamp_ms);
+      if (error != 0 && first_error == 0) {
+        first_error = error;
       }
     } else {
       std::memset(out_gestures, 0, sizeof(*out_gestures));
@@ -1493,12 +1503,13 @@ int32_t un_motion_mediapipe_poll_latest_timestamp_at(
   }
 
   if (out_holistic != nullptr) {
-    QueuedHolisticResult item = {};
-    if (pop_first_at_or_after(context->queued_holistic, timestamp_ms, &item)) {
-      *out_holistic = item.value;
-      result_timestamp_ms = std::min(result_timestamp_ms, item.timestamp_ms);
-      if (item.error != 0 && first_error == 0) {
-        first_error = item.error;
+    int32_t error = 0;
+    int64_t item_timestamp_ms = -1;
+    if (pop_first_at_or_after(context->queued_holistic, timestamp_ms, out_holistic, &error,
+                              &item_timestamp_ms)) {
+      result_timestamp_ms = std::min(result_timestamp_ms, item_timestamp_ms);
+      if (error != 0 && first_error == 0) {
+        first_error = error;
       }
     } else {
       std::memset(out_holistic, 0, sizeof(*out_holistic));
