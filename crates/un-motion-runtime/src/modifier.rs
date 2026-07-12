@@ -25,6 +25,7 @@
 //!   **視点を整える** → **不要を捨てる**」と読める並びを採る。
 //!
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use un_motion_frame::{HandMotion, HumanoidBone, MotionSignalValue, Quatf, TransformSample, UNMotionFrame, Vec3f};
 
@@ -641,6 +642,7 @@ pub struct SmoothingStage {
 	root_rotation_state: Option<QuatSmoothingState>,
 	face_expression_state: HashMap<String, ScalarSmoothingState>,
 	signal_scalar_state: HashMap<String, ScalarSmoothingState>,
+	hand_transform_keys: HashMap<(bool, u8, usize), (Arc<str>, Arc<str>)>,
 	generation: u64,
 }
 
@@ -762,6 +764,7 @@ impl SmoothingStage {
 			root_rotation_state: None,
 			face_expression_state: HashMap::new(),
 			signal_scalar_state: HashMap::new(),
+			hand_transform_keys: HashMap::new(),
 			generation: 0,
 		})
 	}
@@ -1149,24 +1152,48 @@ impl SmoothingStage {
 		}
 	}
 
-	fn smooth_hand_motion(&mut self, side: &str, hand: &mut HandMotion, timestamp_ns: u64) {
+	fn smooth_hand_motion(&mut self, is_left: bool, hand: &mut HandMotion, timestamp_ns: u64) {
 		let confidence = hand.confidence;
 		if let Some(wrist) = hand.wrist.as_mut() {
-			self.smooth_transform_sample(&format!("hand.{side}.wrist"), wrist, timestamp_ns, confidence);
+			let keys = self.hand_transform_keys(is_left, u8::MAX, 0, || "wrist".to_string());
+			self.smooth_transform_sample(&keys.0, &keys.1, wrist, timestamp_ns, confidence);
 		}
 		for finger in &mut hand.fingers {
 			for (index, joint) in finger.joints.iter_mut().enumerate() {
-				self.smooth_transform_sample(&format!("hand.{side}.{:?}.{index}", finger.finger), joint, timestamp_ns, confidence);
+				let finger_id = finger.finger as u8;
+				let keys = self.hand_transform_keys(is_left, finger_id, index, || format!("{:?}.{index}", finger.finger));
+				self.smooth_transform_sample(&keys.0, &keys.1, joint, timestamp_ns, confidence);
 			}
 		}
 	}
 
-	fn smooth_transform_sample(&mut self, key: &str, transform: &mut TransformSample, timestamp_ns: u64, confidence: f32) {
+	fn hand_transform_keys(&mut self, is_left: bool, finger: u8, joint: usize, label: impl FnOnce() -> String) -> (Arc<str>, Arc<str>) {
+		if let Some(keys) = self.hand_transform_keys.get(&(is_left, finger, joint)) {
+			return keys.clone();
+		}
+		let side = if is_left { "left" } else { "right" };
+		let label = label();
+		let base = format!("hand.{side}.{label}");
+		let keys = (Arc::from(format!("{base}.translation")), Arc::from(format!("{base}.rotation")));
+		if self.hand_transform_keys.len() < MAX_DYNAMIC_SMOOTHING_STATES {
+			self.hand_transform_keys.insert((is_left, finger, joint), keys.clone());
+		}
+		keys
+	}
+
+	fn smooth_transform_sample(
+		&mut self,
+		translation_key: &str,
+		rotation_key: &str,
+		transform: &mut TransformSample,
+		timestamp_ns: u64,
+		confidence: f32,
+	) {
 		if let Some(translation) = transform.translation {
-			transform.translation = Some(self.step_named_translation(&format!("{key}.translation"), translation, timestamp_ns, confidence));
+			transform.translation = Some(self.step_named_translation(translation_key, translation, timestamp_ns, confidence));
 		}
 		if let Some(rotation) = transform.rotation {
-			transform.rotation = Some(self.step_named_rotation(&format!("{key}.rotation"), rotation, timestamp_ns, confidence));
+			transform.rotation = Some(self.step_named_rotation(rotation_key, rotation, timestamp_ns, confidence));
 		}
 	}
 }
@@ -1209,7 +1236,7 @@ impl ModifierStage for SmoothingStage {
 		// BoneFilter (face_enabled=false) の責務なのでここでは触らない。
 		if let Some(face) = frame.face.as_mut() {
 			if let Some(head) = face.head.as_mut() {
-				self.smooth_transform_sample("face.head", head, timestamp_ns, face.confidence);
+				self.smooth_transform_sample("face.head.translation", "face.head.rotation", head, timestamp_ns, face.confidence);
 			}
 			for expression in face.expressions.iter_mut() {
 				let smoothed = self.step_expression(&expression.name, expression.value, timestamp_ns, expression.confidence);
@@ -1218,10 +1245,10 @@ impl ModifierStage for SmoothingStage {
 		}
 		if self.bone_subset.hands_enabled {
 			if let Some(hand) = frame.left_hand.as_mut() {
-				self.smooth_hand_motion("left", hand, timestamp_ns);
+				self.smooth_hand_motion(true, hand, timestamp_ns);
 			}
 			if let Some(hand) = frame.right_hand.as_mut() {
-				self.smooth_hand_motion("right", hand, timestamp_ns);
+				self.smooth_hand_motion(false, hand, timestamp_ns);
 			}
 		}
 		for signal in frame.signals.iter_mut() {
@@ -2759,6 +2786,30 @@ mod tests {
 		}
 		assert!(stage.named_vec3_state.is_empty());
 		assert!(stage.named_quat_state.is_empty());
+	}
+
+	#[test]
+	fn smoothing_reuses_cached_hand_transform_keys() {
+		let config = SmoothingConfig {
+			preset: SmoothingPreset::Medium,
+			..SmoothingConfig::default()
+		};
+		let mut stage = SmoothingStage::from_config(&config, BoneSubsetConfig::default()).expect("smoothing stage");
+		let mut first = UNMotionFrame::new(1);
+		first.left_hand = Some(make_left_hand_motion());
+		stage.apply(&mut first);
+		let cached_translation = Arc::clone(&stage.hand_transform_keys[&(true, Finger::Index as u8, 0)].0);
+		assert_eq!(stage.hand_transform_keys.len(), 2);
+
+		let mut second = UNMotionFrame::new(2);
+		second.left_hand = Some(make_left_hand_motion());
+		stage.apply(&mut second);
+
+		assert_eq!(stage.hand_transform_keys.len(), 2);
+		assert!(Arc::ptr_eq(
+			&cached_translation,
+			&stage.hand_transform_keys[&(true, Finger::Index as u8, 0)].0
+		));
 	}
 
 	#[test]
