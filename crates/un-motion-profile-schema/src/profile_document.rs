@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,6 +16,9 @@ const NEXT_PROFILES_DIR: &str = ".profiles-next";
 const PREVIOUS_PROFILES_DIR: &str = ".profiles-previous";
 const NEXT_CONF_FILE: &str = ".conf.toml.next";
 const PROFILE_STORE_LOCK_FILE: &str = ".profiles.lock";
+const MAX_PROFILE_STORE_FILE_BYTES: u64 = 1_048_576;
+const MAX_PROFILE_FILES: usize = 256;
+const MAX_PROFILE_SOURCES: usize = 4_096;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -205,7 +208,10 @@ impl CoreProfileDocumentStore {
 			if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
 				continue;
 			}
-			let raw = fs::read_to_string(&path).with_context(|| format!("failed to read template {}", path.display()))?;
+			if templates.len() >= MAX_PROFILE_FILES {
+				bail!("template directory contains more than {MAX_PROFILE_FILES} profile files");
+			}
+			let raw = read_bounded_utf8(&path)?;
 			let profile =
 				toml::from_str::<CoreProfileFile>(&raw).with_context(|| format!("failed to parse profile template {}", path.display()))?;
 			let profile_id = profile.id.trim();
@@ -216,6 +222,9 @@ impl CoreProfileDocumentStore {
 				bail!("profile template {} has duplicate profile id '{profile_id}'", path.display());
 			}
 			for source in &profile.sources {
+				if source_ids.len() >= MAX_PROFILE_SOURCES {
+					bail!("profile templates contain more than {MAX_PROFILE_SOURCES} sources");
+				}
 				let source_id = source.id.trim();
 				if source_id.is_empty() {
 					bail!("profile template {} has an empty source id", path.display());
@@ -268,6 +277,7 @@ impl CoreProfileDocumentStore {
 	fn load_unlocked(&self) -> anyhow::Result<CoreProfileDocument> {
 		let mut profiles = Vec::new();
 		let mut profile_sources = Vec::new();
+		let mut profile_file_count = 0;
 		let conf = load_conf_document(&self.conf_path)?;
 		let profile_manifest = conf.as_ref().and_then(profile_manifest_from_document);
 		if self.profiles_dir.exists() {
@@ -279,13 +289,20 @@ impl CoreProfileDocumentStore {
 				if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
 					continue;
 				}
-				let raw = fs::read_to_string(&path).with_context(|| format!("failed to read profile {}", path.display()))?;
+				profile_file_count += 1;
+				if profile_file_count > MAX_PROFILE_FILES {
+					bail!("profile store contains more than {MAX_PROFILE_FILES} profile files");
+				}
+				let raw = read_bounded_utf8(&path)?;
 				let profile =
 					toml::from_str::<CoreProfileFile>(&raw).with_context(|| format!("failed to parse profile {}", path.display()))?;
 				if profile_manifest.as_ref().is_some_and(|manifest| !manifest.contains(&profile.id)) {
 					continue;
 				}
 				for source in profile.sources {
+					if profile_sources.len() >= MAX_PROFILE_SOURCES {
+						bail!("profile store contains more than {MAX_PROFILE_SOURCES} sources");
+					}
 					let kind = normalize_source_kind(&source.kind);
 					profile_sources.push(CoreProfileDocumentSource {
 						id: source.id,
@@ -332,6 +349,7 @@ impl CoreProfileDocumentStore {
 	pub fn save(&self, document: CoreProfileDocument) -> anyhow::Result<CoreProfileDocument> {
 		let _store_lock = self.acquire_store_lock()?;
 		self.recover_profile_transaction()?;
+		validate_profile_document_limits(&document)?;
 		let normalized = normalize_profile_document(document);
 		let root = self.store_root();
 		fs::create_dir_all(root).with_context(|| format!("failed to create profile store {}", root.display()))?;
@@ -638,6 +656,31 @@ fn has_any_toml(dir: &Path) -> bool {
 	false
 }
 
+fn read_bounded_utf8(path: &Path) -> anyhow::Result<String> {
+	let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+	let mut bytes = Vec::new();
+	file.take(MAX_PROFILE_STORE_FILE_BYTES + 1)
+		.read_to_end(&mut bytes)
+		.with_context(|| format!("failed to read {}", path.display()))?;
+	if bytes.len() as u64 > MAX_PROFILE_STORE_FILE_BYTES {
+		bail!(
+			"{} exceeds the profile store file size limit of {MAX_PROFILE_STORE_FILE_BYTES} bytes",
+			path.display()
+		);
+	}
+	String::from_utf8(bytes).with_context(|| format!("{} is not valid UTF-8", path.display()))
+}
+
+fn validate_profile_document_limits(document: &CoreProfileDocument) -> anyhow::Result<()> {
+	if document.profiles.len() > MAX_PROFILE_FILES {
+		bail!("profile document contains more than {MAX_PROFILE_FILES} profiles");
+	}
+	if document.profile_sources.len() > MAX_PROFILE_SOURCES {
+		bail!("profile document contains more than {MAX_PROFILE_SOURCES} sources");
+	}
+	Ok(())
+}
+
 fn default_profiles() -> Vec<CoreProfileDocumentProfile> {
 	vec![CoreProfileDocumentProfile {
 		id: default_selected_profile_id(),
@@ -885,12 +928,18 @@ fn profile_manifest_from_document(doc: &toml::Value) -> Option<HashSet<String>> 
 }
 
 fn load_conf_document(path: &Path) -> anyhow::Result<Option<toml::Value>> {
-	match fs::read_to_string(path) {
+	match read_bounded_utf8(path) {
 		Ok(raw) => raw
 			.parse::<toml::Value>()
 			.with_context(|| format!("failed to parse {}", path.display()))
 			.map(Some),
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+		Err(error)
+			if error
+				.downcast_ref::<std::io::Error>()
+				.is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+		{
+			Ok(None)
+		}
 		Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
 	}
 }
@@ -912,11 +961,17 @@ fn sort_profiles_by_saved_order(profiles: &mut [CoreProfileDocumentProfile], ord
 }
 
 fn format_profile_metadata(path: &Path, active_profile_id: &str, profile_order: &[String]) -> anyhow::Result<String> {
-	let mut doc = match fs::read_to_string(path) {
+	let mut doc = match read_bounded_utf8(path) {
 		Ok(raw) => raw
 			.parse::<toml::Value>()
 			.with_context(|| format!("failed to parse {}", path.display()))?,
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => toml::Value::Table(toml::map::Map::new()),
+		Err(error)
+			if error
+				.downcast_ref::<std::io::Error>()
+				.is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+		{
+			toml::Value::Table(toml::map::Map::new())
+		}
 		Err(error) => return Err(error).with_context(|| format!("failed to read {}", path.display())),
 	};
 	if !doc.is_table() {
@@ -1167,6 +1222,86 @@ mirrorCorrectionEnabled = true
 			.load()
 			.expect_err("malformed conf must fail");
 		assert!(conf_error.to_string().contains("failed to parse"));
+	}
+
+	#[test]
+	fn store_rejects_oversized_profile_files() {
+		let root = temp_root("oversized-profile");
+		let path = root.join("profiles/oversized.toml");
+		File::create(&path)
+			.expect("create oversized profile")
+			.set_len(MAX_PROFILE_STORE_FILE_BYTES + 1)
+			.expect("extend oversized profile");
+
+		let error = CoreProfileDocumentStore::from_root(&root)
+			.load()
+			.expect_err("oversized profile must fail");
+
+		assert!(error.to_string().contains("file size limit"), "{error:#}");
+		let _ = fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn store_rejects_too_many_profile_files() {
+		let root = temp_root("too-many-profiles");
+		for index in 0..=MAX_PROFILE_FILES {
+			fs::write(
+				root.join("profiles").join(format!("profile-{index}.toml")),
+				format!("id = \"profile-{index}\"\nname = \"Profile {index}\"\n"),
+			)
+			.expect("write profile");
+		}
+
+		let error = CoreProfileDocumentStore::from_root(&root)
+			.load()
+			.expect_err("excess profile files must fail");
+
+		assert!(error.to_string().contains("more than 256 profile files"), "{error:#}");
+		let _ = fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn store_rejects_oversized_documents_before_save() {
+		let root = temp_root("oversized-document");
+		let store = CoreProfileDocumentStore::from_root(&root);
+		let profile = default_profiles().remove(0);
+		let mut too_many_profiles = CoreProfileDocument::default();
+		too_many_profiles.profiles = (0..=MAX_PROFILE_FILES)
+			.map(|index| CoreProfileDocumentProfile {
+				id: format!("profile-{index}"),
+				..profile.clone()
+			})
+			.collect();
+		assert!(
+			store
+				.save(too_many_profiles)
+				.expect_err("profile limit")
+				.to_string()
+				.contains("more than 256 profiles")
+		);
+
+		let mut too_many_sources = CoreProfileDocument::default();
+		let profile_id = too_many_sources.profiles[0].id.clone();
+		too_many_sources.profile_sources = (0..=MAX_PROFILE_SOURCES)
+			.map(|index| CoreProfileDocumentSource {
+				id: format!("source-{index}"),
+				profile_id: profile_id.clone(),
+				kind: "vmc-osc".to_string(),
+				label: "Source".to_string(),
+				protocol: None,
+				host: None,
+				port: None,
+				mirror_correction_enabled: false,
+			})
+			.collect();
+		assert!(
+			store
+				.save(too_many_sources)
+				.expect_err("source limit")
+				.to_string()
+				.contains("more than 4096 sources")
+		);
+		let _ = fs::remove_dir_all(root);
 	}
 
 	#[test]
