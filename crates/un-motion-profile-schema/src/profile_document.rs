@@ -184,14 +184,22 @@ impl CoreProfileDocumentStore {
 		if !template_dir.is_dir() {
 			return Ok(false);
 		}
+		let _store_lock = self.acquire_store_lock()?;
+		self.recover_profile_transaction()?;
 		if self.conf_path.exists() {
 			return Ok(false);
 		}
 		if has_any_toml(&self.profiles_dir) {
 			return Ok(false);
 		}
-		fs::create_dir_all(&self.profiles_dir)
-			.with_context(|| format!("failed to create user profiles dir {}", self.profiles_dir.display()))?;
+		let root = self.store_root();
+		let next_profiles = root.join(NEXT_PROFILES_DIR);
+		let previous_profiles = root.join(PREVIOUS_PROFILES_DIR);
+		let marker = root.join(PROFILE_TRANSACTION_MARKER);
+		remove_path_if_exists(&next_profiles)?;
+		remove_path_if_exists(&previous_profiles)?;
+		fs::create_dir(&next_profiles)
+			.with_context(|| format!("failed to create staged profiles directory {}", next_profiles.display()))?;
 		let mut copied = false;
 		for entry in fs::read_dir(template_dir)
 			.with_context(|| format!("failed to read template dir {}", template_dir.display()))?
@@ -202,10 +210,29 @@ impl CoreProfileDocumentStore {
 				continue;
 			}
 			let Some(file_name) = path.file_name() else { continue };
-			let dest = self.profiles_dir.join(file_name);
-			fs::copy(&path, &dest).with_context(|| format!("failed to copy {} -> {}", path.display(), dest.display()))?;
+			let dest = next_profiles.join(file_name);
+			let raw = fs::read(&path).with_context(|| format!("failed to read template {}", path.display()))?;
+			atomic_write(&dest, &raw).with_context(|| format!("failed to stage template {} -> {}", path.display(), dest.display()))?;
 			copied = true;
 		}
+		if !copied {
+			remove_path_if_exists(&next_profiles)?;
+			return Ok(false);
+		}
+		atomic_write(&marker, b"prepared\n")?;
+		if self.profiles_dir.exists() {
+			fs::rename(&self.profiles_dir, &previous_profiles).with_context(|| {
+				format!(
+					"failed to preserve profiles {} -> {}",
+					self.profiles_dir.display(),
+					previous_profiles.display()
+				)
+			})?;
+		}
+		fs::rename(&next_profiles, &self.profiles_dir)
+			.with_context(|| format!("failed to install seeded profiles {}", self.profiles_dir.display()))?;
+		remove_path_if_exists(&previous_profiles)?;
+		remove_path_if_exists(&marker)?;
 		Ok(copied)
 	}
 
