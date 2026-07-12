@@ -8,6 +8,8 @@ use rosc::{OscMessage, OscPacket, OscType, decoder};
 const MAX_DATAGRAMS_PER_POLL: usize = 64;
 pub const MAX_VMC_BLENDSHAPES: usize = 1_024;
 pub const MAX_VMC_NAME_BYTES: usize = 256;
+pub const MAX_VMC_BONES_PER_FRAME: usize = 256;
+pub const MAX_VMC_MESSAGES_PER_FRAME: usize = 1_024;
 const MAX_OSC_BUNDLE_DEPTH: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -167,7 +169,7 @@ impl VmcPacketDecoder {
 	}
 
 	fn visit_packet(&mut self, packet: &OscPacket, frame: &mut VmcInputFrame, depth: usize) {
-		if depth > MAX_OSC_BUNDLE_DEPTH {
+		if depth > MAX_OSC_BUNDLE_DEPTH || frame.message_count >= MAX_VMC_MESSAGES_PER_FRAME {
 			return;
 		}
 		match packet {
@@ -175,6 +177,9 @@ impl VmcPacketDecoder {
 			OscPacket::Bundle(bundle) => {
 				for packet in &bundle.content {
 					self.visit_packet(packet, frame, depth + 1);
+					if frame.message_count >= MAX_VMC_MESSAGES_PER_FRAME {
+						break;
+					}
 				}
 			}
 		}
@@ -190,7 +195,11 @@ impl VmcPacketDecoder {
 				frame.root = parse_transform(&message.args);
 			}
 			"/VMC/Ext/Bone/Pos" => {
-				if let Some(transform) = parse_transform(&message.args) {
+				if frame.bones.len() < MAX_VMC_BONES_PER_FRAME
+					&& let Some(transform) = parse_transform(&message.args)
+					&& !transform.name.is_empty()
+					&& transform.name.len() <= MAX_VMC_NAME_BYTES
+				{
 					frame.bones.push(VmcBoneSample {
 						name: transform.name,
 						position: transform.position,
@@ -510,6 +519,32 @@ mod tests {
 		let error = decoder.decode_datagram(&data, 1).expect_err("wire depth must fail");
 
 		assert!(error.to_string().contains("bundle depth exceeds"), "{error:#}");
+	}
+
+	#[test]
+	fn bounds_messages_and_bones_per_frame() {
+		let bone = || {
+			packet_message(
+				"/VMC/Ext/Bone/Pos",
+				vec![
+					OscType::String("Head".to_string()),
+					OscType::Float(0.0),
+					OscType::Float(1.0),
+					OscType::Float(0.0),
+					OscType::Float(0.0),
+					OscType::Float(0.0),
+					OscType::Float(0.0),
+					OscType::Float(1.0),
+				],
+			)
+		};
+		let packet = bundle((0..MAX_VMC_MESSAGES_PER_FRAME + 100).map(|_| bone()).collect());
+		let mut decoder = VmcPacketDecoder::new("bounded-frame");
+
+		let frame = decoder.decode_packet(&packet, 1).expect("bounded frame");
+
+		assert_eq!(frame.message_count, MAX_VMC_MESSAGES_PER_FRAME);
+		assert_eq!(frame.bones.len(), MAX_VMC_BONES_PER_FRAME);
 	}
 
 	#[test]
