@@ -16,7 +16,9 @@ use un_motion_profile_schema::{
 	CoreProfile, CoreProfileDocument, CoreProfileDocumentStore, document_from_profiles, document_profiles, normalize_profile_document,
 };
 
-use crate::runtime_host::{CoreRuntimeHost, CoreRuntimeStatusUpdate, NeutralCalibrationPose, core_runtime_config_from_document};
+use crate::runtime_host::{
+	CoreRuntimeHandle, CoreRuntimeHost, CoreRuntimeStatusUpdate, NeutralCalibrationPose, core_runtime_config_from_document,
+};
 
 pub const DEFAULT_API_WORKER_THREADS: usize = 2;
 
@@ -453,12 +455,8 @@ impl CoreControlState {
 
 	pub async fn calibrate_neutral(&self, valid_sample_count: usize, pose: Option<&str>) -> anyhow::Result<CoreProfileDocument> {
 		let pose = NeutralCalibrationPose::parse(pose)?;
-		let result = {
-			let host = self.inner.runtime_host.lock().map_err(|_| anyhow!("runtime host lock poisoned"))?;
-			host.as_ref()
-				.context("runtime is not running")?
-				.calibrate_neutral(valid_sample_count, pose)?
-		};
+		let handle = self.runtime_handle()?;
+		let result = run_blocking_runtime_operation(move || handle.calibrate_neutral(valid_sample_count, pose)).await?;
 		let document = {
 			let state = self.inner.state.read().await;
 			let mut document = state.profile_document.clone();
@@ -499,12 +497,8 @@ impl CoreControlState {
 	}
 
 	pub async fn build_face_pose_model(&self, valid_sample_count: usize) -> anyhow::Result<CoreProfileDocument> {
-		let result = {
-			let host = self.inner.runtime_host.lock().map_err(|_| anyhow!("runtime host lock poisoned"))?;
-			host.as_ref()
-				.context("runtime is not running")?
-				.build_face_pose_model(valid_sample_count)?
-		};
+		let handle = self.runtime_handle()?;
+		let result = run_blocking_runtime_operation(move || handle.build_face_pose_model(valid_sample_count)).await?;
 		let document = {
 			let state = self.inner.state.read().await;
 			let mut document = state.profile_document.clone();
@@ -529,8 +523,8 @@ impl CoreControlState {
 	}
 
 	pub async fn capture_unmotion_frame(&self) -> anyhow::Result<UNMotionFrame> {
-		let host = self.inner.runtime_host.lock().map_err(|_| anyhow!("runtime host lock poisoned"))?;
-		host.as_ref().context("runtime is not running")?.capture_unmotion_frame()
+		let handle = self.runtime_handle()?;
+		run_blocking_runtime_operation(move || handle.capture_unmotion_frame()).await
 	}
 
 	pub async fn capture_analysis_extras(
@@ -621,6 +615,11 @@ impl CoreControlState {
 
 	fn runtime_host_is_running(&self) -> bool {
 		self.inner.runtime_host.lock().map(|host| host.is_some()).unwrap_or(false)
+	}
+
+	fn runtime_handle(&self) -> anyhow::Result<CoreRuntimeHandle> {
+		let host = self.inner.runtime_host.lock().map_err(|_| anyhow!("runtime host lock poisoned"))?;
+		Ok(host.as_ref().context("runtime is not running")?.handle())
 	}
 
 	async fn stop_runtime_host(&self) -> bool {

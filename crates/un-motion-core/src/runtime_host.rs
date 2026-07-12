@@ -363,6 +363,11 @@ pub(crate) struct CoreRuntimeHost {
 	join: Option<JoinHandle<()>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct CoreRuntimeHandle {
+	control_tx: SyncSender<CoreRuntimeControl>,
+}
+
 impl std::fmt::Debug for CoreRuntimeHost {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_struct("CoreRuntimeHost").finish_non_exhaustive()
@@ -393,6 +398,23 @@ impl CoreRuntimeHost {
 		let _ = self.control_tx.send(CoreRuntimeControl::Stop);
 	}
 
+	pub(crate) fn handle(&self) -> CoreRuntimeHandle {
+		CoreRuntimeHandle {
+			control_tx: self.control_tx.clone(),
+		}
+	}
+
+	pub(crate) fn capture_analysis_extras(&self, output_dir: PathBuf, duration: Duration) -> anyhow::Result<Vec<serde_json::Value>> {
+		self.handle().capture_analysis_extras(output_dir, duration)
+	}
+
+	pub(crate) fn join(mut self) -> thread::Result<()> {
+		self.stop();
+		if let Some(join) = self.join.take() { join.join() } else { Ok(()) }
+	}
+}
+
+impl CoreRuntimeHandle {
 	pub(crate) fn calibrate_neutral(
 		&self,
 		valid_sample_count: usize,
@@ -421,7 +443,7 @@ impl CoreRuntimeHost {
 			.context("UNMotionFrame capture timed out")?
 	}
 
-	pub(crate) fn capture_analysis_extras(&self, output_dir: PathBuf, duration: Duration) -> anyhow::Result<Vec<serde_json::Value>> {
+	fn capture_analysis_extras(&self, output_dir: PathBuf, duration: Duration) -> anyhow::Result<Vec<serde_json::Value>> {
 		fs::create_dir_all(&output_dir).with_context(|| format!("create analysis output dir {}", output_dir.display()))?;
 		let max_samples = analysis_extras_max_samples(duration);
 		let (begin_tx, begin_rx) = mpsc::channel();
@@ -456,11 +478,6 @@ impl CoreRuntimeHost {
 		response_rx
 			.recv_timeout(Duration::from_secs(10))
 			.context("face pose model build timed out")?
-	}
-
-	pub(crate) fn join(mut self) -> thread::Result<()> {
-		self.stop();
-		if let Some(join) = self.join.take() { join.join() } else { Ok(()) }
 	}
 }
 
