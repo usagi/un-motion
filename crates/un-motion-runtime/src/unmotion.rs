@@ -101,7 +101,7 @@ enum MotionFrameStreamWorkerControl {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MotionFrameStreamWorkerMessage {
-	Poll(MotionFrameStreamPoll),
+	Poll(Box<MotionFrameStreamPoll>),
 	Error { stream_id: StreamId, message: String },
 	Stopped { stream_id: StreamId },
 }
@@ -257,7 +257,7 @@ fn run_frame_stream_worker<S>(
 		match worker.poll_once() {
 			Ok(poll) => {
 				let idle = poll.is_idle();
-				if !idle && output_tx.send(MotionFrameStreamWorkerMessage::Poll(poll)).is_err() {
+				if !idle && output_tx.send(MotionFrameStreamWorkerMessage::Poll(Box::new(poll))).is_err() {
 					break;
 				}
 				if idle {
@@ -705,11 +705,11 @@ mod tests {
 		handle.join().expect("join");
 		let stopped = rx.recv_timeout(Duration::from_secs(1)).expect("stopped");
 
-		assert!(matches!(
-			poll,
-			MotionFrameStreamWorkerMessage::Poll(MotionFrameStreamPoll { stream_id, state, .. })
-				if stream_id == StreamId::new("unmotion:stream-5") && state.blendshapes["eyeBlinkLeft"] == 0.6
-		));
+		let MotionFrameStreamWorkerMessage::Poll(poll) = poll else {
+			panic!("expected poll message");
+		};
+		assert_eq!(poll.stream_id, StreamId::new("unmotion:stream-5"));
+		assert_eq!(poll.state.blendshapes["eyeBlinkLeft"], 0.6);
 		assert!(matches!(
 			stopped,
 			MotionFrameStreamWorkerMessage::Stopped { stream_id } if stream_id == StreamId::new("unmotion:stream-5")

@@ -109,7 +109,7 @@ fn open_vmc_receive_source(config: &CoreMotionFrameStreamConfig) -> anyhow::Resu
 	let source_id = format!("vmc-receive:{}", config.profile_stream_id);
 	let source = un_motion_runtime::VmcUnmotionSource::bind(source_id, listen_addr)
 		.with_context(|| format!("VMC receive engine bind failed at {listen_addr}"))?;
-	Ok(CoreMotionFrameSource::VmcReceive(source))
+	Ok(CoreMotionFrameSource::VmcReceive(Box::new(source)))
 }
 
 /// iFacialMocap 受信エンジン (UDP listen) の組み立て。
@@ -135,18 +135,18 @@ fn open_ifacialmocap_receive_source(config: &CoreMotionFrameStreamConfig) -> any
 	let source_id = format!("ifacialmocap-receive:{}", config.profile_stream_id);
 	let source = un_motion_runtime::IfacialMocapUnmotionSource::bind(source_id, listen_addr)
 		.with_context(|| format!("iFacialMocap receive engine bind failed at {listen_addr}"))?;
-	Ok(CoreMotionFrameSource::IfacialMocapReceive(source))
+	Ok(CoreMotionFrameSource::IfacialMocapReceive(Box::new(source)))
 }
 
 pub(crate) enum CoreMotionFrameSource {
-	FileImage(CoreImageMotionFrameSource<FileImageInputSource>),
-	FileVideo(CoreImageMotionFrameSource<FileVideoInputSource>),
-	DirectShow(CoreImageMotionFrameSource<DirectShowWebcamImageInputSource<DirectShowWebcamBackend>>),
+	FileImage(Box<CoreImageMotionFrameSource<FileImageInputSource>>),
+	FileVideo(Box<CoreImageMotionFrameSource<FileVideoInputSource>>),
+	DirectShow(Box<CoreImageMotionFrameSource<DirectShowWebcamImageInputSource<DirectShowWebcamBackend>>>),
 	/// VMC/UDP 受信エンジン (`UNMotionFrame` を直接生成し Modifier →
 	/// [UNMF/Z, VMC/UDP] に流すコンバータ用)。
-	VmcReceive(un_motion_runtime::VmcUnmotionSource),
+	VmcReceive(Box<un_motion_runtime::VmcUnmotionSource>),
 	/// iFacialMocap UDP 受信エンジン (face / eye / blendshape を `UNMotionFrame` に直接変換)。
-	IfacialMocapReceive(un_motion_runtime::IfacialMocapUnmotionSource),
+	IfacialMocapReceive(Box<un_motion_runtime::IfacialMocapUnmotionSource>),
 }
 
 impl MotionFrameSource for CoreMotionFrameSource {
@@ -166,11 +166,11 @@ impl MotionFrameSource for CoreMotionFrameSource {
 		// FPS 表示に使う。VMC / iFacialMocap の受信エンジンに加えて、MediaPipe Native
 		// 系 (FileImage / FileVideo / DirectShow) もハンドルを露出する。
 		match self {
-			Self::FileImage(source) => MotionFrameSource::telemetry_handle(source),
-			Self::FileVideo(source) => MotionFrameSource::telemetry_handle(source),
-			Self::DirectShow(source) => MotionFrameSource::telemetry_handle(source),
-			Self::VmcReceive(source) => MotionFrameSource::telemetry_handle(source),
-			Self::IfacialMocapReceive(source) => MotionFrameSource::telemetry_handle(source),
+			Self::FileImage(source) => MotionFrameSource::telemetry_handle(source.as_ref()),
+			Self::FileVideo(source) => MotionFrameSource::telemetry_handle(source.as_ref()),
+			Self::DirectShow(source) => MotionFrameSource::telemetry_handle(source.as_ref()),
+			Self::VmcReceive(source) => MotionFrameSource::telemetry_handle(source.as_ref()),
+			Self::IfacialMocapReceive(source) => MotionFrameSource::telemetry_handle(source.as_ref()),
 		}
 	}
 }
@@ -549,12 +549,12 @@ fn open_file_image_source(config: &CoreMotionFrameStreamConfig) -> anyhow::Resul
 		.context("file-image Motion frame stream requires inputPath")?;
 	let input = FileImageInputSource::open(file_image_input_config(config, PathBuf::from(path))?)
 		.with_context(|| format!("failed to open file-image input {path}"))?;
-	Ok(Some(CoreMotionFrameSource::FileImage(open_image_source(
+	Ok(Some(CoreMotionFrameSource::FileImage(Box::new(open_image_source(
 		config,
 		input,
 		format!("file-image:{}", config.profile_stream_id),
 		"MediaPipe Native File Image",
-	)?)))
+	)?))))
 }
 
 fn open_file_video_source(config: &CoreMotionFrameStreamConfig) -> anyhow::Result<Option<CoreMotionFrameSource>> {
@@ -564,12 +564,12 @@ fn open_file_video_source(config: &CoreMotionFrameStreamConfig) -> anyhow::Resul
 		.context("file-video Motion frame stream requires inputPath")?;
 	let input = FileVideoInputSource::open(file_video_input_config(config, PathBuf::from(path))?)
 		.with_context(|| format!("failed to open file-video input {path}"))?;
-	Ok(Some(CoreMotionFrameSource::FileVideo(open_image_source(
+	Ok(Some(CoreMotionFrameSource::FileVideo(Box::new(open_image_source(
 		config,
 		input,
 		format!("file-video:{}", config.profile_stream_id),
 		"MediaPipe Native File Video",
-	)?)))
+	)?))))
 }
 
 fn open_directshow_source(config: &CoreMotionFrameStreamConfig) -> anyhow::Result<Option<CoreMotionFrameSource>> {
@@ -587,12 +587,12 @@ fn open_directshow_source(config: &CoreMotionFrameStreamConfig) -> anyhow::Resul
 	let capture_config = DirectShowCaptureConfig::new(width, height, config.input_fps).with_pixel_format(config.input_pixel_format.clone());
 	let backend = DirectShowWebcamBackend::with_capture_config(capture_config);
 	let input = DirectShowWebcamImageInputSource::new(backend, config.device_id.clone());
-	Ok(Some(CoreMotionFrameSource::DirectShow(open_image_source(
+	Ok(Some(CoreMotionFrameSource::DirectShow(Box::new(open_image_source(
 		config,
 		input,
 		format!("webcam-directshow:{}", config.profile_stream_id),
 		"MediaPipe Native DirectShow",
-	)?)))
+	)?))))
 }
 
 fn open_image_source<I>(

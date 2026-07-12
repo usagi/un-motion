@@ -21,6 +21,9 @@ use un_motion_record::MessagePackStreamRecorder;
 use crate::signal_enrich::{enrich_frame_with_signal_derived_motion, frame_needs_signal_derived_motion};
 use crate::{ModifierConfig, ModifierPipeline, vmc_bone_name_to_humanoid_bone};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputDisconnected;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct VmcOutputConfig {
 	pub target_addr: SocketAddr,
@@ -55,13 +58,13 @@ impl VmcOutputConfig {
 pub enum VmcOutputFrame {
 	/// 正式経路: post-process 済み `UNMotionFrame` を受け取り、Modifier 適用後に
 	/// `vmc_packets_for_frame` で OSC bundle に変換して送信する。
-	UnmotionFrame(UNMotionFrame),
+	UnmotionFrame(Box<UNMotionFrame>),
 	SharedUnmotionFrame(Arc<UNMotionFrame>),
 }
 
 impl From<UNMotionFrame> for VmcOutputFrame {
 	fn from(frame: UNMotionFrame) -> Self {
-		Self::UnmotionFrame(frame)
+		Self::UnmotionFrame(Box::new(frame))
 	}
 }
 
@@ -232,11 +235,11 @@ pub struct VmcOutputWorkerHandle {
 }
 
 impl VmcOutputWorkerHandle {
-	pub fn send(&self, frame: impl Into<VmcOutputFrame>) -> Result<bool, ()> {
+	pub fn send(&self, frame: impl Into<VmcOutputFrame>) -> Result<bool, OutputDisconnected> {
 		match self.command_tx.try_send(VmcOutputCommand::Send(frame.into())) {
 			Ok(()) => Ok(true),
 			Err(TrySendError::Full(_)) => Ok(false),
-			Err(TrySendError::Disconnected(_)) => Err(()),
+			Err(TrySendError::Disconnected(_)) => Err(OutputDisconnected),
 		}
 	}
 
@@ -288,7 +291,7 @@ impl FileOutputConfig {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum FileOutputCommand {
-	WriteFrame(UNMotionFrame),
+	WriteFrame(Box<UNMotionFrame>),
 	Flush,
 	Shutdown,
 }
@@ -381,12 +384,14 @@ pub struct FileOutputWorkerHandle {
 }
 
 impl FileOutputWorkerHandle {
-	pub fn write_frame(&self, frame: UNMotionFrame) -> Result<(), ()> {
-		self.command_tx.send(FileOutputCommand::WriteFrame(frame)).map_err(|_| ())
+	pub fn write_frame(&self, frame: UNMotionFrame) -> Result<(), OutputDisconnected> {
+		self.command_tx
+			.send(FileOutputCommand::WriteFrame(Box::new(frame)))
+			.map_err(|_| OutputDisconnected)
 	}
 
-	pub fn flush(&self) -> Result<(), ()> {
-		self.command_tx.send(FileOutputCommand::Flush).map_err(|_| ())
+	pub fn flush(&self) -> Result<(), OutputDisconnected> {
+		self.command_tx.send(FileOutputCommand::Flush).map_err(|_| OutputDisconnected)
 	}
 
 	pub fn shutdown(&self) {
@@ -468,13 +473,13 @@ impl VrcOscOutputConfig {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum VrcOscOutputFrame {
-	UnmotionFrame(UNMotionFrame),
+	UnmotionFrame(Box<UNMotionFrame>),
 	SharedUnmotionFrame(Arc<UNMotionFrame>),
 }
 
 impl From<UNMotionFrame> for VrcOscOutputFrame {
 	fn from(frame: UNMotionFrame) -> Self {
-		Self::UnmotionFrame(frame)
+		Self::UnmotionFrame(Box::new(frame))
 	}
 }
 
@@ -663,11 +668,11 @@ pub struct VrcOscOutputWorkerHandle {
 }
 
 impl VrcOscOutputWorkerHandle {
-	pub fn send(&self, frame: impl Into<VrcOscOutputFrame>) -> Result<bool, ()> {
+	pub fn send(&self, frame: impl Into<VrcOscOutputFrame>) -> Result<bool, OutputDisconnected> {
 		match self.command_tx.try_send(VrcOscOutputCommand::Send(frame.into())) {
 			Ok(()) => Ok(true),
 			Err(TrySendError::Full(_)) => Ok(false),
-			Err(TrySendError::Disconnected(_)) => Err(()),
+			Err(TrySendError::Disconnected(_)) => Err(OutputDisconnected),
 		}
 	}
 
@@ -985,7 +990,7 @@ mod tests {
 		assert_eq!(handle.send(UNMotionFrame::new(1)), Ok(true));
 		assert_eq!(handle.send(UNMotionFrame::new(2)), Ok(false));
 		drop(command_rx);
-		assert_eq!(handle.send(UNMotionFrame::new(3)), Err(()));
+		assert_eq!(handle.send(UNMotionFrame::new(3)), Err(OutputDisconnected));
 	}
 
 	#[test]
@@ -1053,9 +1058,7 @@ mod tests {
 			}),
 		});
 
-		let event = worker
-			.send_frame(VmcOutputFrame::UnmotionFrame(frame))
-			.expect("send unmotion frame");
+		let event = worker.send_frame(VmcOutputFrame::from(frame)).expect("send unmotion frame");
 		assert!(matches!(event, VmcOutputEvent::Sent { datagrams: 1, .. }));
 
 		let messages = recv_messages(&receiver);
@@ -1093,9 +1096,7 @@ mod tests {
 			}],
 		});
 
-		let event = worker
-			.send_frame(VrcOscOutputFrame::UnmotionFrame(frame))
-			.expect("send vrc osc frame");
+		let event = worker.send_frame(VrcOscOutputFrame::from(frame)).expect("send vrc osc frame");
 		assert!(matches!(
 			event,
 			VrcOscOutputEvent::Sent {
@@ -1125,7 +1126,7 @@ mod tests {
 		.expect("worker");
 
 		let event = worker
-			.send_frame(VrcOscOutputFrame::UnmotionFrame(UNMotionFrame::new(1)))
+			.send_frame(VrcOscOutputFrame::from(UNMotionFrame::new(1)))
 			.expect("send empty frame");
 
 		assert!(matches!(
@@ -1184,7 +1185,7 @@ mod tests {
 		let mut worker = VmcOutputWorker::bind(VmcOutputConfig::new(target).with_ok_packet(false).with_modifier(modifier)).expect("worker");
 
 		worker
-			.send_frame(VmcOutputFrame::UnmotionFrame(frame_with_left_hand(
+			.send_frame(VmcOutputFrame::from(frame_with_left_hand(
 				1,
 				Quatf {
 					x: 0.0,
@@ -1197,7 +1198,7 @@ mod tests {
 		let _ = recv_messages(&receiver);
 
 		worker
-			.send_frame(VmcOutputFrame::UnmotionFrame(frame_with_left_hand(
+			.send_frame(VmcOutputFrame::from(frame_with_left_hand(
 				2,
 				Quatf {
 					x: 1.0,
@@ -1264,11 +1265,11 @@ mod tests {
 		)
 		.expect("worker");
 		smooth_worker
-			.send_frame(VmcOutputFrame::UnmotionFrame(finger_frame(1, 0.0)))
+			.send_frame(VmcOutputFrame::from(finger_frame(1, 0.0)))
 			.expect("send first");
 		let _ = recv_messages(&smooth_receiver);
 		smooth_worker
-			.send_frame(VmcOutputFrame::UnmotionFrame(finger_frame(2, 1.0)))
+			.send_frame(VmcOutputFrame::from(finger_frame(2, 1.0)))
 			.expect("send second");
 		let smoothed = right_index_intermediate_z(&recv_messages(&smooth_receiver)).abs();
 
@@ -1276,9 +1277,7 @@ mod tests {
 		raw_receiver.set_read_timeout(Some(Duration::from_millis(500))).expect("timeout");
 		let mut raw_worker =
 			VmcOutputWorker::bind(VmcOutputConfig::new(raw_receiver.local_addr().expect("target")).with_ok_packet(false)).expect("worker");
-		raw_worker
-			.send_frame(VmcOutputFrame::UnmotionFrame(finger_frame(2, 1.0)))
-			.expect("send raw");
+		raw_worker.send_frame(VmcOutputFrame::from(finger_frame(2, 1.0))).expect("send raw");
 		let raw = right_index_intermediate_z(&recv_messages(&raw_receiver)).abs();
 
 		assert!(smoothed > 0.01, "expected smoothed finger to move");
@@ -1306,9 +1305,7 @@ mod tests {
 		});
 
 		// 空の body だが OK packet が無い前提なら何も送らない (packets = 0)。
-		let event = worker
-			.send_frame(VmcOutputFrame::UnmotionFrame(frame))
-			.expect("send unmotion frame");
+		let event = worker.send_frame(VmcOutputFrame::from(frame)).expect("send unmotion frame");
 		assert!(matches!(
 			event,
 			VmcOutputEvent::Sent {
@@ -1352,7 +1349,7 @@ mod tests {
 			}),
 		});
 
-		worker.send_frame(VmcOutputFrame::UnmotionFrame(frame)).expect("send frame");
+		worker.send_frame(VmcOutputFrame::from(frame)).expect("send frame");
 
 		let messages = recv_messages(&receiver);
 		assert!(

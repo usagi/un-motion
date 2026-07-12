@@ -23,6 +23,7 @@ use un_motion_frame::{
 };
 use un_motion_frame_zenoh::{Publisher, TopicMode, ZenohSessionBackend, ZenohTopicStrategy};
 
+use crate::OutputDisconnected;
 use crate::modifier::{ModifierConfig, ModifierPipeline};
 use crate::signal_enrich::enrich_frame_with_signal_derived_motion;
 
@@ -93,13 +94,13 @@ impl ZenohOutputConfig {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ZenohOutputFrame {
-	UnmotionFrame(UNMotionFrame),
+	UnmotionFrame(Box<UNMotionFrame>),
 	SharedUnmotionFrame(Arc<UNMotionFrame>),
 }
 
 impl From<UNMotionFrame> for ZenohOutputFrame {
 	fn from(frame: UNMotionFrame) -> Self {
-		Self::UnmotionFrame(frame)
+		Self::UnmotionFrame(Box::new(frame))
 	}
 }
 
@@ -187,7 +188,7 @@ impl ZenohOutputWorker {
 
 	pub fn send_frame(&mut self, frame: ZenohOutputFrame) -> anyhow::Result<ZenohOutputEvent> {
 		let mut unmotion_frame = match frame {
-			ZenohOutputFrame::UnmotionFrame(frame) => self.finalize_frame(frame),
+			ZenohOutputFrame::UnmotionFrame(frame) => self.finalize_frame(*frame),
 			ZenohOutputFrame::SharedUnmotionFrame(frame) => self.finalize_frame((*frame).clone()),
 		};
 		// MediaPipe Native などの signal-only frame は VMC 出力側では signal fallback で
@@ -369,11 +370,11 @@ pub struct ZenohOutputWorkerHandle {
 }
 
 impl ZenohOutputWorkerHandle {
-	pub fn send(&self, frame: impl Into<ZenohOutputFrame>) -> Result<bool, ()> {
+	pub fn send(&self, frame: impl Into<ZenohOutputFrame>) -> Result<bool, OutputDisconnected> {
 		match self.command_tx.try_send(ZenohOutputCommand::Send(frame.into())) {
 			Ok(()) => Ok(true),
 			Err(TrySendError::Full(_)) => Ok(false),
-			Err(TrySendError::Disconnected(_)) => Err(()),
+			Err(TrySendError::Disconnected(_)) => Err(OutputDisconnected),
 		}
 	}
 

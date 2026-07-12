@@ -4,7 +4,7 @@ use un_motion_mediapipe_native::NativeMediaPipeOutput;
 pub enum MediaPipeRawOutput {
 	#[default]
 	Empty,
-	Native(NativeMediaPipeOutput),
+	Native(Box<NativeMediaPipeOutput>),
 }
 
 impl MediaPipeRawOutput {
@@ -18,6 +18,6 @@ impl MediaPipeRawOutput {
 
 impl From<NativeMediaPipeOutput> for MediaPipeRawOutput {
 	fn from(output: NativeMediaPipeOutput) -> Self {
-		Self::Native(output)
+		Self::Native(Box::new(output))
 	}
 }
