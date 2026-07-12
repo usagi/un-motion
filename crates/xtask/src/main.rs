@@ -22,6 +22,9 @@ use un_motion_frame::{
 use un_motion_frame_zenoh::{Subscriber, TopicMode, ZenohSubscriberBackend, ZenohTopicStrategy};
 use un_motion_input_vmc::{VmcInputFrame, VmcPacketDecoder, VmcTransform};
 
+mod build;
+mod unmf_capture;
+
 fn main() -> Result<()> {
 	let repo = repo_root()?;
 	let mut args = env::args_os().skip(1);
@@ -33,7 +36,7 @@ fn main() -> Result<()> {
 		"fmt" => cargo_simple(&repo, "fmt", ["fmt", "--all"]),
 		"check" => cargo_simple(&repo, "check", ["check", "--workspace"]),
 		"test" => cargo_simple(&repo, "test", ["test", "--workspace"]),
-		"build" => build(&repo, args.collect()),
+		"build" => build::run_build(&repo, args.collect()),
 		"frontend" => frontend(&repo, args.collect()),
 		"core" => core(&repo, args.collect()),
 		"make-release-package" => make_release_package(&repo, args.collect()),
@@ -55,56 +58,6 @@ fn main() -> Result<()> {
 
 fn cargo_simple<const N: usize>(repo: &Path, label: &str, args: [&str; N]) -> Result<()> {
 	run(repo, "cargo", args).with_context(|| format!("cargo xtask {label} failed"))
-}
-
-#[derive(Debug)]
-struct BuildArgs {
-	release: bool,
-}
-
-fn build(repo: &Path, raw_args: Vec<OsString>) -> Result<()> {
-	let args = parse_build_args(raw_args)?;
-	build_binaries(repo, args.release)
-}
-
-fn parse_build_args(raw_args: Vec<OsString>) -> Result<BuildArgs> {
-	let mut release = false;
-	for arg in raw_args {
-		match arg.to_string_lossy().as_ref() {
-			"--release" => release = true,
-			"--help" | "-h" | "help" => {
-				print_build_usage();
-				std::process::exit(0);
-			}
-			other => bail!("unknown build option: {other}"),
-		}
-	}
-	Ok(BuildArgs { release })
-}
-
-fn build_binaries(repo: &Path, release: bool) -> Result<()> {
-	run(repo.join("apps/un-motion-supervisor"), "npm", ["run", "build"])?;
-	cargo_build_package(repo, release, "un-motion-core", "un-motion-core")?;
-	cargo_build_package(repo, release, "un-motion-capturer", "un-motion-capturer")?;
-	cargo_build_package(repo, release, "un-motion-supervisor", "un-motion-supervisor")?;
-	Ok(())
-}
-
-fn cargo_build_package(repo: &Path, release: bool, package: &str, bin: &str) -> Result<()> {
-	let mut cmd = Command::new(resolve_tool("cargo"));
-	cmd.current_dir(repo).arg("build");
-	if release {
-		cmd.arg("--release");
-	}
-	cmd.args(["-p", package, "--bin", bin]);
-	run_command(
-		&format!("cargo build{} -p {package} --bin {bin}", if release { " --release" } else { "" }),
-		&mut cmd,
-	)
-}
-
-fn print_build_usage() {
-	eprintln!("usage: cargo xtask build [--release]");
 }
 
 #[derive(Debug)]
@@ -1866,7 +1819,7 @@ fn make_release_package(repo: &Path, raw_args: Vec<OsString>) -> Result<()> {
 	let staging_dir = staging_root.join(&package_name);
 
 	if !args.skip_build {
-		build_binaries(repo, true)?;
+		build::build_binaries(repo, true)?;
 	}
 
 	fs::create_dir_all(&output_dir).with_context(|| format!("failed to create {}", output_dir.display()))?;
@@ -4735,7 +4688,7 @@ fn unmf(repo: &Path, args: Vec<OsString>) -> Result<()> {
 		bail!("missing unmf subcommand");
 	};
 	match subcommand.to_string_lossy().as_ref() {
-		"capture-frame" | "capture" | "frame" => unmf_capture_frame(repo, args[1..].to_vec()),
+		"capture-frame" | "capture" | "frame" => unmf_capture::run(repo, args[1..].to_vec()),
 		"stability" | "stability-report" => unmf_stability_report(repo, args[1..].to_vec()),
 		"noise" | "noise-report" => unmf_noise_report(repo, args[1..].to_vec()),
 		"--help" | "-h" | "help" => {
@@ -4872,61 +4825,6 @@ fn unmf_noise_report(repo: &Path, raw_args: Vec<OsString>) -> Result<()> {
 	println!("wrote {}", output.display());
 	println!("wrote {}", markdown.display());
 	Ok(())
-}
-
-fn unmf_capture_frame(repo: &Path, raw_args: Vec<OsString>) -> Result<()> {
-	let args = parse_unmf_capture_frame_args(raw_args)?;
-	let strategy = ZenohTopicStrategy::new(args.base_key_expr.clone(), args.topic_mode);
-	let subscribe_key_expr = strategy.subscribe_key_expr();
-	let mut backend = ZenohSubscriberBackend::open_default().context("UNMF/Z capture Zenoh open failed")?;
-	let subscriber =
-		Subscriber::declare(&mut backend, strategy).with_context(|| format!("UNMF/Z capture subscribe failed on {subscribe_key_expr}"))?;
-	let started = Instant::now();
-	let frame = loop {
-		if started.elapsed() >= args.timeout {
-			bail!(
-				"UNMF/Z capture timed out after {} ms on {subscribe_key_expr}",
-				args.timeout.as_millis()
-			);
-		}
-		match subscriber.recv_frame_timeout(Duration::from_millis(50)) {
-			Ok(Some(frame)) => {
-				if !unmf_capture_frame_matches(&frame, &args) {
-					continue;
-				}
-				break frame;
-			}
-			Ok(None) => {}
-			Err(error) => eprintln!("UNMF/Z capture decode error: {error}"),
-		}
-	};
-	let output_path = absolutize(repo, &args.output);
-	if let Some(parent) = output_path.parent() {
-		fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-	}
-	let json = serde_json::to_string_pretty(&frame)?;
-	fs::write(&output_path, format!("{json}\n")).with_context(|| format!("failed to write {}", output_path.display()))?;
-	println!("captured UNMotionFrame from {} to {}", subscribe_key_expr, output_path.display());
-	Ok(())
-}
-
-fn unmf_capture_frame_matches(frame: &UNMotionFrame, args: &UnmfCaptureFrameArgs) -> bool {
-	if let Some(stream_id) = args.stream_id.as_deref()
-		&& frame.header.stream_id.as_deref() != Some(stream_id)
-	{
-		return false;
-	}
-	if args.require_body_bones {
-		let body_bones = frame
-			.body
-			.as_ref()
-			.and_then(|body| body.humanoid.as_ref())
-			.map_or(0, |humanoid| humanoid.bones.len());
-		if body_bones == 0 {
-			return false;
-		}
-	}
-	true
 }
 
 fn parse_unmf_noise_args(raw_args: Vec<OsString>) -> Result<UnmfNoiseArgs> {
@@ -6017,16 +5915,6 @@ struct UnmfStabilityArgs {
 	read_timeout: Duration,
 	output: Option<PathBuf>,
 	min_samples: usize,
-}
-
-#[derive(Debug)]
-struct UnmfCaptureFrameArgs {
-	base_key_expr: String,
-	topic_mode: TopicMode,
-	stream_id: Option<String>,
-	require_body_bones: bool,
-	timeout: Duration,
-	output: PathBuf,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -7406,57 +7294,6 @@ fn parse_unmf_stability_args(raw_args: Vec<OsString>) -> Result<UnmfStabilityArg
 	Ok(args)
 }
 
-fn parse_unmf_capture_frame_args(raw_args: Vec<OsString>) -> Result<UnmfCaptureFrameArgs> {
-	let mut args = UnmfCaptureFrameArgs {
-		base_key_expr: "un-motion/frame".to_string(),
-		topic_mode: TopicMode::Frame,
-		stream_id: None,
-		require_body_bones: false,
-		timeout: Duration::from_secs(5),
-		output: PathBuf::from("target/unmf-captures/frame.json"),
-	};
-	let mut iter = raw_args.into_iter();
-	while let Some(arg) = iter.next() {
-		match arg.to_string_lossy().as_ref() {
-			"--key" | "--base-key" | "--base-key-expr" => {
-				args.base_key_expr = next_value(&mut iter, "--key")?.to_string_lossy().into_owned()
-			}
-			"--topic-mode" | "--mode" => {
-				let value = next_value(&mut iter, "--topic-mode")?.to_string_lossy().into_owned();
-				args.topic_mode = parse_unmf_topic_mode(&value)?;
-			}
-			"--stream-id" => {
-				args.stream_id = Some(next_value(&mut iter, "--stream-id")?.to_string_lossy().into_owned());
-			}
-			"--require-body-bones" => args.require_body_bones = true,
-			"--timeout-ms" => {
-				args.timeout = Duration::from_millis(
-					next_value(&mut iter, "--timeout-ms")?
-						.to_string_lossy()
-						.parse::<u64>()
-						.context("invalid --timeout-ms")?,
-				);
-			}
-			"--output" | "-o" => args.output = PathBuf::from(next_value(&mut iter, "--output")?),
-			"--help" | "-h" => {
-				eprintln!(
-					"usage: cargo xtask unmf capture-frame [--key un-motion/frame] [--topic-mode frame|by-primary-source|by-stream-id] [--stream-id id] [--require-body-bones] [--output frame.json] [--timeout-ms 5000]"
-				);
-				std::process::exit(0);
-			}
-			other if !other.starts_with('-') => args.base_key_expr = other.to_string(),
-			other => bail!("unexpected unmf capture-frame argument: {other}"),
-		}
-	}
-	if args.base_key_expr.trim().is_empty() {
-		bail!("--key must not be empty");
-	}
-	if args.timeout.is_zero() {
-		bail!("--timeout-ms must be greater than 0");
-	}
-	Ok(args)
-}
-
 fn parse_unmf_topic_mode(value: &str) -> Result<TopicMode> {
 	match value {
 		"frame" => Ok(TopicMode::Frame),
@@ -7791,7 +7628,7 @@ mod tests {
 
 	#[test]
 	fn parse_build_args_accepts_release() {
-		let args = parse_build_args(vec!["--release".into()]).unwrap();
+		let args = build::parse_args(vec!["--release".into()]).unwrap();
 		assert!(args.release);
 	}
 
