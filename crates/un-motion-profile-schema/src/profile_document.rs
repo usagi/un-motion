@@ -209,11 +209,7 @@ impl CoreProfileDocumentStore {
 		Ok(copied)
 	}
 
-	pub fn load(&self) -> CoreProfileDocument {
-		self.try_load().unwrap_or_else(|_| CoreProfileDocument::default())
-	}
-
-	pub fn try_load(&self) -> anyhow::Result<CoreProfileDocument> {
+	pub fn load(&self) -> anyhow::Result<CoreProfileDocument> {
 		let _store_lock = self.acquire_store_lock()?;
 		self.recover_profile_transaction()?;
 		Ok(self.load_unlocked())
@@ -928,7 +924,7 @@ mod tests {
 			})
 			.expect("save colliding profiles");
 
-		let loaded = store.load();
+		let loaded = store.load().expect("load profiles");
 		assert_eq!(loaded.profiles.len(), 2);
 		assert!(loaded.profiles.iter().any(|profile| profile.id == "profile-a"));
 		assert!(loaded.profiles.iter().any(|profile| profile.id == "profile-b"));
@@ -973,7 +969,7 @@ mirrorCorrectionEnabled = true
 		)
 		.expect("profile");
 
-		let document = CoreProfileDocumentStore::from_root(&root).load();
+		let document = CoreProfileDocumentStore::from_root(&root).load().expect("load profile document");
 
 		assert_eq!(document.selected_profile_id, "waidayo");
 		assert_eq!(document.profiles[0].name, "Waidayo");
@@ -1028,7 +1024,7 @@ mirrorCorrectionEnabled = true
 			.replace("id = \"p2\"", "id = \"stale\"")
 			.replace("name = \"Profile 2\"", "name = \"Stale\"");
 		fs::write(root.join("profiles/stale.toml"), stale).expect("simulate stale profile after metadata commit");
-		let reloaded = store.load();
+		let reloaded = store.load().expect("reload profile document");
 		assert_eq!(
 			reloaded.profiles.iter().map(|profile| profile.id.as_str()).collect::<Vec<_>>(),
 			vec!["p2"]
@@ -1053,7 +1049,7 @@ mirrorCorrectionEnabled = true
 		.expect("next conf");
 		fs::write(root.join(PROFILE_TRANSACTION_MARKER), "prepared\n").expect("marker");
 
-		let loaded = store.load();
+		let loaded = store.load().expect("recover profile document");
 
 		assert_eq!(loaded.selected_profile_id, "new");
 		assert_eq!(
@@ -1074,7 +1070,7 @@ mirrorCorrectionEnabled = true
 		let (tx, rx) = std::sync::mpsc::channel();
 		let load_root = root.clone();
 		let join = std::thread::spawn(move || {
-			let result = CoreProfileDocumentStore::from_root(load_root).try_load();
+			let result = CoreProfileDocumentStore::from_root(load_root).load();
 			tx.send(result).expect("send load result");
 		});
 
@@ -1086,6 +1082,17 @@ mirrorCorrectionEnabled = true
 				.is_ok()
 		);
 		join.join().expect("load thread");
+	}
+
+	#[test]
+	fn store_load_propagates_recovery_errors() {
+		let root = temp_root("profile-recovery-error");
+		fs::write(root.join(PROFILE_TRANSACTION_MARKER), "prepared\n").expect("marker");
+		fs::create_dir(root.join(NEXT_CONF_FILE)).expect("invalid staged conf directory");
+
+		let error = CoreProfileDocumentStore::from_root(&root).load().expect_err("recovery must fail");
+
+		assert!(error.to_string().contains("failed to read staged conf"));
 	}
 
 	#[test]
@@ -1179,7 +1186,7 @@ mirrorCorrectionEnabled = true
 				.expect("conf")
 				.contains("active_profile_id = \"\"")
 		);
-		let loaded = store.load();
+		let loaded = store.load().expect("load empty profile document");
 		assert!(loaded.profiles.is_empty());
 		assert_eq!(loaded.selected_profile_id, "");
 	}
@@ -1200,7 +1207,7 @@ mirrorCorrectionEnabled = true
 			})
 			.expect("save");
 
-		let loaded = store.load();
+		let loaded = store.load().expect("load ordered profiles");
 
 		assert_eq!(
 			loaded.profiles.iter().map(|profile| profile.id.as_str()).collect::<Vec<_>>(),
@@ -1237,7 +1244,7 @@ headEnabled = true
 		)
 		.expect("profile");
 		let store = CoreProfileDocumentStore::from_root(&root);
-		let document = store.load();
+		let document = store.load().expect("load nested runtime selection");
 
 		assert_eq!(
 			document.profiles[0].runtime_selection.as_ref().and_then(|settings| settings.fps),

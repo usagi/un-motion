@@ -368,6 +368,10 @@ fn user_profile_store() -> CoreProfileDocumentStore {
 	store
 }
 
+fn load_profile_document(store: &CoreProfileDocumentStore) -> Result<CoreProfileDocument, String> {
+	store.load().map_err(|error| format!("load profile document: {error}"))
+}
+
 fn profile_path_for_id(id: &str) -> PathBuf {
 	let profiles_dir = user_profile_store().profiles_dir().to_path_buf();
 	if let Ok(entries) = fs::read_dir(&profiles_dir) {
@@ -922,7 +926,7 @@ fn build_capturer_face_pose_model(
 fn save_profile_from_capturer_selection(profile_id: &str, capturer_document: CoreProfileDocument) -> Result<CoreProfileDocument, String> {
 	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
-	let user_document = merge_profile_from_capturer_selection(profile_id, store.load(), capturer_document)?;
+	let user_document = merge_profile_from_capturer_selection(profile_id, load_profile_document(&store)?, capturer_document)?;
 	store.save(user_document).map_err(|error| error.to_string())
 }
 
@@ -1838,7 +1842,8 @@ struct ProfileDocumentEnvelope {
 /// 瞬間に古い順序を返すことがあるため、ここでは UI の表示順に使わない。
 #[tauri::command]
 fn list_profiles(_state: State<'_, Mutex<SupervisorState>>) -> Result<Vec<ProfileSummary>, String> {
-	Ok(user_profile_store().load().profiles_summary())
+	let store = user_profile_store();
+	Ok(load_profile_document(&store)?.profiles_summary())
 }
 
 /// Supervisor Console の前回選択 profile id を返す。
@@ -1846,7 +1851,8 @@ fn list_profiles(_state: State<'_, Mutex<SupervisorState>>) -> Result<Vec<Profil
 /// これは Launch UI の復元用であり、稼働中 Capturer の runtime state ではない。
 #[tauri::command]
 fn selected_profile_id(_state: State<'_, Mutex<SupervisorState>>) -> Result<String, String> {
-	Ok(user_profile_store().load().selected_profile_id)
+	let store = user_profile_store();
+	Ok(load_profile_document(&store)?.selected_profile_id)
 }
 
 /// Supervisor Console の前回選択 profile id を保存する。
@@ -1857,7 +1863,7 @@ fn selected_profile_id(_state: State<'_, Mutex<SupervisorState>>) -> Result<Stri
 fn set_selected_profile_id(profile_id: Option<String>, _state: State<'_, Mutex<SupervisorState>>) -> Result<(), String> {
 	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
-	let mut doc = store.load();
+	let mut doc = load_profile_document(&store)?;
 	let normalized = profile_id
 		.map(|value| value.trim().to_string())
 		.filter(|value| !value.is_empty())
@@ -1886,7 +1892,7 @@ fn create_profile(name: String, _state: State<'_, Mutex<SupervisorState>>) -> Re
 		trimmed.to_string()
 	};
 	let store = user_profile_store();
-	let mut doc = store.load();
+	let mut doc = load_profile_document(&store)?;
 	let id = next_profile_id(&doc, &name);
 	let new_profile = CoreProfileDocumentProfile {
 		id: id.clone(),
@@ -1957,7 +1963,7 @@ fn new_profile_runtime_defaults() -> ProfileRuntimeSettings {
 fn delete_profile(profile_id: String, state: State<'_, Mutex<SupervisorState>>) -> Result<(), String> {
 	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
-	let mut doc = store.load();
+	let mut doc = load_profile_document(&store)?;
 	if !doc.profiles.iter().any(|profile| profile.id == profile_id) {
 		return Err(format!("profile not found: {profile_id}"));
 	}
@@ -1989,7 +1995,7 @@ fn delete_profile(profile_id: String, state: State<'_, Mutex<SupervisorState>>) 
 fn duplicate_profile(profile_id: String, _state: State<'_, Mutex<SupervisorState>>) -> Result<ProfileDetail, String> {
 	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
-	let mut doc = store.load();
+	let mut doc = load_profile_document(&store)?;
 	let original = doc
 		.profiles
 		.iter()
@@ -2019,7 +2025,7 @@ fn duplicate_profile(profile_id: String, _state: State<'_, Mutex<SupervisorState
 fn reorder_profiles(profile_ids: Vec<String>, _state: State<'_, Mutex<SupervisorState>>) -> Result<Vec<ProfileSummary>, String> {
 	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
-	let mut doc = store.load();
+	let mut doc = load_profile_document(&store)?;
 	let mut ordered = Vec::with_capacity(doc.profiles.len());
 	for id in &profile_ids {
 		if let Some(index) = doc.profiles.iter().position(|profile| &profile.id == id) {
@@ -2035,7 +2041,8 @@ fn reorder_profiles(profile_ids: Vec<String>, _state: State<'_, Mutex<Supervisor
 /// Profile の詳細フィールドを GUI 用 DTO で返す。
 #[tauri::command]
 fn get_profile_detail(profile_id: String) -> Result<ProfileDetail, String> {
-	let doc = user_profile_store().load();
+	let store = user_profile_store();
+	let doc = load_profile_document(&store)?;
 	doc.profiles
 		.iter()
 		.find(|profile| profile.id == profile_id)
@@ -2055,7 +2062,7 @@ fn update_profile_field(
 ) -> Result<ProfileDetail, String> {
 	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
-	let mut doc = store.load();
+	let mut doc = load_profile_document(&store)?;
 	{
 		let profile = doc
 			.profiles

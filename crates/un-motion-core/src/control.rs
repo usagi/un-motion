@@ -239,7 +239,7 @@ impl CoreControlState {
 
 	pub fn from_workspace() -> anyhow::Result<Self> {
 		let store = CoreProfileDocumentStore::from_workspace();
-		Ok(Self::from_profile_document(store.load(), Some(store)))
+		Ok(Self::from_profile_document(store.load()?, Some(store)))
 	}
 
 	pub fn from_profile_document(profile_document: CoreProfileDocument, profile_store: Option<CoreProfileDocumentStore>) -> Self {
