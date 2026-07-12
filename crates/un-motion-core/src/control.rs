@@ -292,7 +292,7 @@ impl CoreControlState {
 		} else {
 			normalize_profile_document(profile_document)
 		};
-		let was_running = self.stop_runtime_host();
+		let was_running = self.stop_runtime_host().await;
 		{
 			let mut state = self.inner.state.write().await;
 			state.profiles = document_profiles(&normalized);
@@ -343,7 +343,7 @@ impl CoreControlState {
 		let should_restart =
 			was_running && (normalized.selected_profile_id != current_active_profile_id || old_active_profile != new_active_profile);
 		if should_restart {
-			self.stop_runtime_host();
+			self.stop_runtime_host().await;
 		}
 		{
 			let mut state = self.inner.state.write().await;
@@ -434,7 +434,7 @@ impl CoreControlState {
 
 	pub async fn stop_runtime(&self) -> RuntimeStatus {
 		let _mutation = self.inner.mutation.lock().await;
-		self.stop_runtime_host();
+		self.stop_runtime_host().await;
 		let status = {
 			let mut state = self.inner.state.write().await;
 			state.status.running = false;
@@ -570,7 +570,7 @@ impl CoreControlState {
 		} else {
 			normalize_profile_document(document)
 		};
-		let was_running = self.stop_runtime_host();
+		let was_running = self.stop_runtime_host().await;
 		let status = {
 			let mut state = self.inner.state.write().await;
 			state.profiles = document_profiles(&normalized);
@@ -619,10 +619,10 @@ impl CoreControlState {
 		self.inner.runtime_host.lock().map(|host| host.is_some()).unwrap_or(false)
 	}
 
-	fn stop_runtime_host(&self) -> bool {
+	async fn stop_runtime_host(&self) -> bool {
 		let host = self.inner.runtime_host.lock().ok().and_then(|mut host| host.take());
 		if let Some(host) = host {
-			let _ = host.join();
+			let _ = tokio::task::spawn_blocking(move || host.join()).await;
 			true
 		} else {
 			false
