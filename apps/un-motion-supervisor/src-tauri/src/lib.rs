@@ -1119,10 +1119,11 @@ fn capture_unmf_frames_from_capturer(
 		SnapshotDuration::OneSecond | SnapshotDuration::ThreeSeconds => {
 			let started = Instant::now();
 			let mut frames = Vec::new();
+			let mut last_sequence = None;
 			while started.elapsed() < Duration::from_millis(duration.capture_duration_ms()) {
 				let frame = capture_unmf_pose_from_capturer(http_client, bind_addr)?;
-				frames.push(frame);
-				std::thread::sleep(Duration::from_millis(10));
+				let inserted = push_snapshot_if_new(&mut frames, frame, &mut last_sequence);
+				std::thread::sleep(Duration::from_millis(if inserted { 10 } else { 20 }));
 			}
 			if frames.is_empty() {
 				frames.push(capture_unmf_pose_from_capturer(http_client, bind_addr)?);
@@ -1130,6 +1131,21 @@ fn capture_unmf_frames_from_capturer(
 			Ok(frames)
 		}
 	}
+}
+
+fn push_snapshot_if_new(frames: &mut Vec<serde_json::Value>, frame: serde_json::Value, last_sequence: &mut Option<u64>) -> bool {
+	let sequence = frame
+		.get("header")
+		.and_then(|header| header.get("sequence"))
+		.and_then(serde_json::Value::as_u64);
+	if sequence.is_some() && sequence == *last_sequence {
+		return false;
+	}
+	if sequence.is_some() {
+		*last_sequence = sequence;
+	}
+	frames.push(frame);
+	true
 }
 
 fn response_error(method: &str, url: &str, response: reqwest::blocking::Response) -> String {
@@ -4057,6 +4073,30 @@ mod tests {
 			&["Address already in use (os error 10048)".to_string()]
 		));
 		assert!(!capturer_bind_conflict("profile parse failed", &["invalid profile".to_string()]));
+	}
+
+	#[test]
+	fn snapshot_capture_deduplicates_sequences() {
+		let mut frames = Vec::new();
+		let mut last_sequence = None;
+
+		assert!(push_snapshot_if_new(
+			&mut frames,
+			json!({ "header": { "sequence": 7 } }),
+			&mut last_sequence
+		));
+		assert!(!push_snapshot_if_new(
+			&mut frames,
+			json!({ "header": { "sequence": 7 } }),
+			&mut last_sequence
+		));
+		assert!(push_snapshot_if_new(
+			&mut frames,
+			json!({ "header": { "sequence": 8 } }),
+			&mut last_sequence
+		));
+
+		assert_eq!(frames.len(), 2);
 	}
 
 	#[test]
