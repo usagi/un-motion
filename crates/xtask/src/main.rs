@@ -217,10 +217,10 @@ fn default_un_motion_config_dir() -> PathBuf {
 	if let Some(path) = env::var_os("UN_MOTION_CONFIG_DIR") {
 		return PathBuf::from(path);
 	}
-	if cfg!(windows) {
-		if let Some(path) = env::var_os("APPDATA") {
-			return PathBuf::from(path).join("UN Motion");
-		}
+	if cfg!(windows)
+		&& let Some(path) = env::var_os("APPDATA")
+	{
+		return PathBuf::from(path).join("UN Motion");
 	}
 	if let Some(path) = env::var_os("XDG_CONFIG_HOME") {
 		return PathBuf::from(path).join("un-motion");
@@ -1651,6 +1651,7 @@ fn wait_for_vmc_compare_output_start(
 	bail!("external VMC compare produced no core output before timeout; forwarded datagrams={forwarded}")
 }
 
+#[allow(clippy::unnecessary_unwrap)]
 fn wait_for_vmc_mirror_smoke_output(socket: &UdpSocket, timeout: Duration) -> Result<VmcMirrorSmokeOutput> {
 	let deadline = Instant::now() + timeout;
 	let mut buf = [0_u8; 65535];
@@ -1789,6 +1790,7 @@ fn smoke_vmc_mirror_datagram() -> Result<Vec<u8>> {
 	.context("failed to encode VMC mirror smoke datagram")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn vmc_transform_packet(addr: &str, name: &str, px: f32, py: f32, pz: f32, rx: f32, ry: f32, rz: f32, rw: f32) -> OscPacket {
 	OscPacket::Message(OscMessage {
 		addr: addr.to_string(),
@@ -2533,6 +2535,7 @@ fn penn_action_desktop_config_toml(sequence: &str, video: &Path, ffmpeg: &Path, 
 	desktop_file_video_config_toml(&id, &label, &source_id, video, ffmpeg, width, height, fps, repeat)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn desktop_file_video_config_toml(
 	input_id: &str,
 	source_label: &str,
@@ -2807,6 +2810,7 @@ fn contains_ascii(haystack: &[u8], needle: &[u8]) -> bool {
 	!needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_penn_action_videos(
 	repo: &Path,
 	frames_dir: &Path,
@@ -2996,12 +3000,12 @@ fn find_tool(program: &str) -> Result<OsString> {
 	let mut cmd = Command::new(if cfg!(windows) { "where" } else { "which" });
 	cmd.arg(&tool);
 	let output = cmd.output().with_context(|| format!("failed to locate {program}"))?;
-	if output.status.success() {
-		if let Some(first) = String::from_utf8_lossy(&output.stdout).lines().next() {
-			let value = first.trim();
-			if !value.is_empty() {
-				return Ok(OsString::from(value));
-			}
+	if output.status.success()
+		&& let Some(first) = String::from_utf8_lossy(&output.stdout).lines().next()
+	{
+		let value = first.trim();
+		if !value.is_empty() {
+			return Ok(OsString::from(value));
 		}
 	}
 	bail!("{program} was not found on PATH")
@@ -3432,20 +3436,20 @@ fn check_pose_fixture_signal(fixture: &PoseFixtureSpec, signal: &str, value: Opt
 		}
 		return Ok(());
 	};
-	if let Some(max_abs) = fixture.max_abs_for_signal(signal) {
-		if value.abs() > max_abs {
-			bail!("{}: {signal} {value:.3} exceeds ±{max_abs:.3}", fixture.file);
-		}
+	if let Some(max_abs) = fixture.max_abs_for_signal(signal)
+		&& value.abs() > max_abs
+	{
+		bail!("{}: {signal} {value:.3} exceeds ±{max_abs:.3}", fixture.file);
 	}
-	if let Some(min) = fixture.min_for_signal(signal) {
-		if value < min {
-			bail!("{}: {signal} {value:.3} is below {min:.3}", fixture.file);
-		}
+	if let Some(min) = fixture.min_for_signal(signal)
+		&& value < min
+	{
+		bail!("{}: {signal} {value:.3} is below {min:.3}", fixture.file);
 	}
-	if let Some(max) = fixture.max_for_signal(signal) {
-		if value > max {
-			bail!("{}: {signal} {value:.3} is above {max:.3}", fixture.file);
-		}
+	if let Some(max) = fixture.max_for_signal(signal)
+		&& value > max
+	{
+		bail!("{}: {signal} {value:.3} is above {max:.3}", fixture.file);
 	}
 	Ok(())
 }
@@ -4004,6 +4008,7 @@ fn ensure_download(repo: &Path, label: &str, url: &str, out: &Path) -> Result<()
 	run_command(&format!("download {label}"), &mut cmd)
 }
 
+#[allow(clippy::permissions_set_readonly_false)]
 fn copy_replacing_file(source: &Path, destination: &Path) -> Result<()> {
 	if destination.exists() {
 		let metadata = fs::metadata(destination).with_context(|| format!("failed to inspect {}", destination.display()))?;
@@ -4391,12 +4396,12 @@ fn find_python() -> Result<PathBuf> {
 	let mut cmd = Command::new(if cfg!(windows) { "where" } else { "which" });
 	cmd.arg("python");
 	let output = cmd.output().context("failed to locate python")?;
-	if output.status.success() {
-		if let Some(first) = String::from_utf8_lossy(&output.stdout).lines().next() {
-			let path = PathBuf::from(first.trim());
-			if path.exists() {
-				return Ok(path);
-			}
+	if output.status.success()
+		&& let Some(first) = String::from_utf8_lossy(&output.stdout).lines().next()
+	{
+		let path = PathBuf::from(first.trim());
+		if path.exists() {
+			return Ok(path);
 		}
 	}
 	bail!("could not find a runnable Python executable for Bazel")
@@ -5041,7 +5046,7 @@ fn analyze_unmf_noise_images(paths: &[PathBuf], spectral_points: usize) -> Resul
 			adjacent.observe(previous, &luma, width as usize, height as usize);
 		}
 		previous_luma = Some(luma);
-		if frames.saturating_sub(1) % high_frequency_stride == 0 {
+		if frames.saturating_sub(1).is_multiple_of(high_frequency_stride) {
 			high_frequency.push(unmf_noise_high_frequency_residual(&image));
 		}
 		if let Some(timestamp) = parse_unmf_noise_timestamp_ns(path) {
@@ -5531,8 +5536,8 @@ fn unmf_noise_landmark_report(frames: Vec<Vec<[f64; 3]>>) -> Option<UnmfNoiseLan
 	}
 	let mut deltas = Vec::new();
 	for pair in frames.windows(2) {
-		for point in 0..points {
-			deltas.push(distance3(pair[0][point], pair[1][point]));
+		for (&previous, &current) in pair[0].iter().zip(&pair[1]).take(points) {
+			deltas.push(distance3(previous, current));
 		}
 	}
 	let mut ranked = point_std.iter().copied().enumerate().collect::<Vec<_>>();
@@ -6785,10 +6790,10 @@ fn observe_unmf_metadata_notes(
 						.or_insert_with(|| QualityStats::new(score));
 				}
 			}
-		} else if let Some(rest) = note.strip_prefix("mediapipe.stability ") {
-			if let Some((scope, state)) = rest.split_once('=') {
-				increment_unmf_state_count(notes, scope, state);
-			}
+		} else if let Some(rest) = note.strip_prefix("mediapipe.stability ")
+			&& let Some((scope, state)) = rest.split_once('=')
+		{
+			increment_unmf_state_count(notes, scope, state);
 		}
 	}
 }

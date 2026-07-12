@@ -1359,14 +1359,13 @@ impl SnapshotAnalysisStats {
 		let mut items = self
 			.channels
 			.iter()
-			.filter_map(|(name, stats)| {
-				(stats.max_abs_delta > 0.0).then(|| {
-					serde_json::json!({
-						"name": name,
-						"maxAbsDelta": stats.max_abs_delta,
-						"meanAbsDelta": stats.mean_abs_delta(),
-						"stddev": stats.stddev(),
-					})
+			.filter(|&(_name, stats)| stats.max_abs_delta > 0.0)
+			.map(|(name, stats)| {
+				serde_json::json!({
+					"name": name,
+					"maxAbsDelta": stats.max_abs_delta,
+					"meanAbsDelta": stats.mean_abs_delta(),
+					"stddev": stats.stddev(),
 				})
 			})
 			.collect::<Vec<_>>();
@@ -1379,15 +1378,14 @@ impl SnapshotAnalysisStats {
 		let mut items = self
 			.rotations
 			.iter()
-			.filter_map(|(name, stats)| {
-				(stats.max_delta_rad > 0.0).then(|| {
-					serde_json::json!({
-						"name": name,
-						"maxDeltaRad": stats.max_delta_rad,
-						"meanDeltaRad": stats.mean_delta_rad(),
-						"maxDeltaDeg": stats.max_delta_rad.to_degrees(),
-						"meanDeltaDeg": stats.mean_delta_rad().to_degrees(),
-					})
+			.filter(|&(_name, stats)| stats.max_delta_rad > 0.0)
+			.map(|(name, stats)| {
+				serde_json::json!({
+					"name": name,
+					"maxDeltaRad": stats.max_delta_rad,
+					"meanDeltaRad": stats.mean_delta_rad(),
+					"maxDeltaDeg": stats.max_delta_rad.to_degrees(),
+					"meanDeltaDeg": stats.mean_delta_rad().to_degrees(),
 				})
 			})
 			.collect::<Vec<_>>();
@@ -2303,10 +2301,8 @@ fn resolve_ffprobe(ffmpeg_path: Option<&Path>) -> Option<PathBuf> {
 			.and_then(|name| name.to_str())
 			.unwrap_or_default()
 			.to_ascii_lowercase();
-		if name == exe || (!cfg!(windows) && name == "ffprobe") {
-			if path.is_file() {
-				return Some(path.to_path_buf());
-			}
+		if (name == exe || (!cfg!(windows) && name == "ffprobe")) && path.is_file() {
+			return Some(path.to_path_buf());
 		}
 		if let Some(parent) = path.parent() {
 			let sibling = parent.join(exe);
@@ -2552,9 +2548,9 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 	if app.tray_by_id(TRAY_ICON_ID).is_some() {
 		return Ok(());
 	}
-	let open = MenuItem::with_id(app, "open", t!("tray.open").to_string(), true, None::<&str>)?;
-	let stop_all = MenuItem::with_id(app, "stop_all", t!("tray.stop_all").to_string(), true, None::<&str>)?;
-	let quit = MenuItem::with_id(app, "quit", t!("tray.quit").to_string(), true, None::<&str>)?;
+	let open = MenuItem::with_id(app, "open", &t!("tray.open"), true, None::<&str>)?;
+	let stop_all = MenuItem::with_id(app, "stop_all", &t!("tray.stop_all"), true, None::<&str>)?;
+	let quit = MenuItem::with_id(app, "quit", &t!("tray.quit"), true, None::<&str>)?;
 	let menu = Menu::new(app)?;
 	menu.append(&open)?;
 	menu.append(&stop_all)?;
@@ -3305,10 +3301,12 @@ fn opt_f32(value: &serde_json::Value, field: &str) -> Result<Option<f32>, String
 	if value.is_null() {
 		return Ok(None);
 	}
-	if let Some(n) = value.as_f64() {
-		if n.is_finite() && n >= 0.0 && n <= f32::MAX as f64 {
-			return Ok(Some(n as f32));
-		}
+	if let Some(n) = value.as_f64()
+		&& n.is_finite()
+		&& n >= 0.0
+		&& n <= f32::MAX as f64
+	{
+		return Ok(Some(n as f32));
 	}
 	Err(format!("field `{field}` must be a non-negative number or null"))
 }
@@ -3407,9 +3405,7 @@ fn refresh_capturers(state: &mut SupervisorState) {
 			}
 		};
 		if let Some(status) = exit_status {
-			capturer.info.state = if matches!(capturer.info.state, CapturerState::Stopping) {
-				CapturerState::Exited
-			} else if status.success() {
+			capturer.info.state = if matches!(capturer.info.state, CapturerState::Stopping) || status.success() {
 				CapturerState::Exited
 			} else {
 				CapturerState::Crashed
@@ -3760,10 +3756,10 @@ fn capturer_command(
 /// 隣接 exe の親ディレクトリに `models/` があればそれ (release zip 配布レイアウト)、
 /// なければ `repo_root()` (cargo run 開発レイアウト) を返す。
 fn capturer_working_directory(capturer_exe: &Path) -> PathBuf {
-	if let Some(dir) = capturer_exe.parent() {
-		if dir.join("models").is_dir() {
-			return dir.to_path_buf();
-		}
+	if let Some(dir) = capturer_exe.parent()
+		&& dir.join("models").is_dir()
+	{
+		return dir.to_path_buf();
 	}
 	repo_root()
 }
@@ -3920,7 +3916,7 @@ fn open_path_in_file_manager(path: &Path) -> Result<(), String> {
 			command.arg(path);
 		}
 		command.spawn().map_err(|e| format!("open explorer: {e}"))?;
-		return Ok(());
+		Ok(())
 	}
 
 	#[cfg(target_os = "macos")]
@@ -3981,16 +3977,20 @@ mod tests {
 
 	#[test]
 	fn next_profile_id_slugifies_and_avoids_duplicates() {
-		let mut doc = CoreProfileDocument::default();
-		doc.profiles = vec![make_profile("alpha", "Alpha"), make_profile("alpha-2", "Alpha 2")];
+		let doc = CoreProfileDocument {
+			profiles: vec![make_profile("alpha", "Alpha"), make_profile("alpha-2", "Alpha 2")],
+			..Default::default()
+		};
 		let id = next_profile_id(&doc, "Alpha");
 		assert_eq!(id, "alpha-3");
 	}
 
 	#[test]
 	fn next_profile_id_falls_back_when_name_lacks_ascii() {
-		let mut doc = CoreProfileDocument::default();
-		doc.profiles = vec![make_profile("profile", "_")];
+		let doc = CoreProfileDocument {
+			profiles: vec![make_profile("profile", "_")],
+			..Default::default()
+		};
 		let id = next_profile_id(&doc, "！？");
 		assert_eq!(id, "profile-2");
 	}

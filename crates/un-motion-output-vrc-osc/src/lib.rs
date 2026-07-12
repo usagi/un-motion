@@ -212,13 +212,13 @@ fn vrc_osc_packet_for_parameter(parameter: VrcOscParameter) -> OscPacket {
 pub fn vrc_osc_parameters_for_frame(frame: &UNMotionFrame, options: &VrcOscOutputOptions) -> Vec<VrcOscParameter> {
 	let mut parameters = BTreeMap::<String, f32>::new();
 	let mut face_is_live = false;
-	if let Some(face) = &frame.face {
-		if face.tracking_state != un_motion_frame::TrackingState::Lost {
-			face_is_live = true;
-			for expression in &face.expressions {
-				if sample_state_is_usable(expression.state) {
-					merge_expression_parameters(&mut parameters, &expression.name, expression.value, options);
-				}
+	if let Some(face) = &frame.face
+		&& face.tracking_state != un_motion_frame::TrackingState::Lost
+	{
+		face_is_live = true;
+		for expression in &face.expressions {
+			if sample_state_is_usable(expression.state) {
+				merge_expression_parameters(&mut parameters, &expression.name, expression.value, options);
 			}
 		}
 	}
@@ -242,13 +242,13 @@ pub fn vrc_osc_parameters_for_frame(frame: &UNMotionFrame, options: &VrcOscOutpu
 	let has_parameters = !parameters.is_empty();
 	let mut output = Vec::new();
 	for (name, value) in &parameters {
-		if options.avatar_parameters.as_ref().is_none_or(|avatar| avatar.supports_float(&name)) {
+		if options.avatar_parameters.as_ref().is_none_or(|avatar| avatar.supports_float(name)) {
 			output.push(VrcOscParameter {
 				name: name.clone(),
 				value: VrcOscParameterValue::Float(*value),
 			});
 		}
-		if options.avatar_parameters.as_ref().is_some_and(|avatar| avatar.supports_bool(&name)) {
+		if options.avatar_parameters.as_ref().is_some_and(|avatar| avatar.supports_bool(name)) {
 			output.push(VrcOscParameter {
 				name: name.clone(),
 				value: VrcOscParameterValue::Bool(base_bool_value_for_parameter(name, *value)),
@@ -256,7 +256,7 @@ pub fn vrc_osc_parameters_for_frame(frame: &UNMotionFrame, options: &VrcOscOutpu
 		}
 		if options.emit_binary_parameters {
 			output.extend(binary_parameters_for(
-				&binary_parameter_name_for(&name),
+				&binary_parameter_name_for(name),
 				*value,
 				options.avatar_parameters.as_ref(),
 			));
@@ -331,7 +331,7 @@ fn append_binary_value_if_avatar_supports(
 	parameter: &str,
 	value: f32,
 ) {
-	let Some(spec) = avatar_parameters.binary_spec(&parameter) else {
+	let Some(spec) = avatar_parameters.binary_spec(parameter) else {
 		return;
 	};
 	let magnitude = value.abs().clamp(0.0, 1.0);

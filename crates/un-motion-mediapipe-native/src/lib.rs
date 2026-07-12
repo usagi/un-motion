@@ -528,10 +528,10 @@ impl NativeMediaPipeRuntime {
 			&mut output.gestures,
 			&mut output.holistic,
 		)?;
-		if return_code != 30 {
-			if let Some(latest_timestamp_ms) = result_timestamp_ms {
-				self.last_live_stream_output_timestamp_ms = latest_timestamp_ms;
-			}
+		if return_code != 30
+			&& let Some(latest_timestamp_ms) = result_timestamp_ms
+		{
+			self.last_live_stream_output_timestamp_ms = latest_timestamp_ms;
 		}
 		output.return_code = return_code;
 		output.result_timestamp_ms = result_timestamp_ms;
@@ -685,6 +685,7 @@ impl NativeMediaPipeRuntime {
 		Ok(output)
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn poll_latest_at(
 		&mut self,
 		timestamp_ms: i64,
@@ -779,12 +780,11 @@ pub fn resolve_media_pipe_root(input: &Path) -> anyhow::Result<PathBuf> {
 	if input.join("models/pose_landmarker_lite.task").exists() {
 		return Ok(input.to_path_buf());
 	}
-	if input.file_name().is_some_and(|name| name == "mediapipe") {
-		if let Some(root) = input.parent().and_then(Path::parent) {
-			if root.join("models/pose_landmarker_lite.task").exists() {
-				return Ok(root.to_path_buf());
-			}
-		}
+	if input.file_name().is_some_and(|name| name == "mediapipe")
+		&& let Some(root) = input.parent().and_then(Path::parent)
+		&& root.join("models/pose_landmarker_lite.task").exists()
+	{
+		return Ok(root.to_path_buf());
 	}
 	anyhow::bail!(
 		"failed to locate media-pipe models from {}; pass media-pipe root or native/mediapipe directory",

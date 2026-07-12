@@ -751,7 +751,7 @@ fn run_vrc_osc_output_worker(
 				match worker.send_frame(frame) {
 					Ok(event) => {
 						let stats = worker.stats();
-						if stats.sent_datagrams == 1 || stats.sent_datagrams % SEND_LOG_INTERVAL == 0 {
+						if stats.sent_datagrams == 1 || stats.sent_datagrams.is_multiple_of(SEND_LOG_INTERVAL) {
 							debug!(
 								target: "un_motion_runtime::vrc_osc_output",
 								target_addr = %target_addr,
@@ -894,7 +894,7 @@ fn run_vmc_output_worker(
 				match worker.send_frame(frame) {
 					Ok(event) => {
 						let stats = worker.stats();
-						if stats.sent_datagrams == 1 || stats.sent_datagrams % SEND_LOG_INTERVAL == 0 {
+						if stats.sent_datagrams == 1 || stats.sent_datagrams.is_multiple_of(SEND_LOG_INTERVAL) {
 							debug!(
 								target: "un_motion_runtime::vmc_output",
 								target_addr = %target_addr,

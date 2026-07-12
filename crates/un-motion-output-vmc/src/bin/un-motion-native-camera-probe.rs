@@ -588,13 +588,12 @@ fn resolve_camera(device: Option<&str>) -> anyhow::Result<nokhwa::utils::CameraI
 	let Some(device) = device else {
 		return Ok(cameras[0].clone());
 	};
-	if let Ok(index) = device.parse::<u32>() {
-		if let Some(camera) = cameras
+	if let Ok(index) = device.parse::<u32>()
+		&& let Some(camera) = cameras
 			.iter()
 			.find(|camera| matches!(camera.index(), CameraIndex::Index(value) if *value == index))
-		{
-			return Ok(camera.clone());
-		}
+	{
+		return Ok(camera.clone());
 	}
 	let needle = comparable_label(device);
 	if let Some(camera) = cameras.iter().find(|camera| {

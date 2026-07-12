@@ -641,22 +641,20 @@ impl MotionStabilizer {
 					timestamp_ns.saturating_sub(snapshot.timestamp_ns),
 					Self::HEAD_MAX_ANGULAR_SPEED_RAD_PER_SEC,
 					Self::ROTATION_JUMP_SLACK_RAD,
-				) {
-				if let Some(limited) = blend_body_bone(
+				) && let Some(limited) = blend_body_bone(
+				snapshot.bone.as_ref(),
+				body_bone(frame, HumanoidBone::Head),
+				rotation_delta_limit_alpha(
 					snapshot.bone.as_ref(),
 					body_bone(frame, HumanoidBone::Head),
-					rotation_delta_limit_alpha(
-						snapshot.bone.as_ref(),
-						body_bone(frame, HumanoidBone::Head),
-						timestamp_ns.saturating_sub(snapshot.timestamp_ns),
-						Self::HEAD_MAX_ANGULAR_SPEED_RAD_PER_SEC,
-						Self::ROTATION_JUMP_SLACK_RAD,
-					)
-					.unwrap_or(1.0),
-				) {
-					upsert_body_bone(frame, limited);
-					frame.metadata.notes.push("mediapipe.stability head=rotation_limited".to_string());
-				}
+					timestamp_ns.saturating_sub(snapshot.timestamp_ns),
+					Self::HEAD_MAX_ANGULAR_SPEED_RAD_PER_SEC,
+					Self::ROTATION_JUMP_SLACK_RAD,
+				)
+				.unwrap_or(1.0),
+			) {
+				upsert_body_bone(frame, limited);
+				frame.metadata.notes.push("mediapipe.stability head=rotation_limited".to_string());
 			}
 			if rules.anatomical_constraints && rules.head_source_switch_blend {
 				self.apply_head_source_switch_blend(frame, quality, timestamp_ns);
@@ -2735,10 +2733,10 @@ fn signal_name_matches_parts(name: &str, kind: &str, side: &str, key: &str) -> b
 
 fn scalar_signal_with_confidence_from_signals(signals: &[MotionSignal], name: &str) -> Option<(f32, f32)> {
 	signals.iter().find_map(|signal| {
-		if signal.name == name {
-			if let MotionSignalValue::Scalar(value) = signal.value {
-				return Some((value.clamp(-1.0, 1.0), signal.confidence.clamp(0.0, 1.0)));
-			}
+		if signal.name == name
+			&& let MotionSignalValue::Scalar(value) = signal.value
+		{
+			return Some((value.clamp(-1.0, 1.0), signal.confidence.clamp(0.0, 1.0)));
 		}
 		None
 	})

@@ -180,7 +180,7 @@ impl DirectShowWebcamBackend {
 	pub fn active_format_label(&self) -> Option<String> {
 		#[cfg(windows)]
 		{
-			return self.active.as_ref().map(ActiveDirectShowCapture::format_label);
+			self.active.as_ref().map(ActiveDirectShowCapture::format_label)
 		}
 		#[cfg(not(windows))]
 		{
@@ -191,7 +191,7 @@ impl DirectShowWebcamBackend {
 	pub fn active_fps(&self) -> Option<f32> {
 		#[cfg(windows)]
 		{
-			return self.active.as_ref().and_then(|active| active.actual_fps);
+			self.active.as_ref().and_then(|active| active.actual_fps)
 		}
 		#[cfg(not(windows))]
 		{
@@ -202,7 +202,7 @@ impl DirectShowWebcamBackend {
 	pub fn active_observed_fps(&self) -> Option<f32> {
 		#[cfg(windows)]
 		{
-			return self.active.as_ref().and_then(ActiveDirectShowCapture::observed_consumer_fps);
+			self.active.as_ref().and_then(ActiveDirectShowCapture::observed_consumer_fps)
 		}
 		#[cfg(not(windows))]
 		{
@@ -213,7 +213,7 @@ impl DirectShowWebcamBackend {
 	pub fn active_observed_source_fps(&self) -> Option<f32> {
 		#[cfg(windows)]
 		{
-			return self.active.as_ref().and_then(ActiveDirectShowCapture::observed_source_fps);
+			self.active.as_ref().and_then(ActiveDirectShowCapture::observed_source_fps)
 		}
 		#[cfg(not(windows))]
 		{
@@ -224,10 +224,9 @@ impl DirectShowWebcamBackend {
 	pub fn active_observed_interval_ms(&self) -> Option<f32> {
 		#[cfg(windows)]
 		{
-			return self
-				.active
+			self.active
 				.as_ref()
-				.and_then(ActiveDirectShowCapture::observed_consumer_interval_ms);
+				.and_then(ActiveDirectShowCapture::observed_consumer_interval_ms)
 		}
 		#[cfg(not(windows))]
 		{
@@ -333,19 +332,19 @@ impl ActiveDirectShowCapture {
 		let mut provider = ccap::Provider::with_device_name_and_extra_info(&device.name, Some("dshow"))?;
 		let requested_label = config.requested_label();
 		let _ = provider.stop_capture();
-		if let (Some(width), Some(height)) = (config.width, config.height) {
-			if let Err(error) = provider.set_resolution(width, height) {
-				tracing::warn!(
-					target: "un_motion_input_webcam_directshow",
-					device_id = %device.id,
-					device_name = %device.name,
-					requested = %requested_label,
-					error = %error,
-					width,
-					height,
-					"DirectShow requested resolution set failed"
-				);
-			}
+		if let (Some(width), Some(height)) = (config.width, config.height)
+			&& let Err(error) = provider.set_resolution(width, height)
+		{
+			tracing::warn!(
+				target: "un_motion_input_webcam_directshow",
+				device_id = %device.id,
+				device_name = %device.name,
+				requested = %requested_label,
+				error = %error,
+				width,
+				height,
+				"DirectShow requested resolution set failed"
+			);
 		}
 		if let Some(pixel_format) = config.pixel_format.as_deref().filter(|value| is_yuv_request(Some(value))) {
 			let requested_pixel_format = ccap_pixel_format_from_label(Some(pixel_format));
@@ -372,18 +371,18 @@ impl ActiveDirectShowCapture {
 				"DirectShow requested output pixel format set failed"
 			);
 		}
-		if let Some(fps) = config.fps {
-			if let Err(error) = provider.set_frame_rate(fps as f64) {
-				tracing::warn!(
-					target: "un_motion_input_webcam_directshow",
-					device_id = %device.id,
-					device_name = %device.name,
-					requested = %requested_label,
-					requested_fps = fps,
-					error = %error,
-					"DirectShow requested frame rate set failed"
-				);
-			}
+		if let Some(fps) = config.fps
+			&& let Err(error) = provider.set_frame_rate(fps as f64)
+		{
+			tracing::warn!(
+				target: "un_motion_input_webcam_directshow",
+				device_id = %device.id,
+				device_name = %device.name,
+				requested = %requested_label,
+				requested_fps = fps,
+				error = %error,
+				"DirectShow requested frame rate set failed"
+			);
 		}
 		provider.start_capture()?;
 		let (actual_width, actual_height) = provider
@@ -503,22 +502,23 @@ impl ActiveDirectShowCapture {
 				self.stats.observed_consumer_fps = Some(smooth_optional_metric(self.stats.observed_consumer_fps, 1000.0 / interval_ms));
 			}
 		}
-		if let (Some(previous_timestamp), Some(previous_index)) = (self.stats.last_source_timestamp_ns, self.stats.last_frame_index) {
-			if pending.frame_timestamp_ns > previous_timestamp && pending.frame_index > previous_index {
-				let interval_ms = (pending.frame_timestamp_ns - previous_timestamp) as f32 / 1_000_000.0;
-				let frame_delta = pending.frame_index - previous_index;
-				if interval_ms > 0.0 && frame_delta > 0 {
-					let source_fps = frame_delta as f32 * 1000.0 / interval_ms;
-					self.stats.observed_source_interval_ms = Some(smooth_optional_metric(
-						self.stats.observed_source_interval_ms,
-						interval_ms / frame_delta as f32,
-					));
-					self.stats.observed_source_fps = Some(smooth_optional_metric(self.stats.observed_source_fps, source_fps));
-					self.stats.observed_frame_index_delta = Some(frame_delta);
-				}
+		if let (Some(previous_timestamp), Some(previous_index)) = (self.stats.last_source_timestamp_ns, self.stats.last_frame_index)
+			&& pending.frame_timestamp_ns > previous_timestamp
+			&& pending.frame_index > previous_index
+		{
+			let interval_ms = (pending.frame_timestamp_ns - previous_timestamp) as f32 / 1_000_000.0;
+			let frame_delta = pending.frame_index - previous_index;
+			if interval_ms > 0.0 && frame_delta > 0 {
+				let source_fps = frame_delta as f32 * 1000.0 / interval_ms;
+				self.stats.observed_source_interval_ms = Some(smooth_optional_metric(
+					self.stats.observed_source_interval_ms,
+					interval_ms / frame_delta as f32,
+				));
+				self.stats.observed_source_fps = Some(smooth_optional_metric(self.stats.observed_source_fps, source_fps));
+				self.stats.observed_frame_index_delta = Some(frame_delta);
 			}
 		}
-		if self.stats.frames == 30 || self.stats.frames == 120 || self.stats.frames % 600 == 0 {
+		if self.stats.frames == 30 || self.stats.frames == 120 || self.stats.frames.is_multiple_of(600) {
 			tracing::info!(
 				target: "un_motion_input_webcam_directshow",
 				device_id = %self.device_id,
@@ -809,6 +809,7 @@ fn ccap_pixel_format_from_label(value: Option<&str>) -> ccap::PixelFormat {
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 fn log_capture_negotiation(
 	device_id: &str,
 	device_name: &str,
@@ -821,20 +822,21 @@ fn log_capture_negotiation(
 ) {
 	if let (Some(requested_width), Some(requested_height), Some(width), Some(height)) =
 		(config.width, config.height, actual_width, actual_height)
+		&& requested_width > 0
+		&& requested_height > 0
+		&& (requested_width != width || requested_height != height)
 	{
-		if requested_width > 0 && requested_height > 0 && (requested_width != width || requested_height != height) {
-			tracing::warn!(
-				target: "un_motion_input_webcam_directshow",
-				device_id = %device_id,
-				device_name = %device_name,
-				requested = %requested_label,
-				requested_width = requested_width,
-				requested_height = requested_height,
-				actual_width = width,
-				actual_height = height,
-				"DirectShow capture resolution was changed by backend"
-			);
-		}
+		tracing::warn!(
+			target: "un_motion_input_webcam_directshow",
+			device_id = %device_id,
+			device_name = %device_name,
+			requested = %requested_label,
+			requested_width = requested_width,
+			requested_height = requested_height,
+			actual_width = width,
+			actual_height = height,
+			"DirectShow capture resolution was changed by backend"
+		);
 	}
 	match (config.fps, actual_fps) {
 		(Some(requested_fps), Some(actual_fps)) if requested_fps > 0 => {

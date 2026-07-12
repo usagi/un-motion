@@ -129,12 +129,11 @@ pub fn vmc_signal_pose_for_unmotion_frame_with_options(
 		}
 	}
 	for signal in &frame.signals {
-		if let Some(route) = blendshape_map.get(&signal.name) {
-			if let MotionSignalValue::Scalar(value) = signal.value {
-				if !pose.blendshapes.iter().any(|(name, _)| name == &route.blendshape_name) {
-					pose.blendshapes.push((route.blendshape_name.clone(), route.map_value(value)));
-				}
-			}
+		if let Some(route) = blendshape_map.get(&signal.name)
+			&& let MotionSignalValue::Scalar(value) = signal.value
+			&& !pose.blendshapes.iter().any(|(name, _)| name == &route.blendshape_name)
+		{
+			pose.blendshapes.push((route.blendshape_name.clone(), route.map_value(value)));
 		}
 	}
 	pose
@@ -1148,10 +1147,11 @@ fn arm_plane_secondary(frame: &UNMotionFrame, side: BodySide, role: ArmSegmentRo
 		signal_vec3(frame, "hand.right.palm.forward"),
 		signal_vec3(frame, "hand.right.palm.normal"),
 	) {
-		if role == ArmSegmentRole::Upper && hands_are_close_overhead(frame) {
-			if let Some(across) = signal_vec3(frame, "hand.right.palm.across") {
-				return Some(across);
-			}
+		if role == ArmSegmentRole::Upper
+			&& hands_are_close_overhead(frame)
+			&& let Some(across) = signal_vec3(frame, "hand.right.palm.across")
+		{
+			return Some(across);
 		}
 		if is_right_folded_front_palm(forward, normal, hand_finger_fold(frame, "right")) {
 			plane = mix3(plane, [0.0, 0.0, 1.0], 0.25).unwrap_or(plane);
@@ -1649,10 +1649,10 @@ const HUMANOID_BONE_REST_POSES: &[BoneRestPose] = &[
 
 fn scalar_signal(frame: &UNMotionFrame, name: &str) -> Option<f32> {
 	frame.signals.iter().find_map(|signal| {
-		if signal.name == name {
-			if let MotionSignalValue::Scalar(value) = signal.value {
-				return Some(value.clamp(-1.0, 1.0));
-			}
+		if signal.name == name
+			&& let MotionSignalValue::Scalar(value) = signal.value
+		{
+			return Some(value.clamp(-1.0, 1.0));
 		}
 		None
 	})

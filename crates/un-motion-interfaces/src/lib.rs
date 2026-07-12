@@ -142,23 +142,21 @@ pub trait ImageFrameBuffer {
 	fn latest_by_source(&self, source_id: &str) -> Option<ImageFrame>;
 	fn read_batch(&mut self, max_frames: usize) -> Vec<ImageFrame>;
 	fn len(&self) -> usize;
+	fn is_empty(&self) -> bool {
+		self.len() == 0
+	}
 	fn capacity(&self) -> usize;
 	fn dropped_count(&self) -> u64;
 	fn event_version(&self) -> u64;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum QueueOverflowPolicy {
+	#[default]
 	DropOldest,
 	DropNewest,
 	BlockProducer,
 	ReplaceOld,
-}
-
-impl Default for QueueOverflowPolicy {
-	fn default() -> Self {
-		Self::DropOldest
-	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

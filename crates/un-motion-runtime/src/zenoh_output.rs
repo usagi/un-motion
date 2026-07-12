@@ -208,7 +208,7 @@ impl ZenohOutputWorker {
 		// 初回 1 frame と以降は 600 frame ごとに INFO で「実際に publish した key と
 		// payload 概要」を出す。これにより subscribe 側 (UN Avatar) で同じ key を
 		// listen しているか / 中身は空でないか をユーザー stderr で確認できる。
-		if self.stats.sent_frames == 1 || self.stats.sent_frames % 600 == 0 {
+		if self.stats.sent_frames == 1 || self.stats.sent_frames.is_multiple_of(600) {
 			let bones = unmotion_frame
 				.body
 				.as_ref()
@@ -431,16 +431,16 @@ fn run_zenoh_output_worker(
 				match worker.send_frame(frame) {
 					Ok(event) => {
 						let frames = worker.stats().sent_frames;
-						if frames == 1 || frames % SEND_LOG_INTERVAL == 0 {
-							if let ZenohOutputEvent::Sent { key_expr, .. } = &event {
-								debug!(
-									target: "un_motion_runtime::zenoh_output",
-									base_key_expr = %base_key_expr,
-									key_expr = %key_expr,
-									sent_frames = frames,
-									"Zenoh publish ok",
-								);
-							}
+						if (frames == 1 || frames.is_multiple_of(SEND_LOG_INTERVAL))
+							&& let ZenohOutputEvent::Sent { key_expr, .. } = &event
+						{
+							debug!(
+								target: "un_motion_runtime::zenoh_output",
+								base_key_expr = %base_key_expr,
+								key_expr = %key_expr,
+								sent_frames = frames,
+								"Zenoh publish ok",
+							);
 						}
 						let _ = event_tx.send(event);
 					}

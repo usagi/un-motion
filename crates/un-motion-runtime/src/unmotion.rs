@@ -371,24 +371,24 @@ fn observe_unmotion_part_diagnostics(
 	diagnostics: &mut std::collections::BTreeMap<MotionPart, crate::PartDiagnostic>,
 	frame: &UNMotionFrame,
 ) {
-	if let Some(body) = frame.body.as_ref() {
-		if let Some(humanoid) = body.humanoid.as_ref() {
-			for bone in &humanoid.bones {
-				upsert_part_diagnostic(
-					diagnostics,
-					part_for_humanoid_bone(bone.bone),
-					status_for_bone(bone),
-					bone.confidence,
-				);
-			}
-			if let Some(root) = humanoid.root.as_ref() {
-				upsert_part_diagnostic(
-					diagnostics,
-					MotionPart::Torso,
-					status_for_tracking_state(body.tracking_state),
-					body.confidence.max(transform_confidence_hint(root)),
-				);
-			}
+	if let Some(body) = frame.body.as_ref()
+		&& let Some(humanoid) = body.humanoid.as_ref()
+	{
+		for bone in &humanoid.bones {
+			upsert_part_diagnostic(
+				diagnostics,
+				part_for_humanoid_bone(bone.bone),
+				status_for_bone(bone),
+				bone.confidence,
+			);
+		}
+		if let Some(root) = humanoid.root.as_ref() {
+			upsert_part_diagnostic(
+				diagnostics,
+				MotionPart::Torso,
+				status_for_tracking_state(body.tracking_state),
+				body.confidence.max(transform_confidence_hint(root)),
+			);
 		}
 	}
 	if let Some(face) = frame.face.as_ref() {

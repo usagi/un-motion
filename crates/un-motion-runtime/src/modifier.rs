@@ -1207,15 +1207,13 @@ impl ModifierStage for MirrorStage {
 		if let Some(body) = frame.body.as_mut()
 			&& let Some(humanoid) = body.humanoid.as_mut()
 		{
-			if mirror_transforms {
-				if let Some(root) = humanoid.root.as_mut() {
-					if let Some(t) = root.translation.as_mut() {
-						t.x = -t.x;
-					}
-					if let Some(r) = root.rotation.as_mut() {
-						r.y = -r.y;
-						r.z = -r.z;
-					}
+			if mirror_transforms && let Some(root) = humanoid.root.as_mut() {
+				if let Some(t) = root.translation.as_mut() {
+					t.x = -t.x;
+				}
+				if let Some(r) = root.rotation.as_mut() {
+					r.y = -r.y;
+					r.z = -r.z;
 				}
 			}
 			for bone in humanoid.bones.iter_mut() {
@@ -1519,7 +1517,9 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 /// `dt` および `cutoff` が異常値の場合 (≤ 0 または NaN) は `1.0`
 /// (= pass-through) を返す。
 fn one_euro_alpha(dt: f32, cutoff: f32) -> f32 {
-	if !(dt > 0.0) || !(cutoff > 0.0) {
+	if !matches!(dt.partial_cmp(&0.0), Some(std::cmp::Ordering::Greater))
+		|| !matches!(cutoff.partial_cmp(&0.0), Some(std::cmp::Ordering::Greater))
+	{
 		return 1.0;
 	}
 	let tau = 1.0 / (2.0 * std::f32::consts::PI * cutoff);

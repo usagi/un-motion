@@ -341,9 +341,7 @@ pub fn parse_ifacialmocap_frame(packet: &str, source_id: &str, received_timestam
 		if trimmed.is_empty() {
 			continue;
 		}
-		let normalized = trimmed
-			.trim_start_matches(|character| matches!(character, '=' | '/' | ':' | ';' | ','))
-			.trim();
+		let normalized = trimmed.trim_start_matches(['=', '/', ':', ';', ',']).trim();
 		let Some((field_name, raw_value)) = normalized.split_once('#') else {
 			if let Some((name, value)) = parse_blendshape_segment(normalized) {
 				push_expression_if_supported(&mut expressions, name, value);
@@ -464,7 +462,7 @@ fn push_expression_if_supported(expressions: &mut Vec<(String, f32)>, name: Stri
 }
 
 fn is_supported_expression_name(name: &str) -> bool {
-	PERFECT_SYNC_EXPRESSION_NAMES.iter().any(|candidate| *candidate == name)
+	PERFECT_SYNC_EXPRESSION_NAMES.contains(&name)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -587,7 +585,7 @@ fn reference_expression_value(target_name: &str, expressions: &[(String, f32)]) 
 			expressions,
 			-0.0440393,
 			&[
-				("mouthPucker", 1.047880),
+				("mouthPucker", 1.047_88),
 				("mouthDimpleRight", 0.583544),
 				("mouthShrugLower", -0.522829),
 				("mouthShrugUpper", 0.422763),

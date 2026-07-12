@@ -9,20 +9,11 @@ const DEFAULT_STALE_TIMEOUT_NS: u64 = i64::MAX as u64;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
+#[derive(Default)]
 pub struct RunnerProfile {
 	pub pipeline: PipelinePolicyConfig,
 	pub components: PipelineComponentsConfig,
 	pub output: OutputConfig,
-}
-
-impl Default for RunnerProfile {
-	fn default() -> Self {
-		Self {
-			pipeline: PipelinePolicyConfig::default(),
-			components: PipelineComponentsConfig::default(),
-			output: OutputConfig::default(),
-		}
-	}
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -443,16 +434,9 @@ impl OutputComponentKind {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
+#[derive(Default)]
 pub struct OutputConfig {
 	pub vmc: VmcOutputConfig,
-}
-
-impl Default for OutputConfig {
-	fn default() -> Self {
-		Self {
-			vmc: VmcOutputConfig::default(),
-		}
-	}
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -606,15 +590,15 @@ pub fn validate_profile(profile: &RunnerProfile) -> anyhow::Result<()> {
 			bail!("output.vmc.blendshape_map[{}].name が空です", signal_name);
 		}
 
-		if let (Some(min), Some(max)) = (detail.clamp_min, detail.clamp_max) {
-			if min > max {
-				bail!(
-					"output.vmc.blendshape_map[{}] の clamp 範囲が不正です (min={} > max={})",
-					signal_name,
-					min,
-					max
-				);
-			}
+		if let (Some(min), Some(max)) = (detail.clamp_min, detail.clamp_max)
+			&& min > max
+		{
+			bail!(
+				"output.vmc.blendshape_map[{}] の clamp 範囲が不正です (min={} > max={})",
+				signal_name,
+				min,
+				max
+			);
 		}
 	}
 

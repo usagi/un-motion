@@ -987,26 +987,26 @@ fn run_core_runtime(
 
 		let now = Instant::now();
 		let mut sent = false;
-		if cadence.mark_due(now) {
-			if let Some(frame) = select_latest_unsent_frame(&workers.frame_streams, &mut last_output_sequences) {
-				frame_count = frame_count.saturating_add(1);
-				if let Some(vmc_output) = &workers.vmc_output
-					&& vmc_output.send(frame.clone()).is_err()
-				{
-					health = "output disconnected".to_string();
-				}
-				if let Some(vrc_osc_output) = &workers.vrc_osc_output
-					&& vrc_osc_output.send(frame.clone()).is_err()
-				{
-					health = "vrc osc output disconnected".to_string();
-				}
-				if let Some(zenoh_output) = &workers.zenoh_output
-					&& zenoh_output.send(frame).is_err()
-				{
-					health = "zenoh output disconnected".to_string();
-				}
-				sent = true;
+		if cadence.mark_due(now)
+			&& let Some(frame) = select_latest_unsent_frame(&workers.frame_streams, &mut last_output_sequences)
+		{
+			frame_count = frame_count.saturating_add(1);
+			if let Some(vmc_output) = &workers.vmc_output
+				&& vmc_output.send(frame.clone()).is_err()
+			{
+				health = "output disconnected".to_string();
 			}
+			if let Some(vrc_osc_output) = &workers.vrc_osc_output
+				&& vrc_osc_output.send(frame.clone()).is_err()
+			{
+				health = "vrc osc output disconnected".to_string();
+			}
+			if let Some(zenoh_output) = &workers.zenoh_output
+				&& zenoh_output.send(frame).is_err()
+			{
+				health = "zenoh output disconnected".to_string();
+			}
+			sent = true;
 		}
 		if received_unmotion || sent {
 			workers.refresh_source_telemetry(&mut output_telemetry);
@@ -1377,7 +1377,7 @@ fn median_f32(values: &mut [f32]) -> Option<f32> {
 	}
 	values.sort_by(|a, b| a.total_cmp(b));
 	let mid = values.len() / 2;
-	if values.len() % 2 == 0 {
+	if values.len().is_multiple_of(2) {
 		Some((values[mid - 1] + values[mid]) * 0.5)
 	} else {
 		Some(values[mid])
