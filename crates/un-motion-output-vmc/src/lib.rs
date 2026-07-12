@@ -3,7 +3,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::OnceLock;
 
 use anyhow::Context;
-use rosc::{OscBundle, OscMessage, OscPacket, OscTime, OscType, encoder};
+use rosc::{OscMessage, OscPacket, OscType, encoder};
 use un_motion_frame::{Finger, HandMotion, HumanoidBone, MotionSignalValue, Quatf, TransformSample, UNMotionFrame, Vec3f};
 use un_motion_interfaces::OutputSink;
 
@@ -221,37 +221,38 @@ impl VmcOutputSink {
 
 pub fn encode_vmc_datagrams(packets: Vec<OscPacket>) -> anyhow::Result<Vec<Vec<u8>>> {
 	let mut datagrams = Vec::new();
-	let mut current = Vec::new();
+	let mut current_packets = Vec::new();
+	let mut current_len = 16usize;
 	for packet in packets {
-		current.push(packet);
-		let encoded = encode_vmc_bundle(&current)?;
-		if encoded.len() <= VMC_MAX_DATAGRAM_BYTES {
-			continue;
-		}
-		let last = current.pop().expect("current contains the packet just pushed");
-		if current.is_empty() {
+		let encoded = encoder::encode(&packet).context("VMC OSC packet encode failed")?;
+		let bundled_len = 4usize.saturating_add(encoded.len());
+		if 16usize.saturating_add(bundled_len) > VMC_MAX_DATAGRAM_BYTES {
 			anyhow::bail!("VMC OSC packet exceeds {VMC_MAX_DATAGRAM_BYTES} byte datagram limit");
 		}
-		datagrams.push(encode_vmc_bundle(&current)?);
-		current.clear();
-		current.push(last);
-		let encoded = encode_vmc_bundle(&current)?;
-		if encoded.len() > VMC_MAX_DATAGRAM_BYTES {
-			anyhow::bail!("VMC OSC packet exceeds {VMC_MAX_DATAGRAM_BYTES} byte datagram limit");
+		if current_len.saturating_add(bundled_len) > VMC_MAX_DATAGRAM_BYTES {
+			datagrams.push(encode_bundle_elements(&current_packets, current_len));
+			current_packets.clear();
+			current_len = 16;
 		}
+		current_len += bundled_len;
+		current_packets.push(encoded);
 	}
-	if !current.is_empty() {
-		datagrams.push(encode_vmc_bundle(&current)?);
+	if !current_packets.is_empty() {
+		datagrams.push(encode_bundle_elements(&current_packets, current_len));
 	}
 	Ok(datagrams)
 }
 
-fn encode_vmc_bundle(packets: &[OscPacket]) -> anyhow::Result<Vec<u8>> {
-	encoder::encode(&OscPacket::Bundle(OscBundle {
-		timetag: OscTime { seconds: 0, fractional: 1 },
-		content: packets.to_vec(),
-	}))
-	.context("VMC OSC encode failed")
+fn encode_bundle_elements(elements: &[Vec<u8>], encoded_len: usize) -> Vec<u8> {
+	let mut bundle = Vec::with_capacity(encoded_len);
+	bundle.extend_from_slice(b"#bundle\0");
+	bundle.extend_from_slice(&0u32.to_be_bytes());
+	bundle.extend_from_slice(&1u32.to_be_bytes());
+	for element in elements {
+		bundle.extend_from_slice(&(element.len() as u32).to_be_bytes());
+		bundle.extend_from_slice(element);
+	}
+	bundle
 }
 
 impl OutputSink<UNMotionFrame> for VmcOutputSink {
@@ -2148,7 +2149,7 @@ const PERFECT_SYNC_BLENDSHAPES: &[&str] = &[
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use rosc::decoder;
+	use rosc::{OscBundle, OscTime, decoder};
 	use un_motion_frame::{
 		BodyMotion, BoneSample, ExpressionSample, FaceMotion, Finger, FingerPose, HandMotion, HumanoidBone, HumanoidPose, MotionSignal,
 		MotionSignalValue, Quatf, SampleState, TrackingState, TransformSample,
@@ -2306,6 +2307,29 @@ mod tests {
 			100
 		);
 		assert_eq!(addresses.last().map(String::as_str), Some("/VMC/Ext/Blend/Apply"));
+	}
+
+	#[test]
+	fn optimized_bundle_encoding_matches_rosc() {
+		let packets = vec![
+			OscPacket::Message(OscMessage {
+				addr: "/VMC/Ext/OK".to_string(),
+				args: vec![OscType::Int(1)],
+			}),
+			OscPacket::Message(OscMessage {
+				addr: "/VMC/Ext/Blend/Apply".to_string(),
+				args: Vec::new(),
+			}),
+		];
+		let expected = encoder::encode(&OscPacket::Bundle(OscBundle {
+			timetag: OscTime { seconds: 0, fractional: 1 },
+			content: packets.clone(),
+		}))
+		.expect("encode reference bundle");
+
+		let actual = encode_vmc_datagrams(packets).expect("encode optimized bundle");
+
+		assert_eq!(actual, vec![expected]);
 	}
 
 	#[test]
