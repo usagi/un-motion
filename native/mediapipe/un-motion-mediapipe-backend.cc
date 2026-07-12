@@ -1304,107 +1304,8 @@ int32_t un_motion_mediapipe_process_rgb_everything_at(
   return first_error;
 }
 
-int32_t un_motion_mediapipe_poll_latest_at(
-    void* raw_context,
-    int64_t timestamp_ms,
-    UnMotionMediaPipePose* out_pose,
-    UnMotionMediaPipeHands* out_hands,
-    UnMotionMediaPipeFace* out_face,
-    UnMotionMediaPipeGestures* out_gestures,
-    UnMotionMediaPipeHolistic* out_holistic) {
-  if (raw_context == nullptr) {
-    return 10;
-  }
-  if (out_pose == nullptr && out_hands == nullptr && out_face == nullptr &&
-      out_gestures == nullptr && out_holistic == nullptr) {
-    return 10;
-  }
-
-  auto* context = static_cast<UnMotionMediaPipeContext*>(raw_context);
-  std::lock_guard<std::mutex> lock(context->latest_mutex);
-  const auto common_timestamp_ms = next_common_result_timestamp(
-      context, timestamp_ms, out_pose != nullptr, out_hands != nullptr,
-      out_face != nullptr, out_gestures != nullptr, out_holistic != nullptr);
-  if (!common_timestamp_ms.has_value()) {
-    if (out_pose != nullptr) std::memset(out_pose, 0, sizeof(*out_pose));
-    if (out_hands != nullptr) std::memset(out_hands, 0, sizeof(*out_hands));
-    if (out_face != nullptr) std::memset(out_face, 0, sizeof(*out_face));
-    if (out_gestures != nullptr) std::memset(out_gestures, 0, sizeof(*out_gestures));
-    if (out_holistic != nullptr) std::memset(out_holistic, 0, sizeof(*out_holistic));
-    return 30;
-  }
-  timestamp_ms = *common_timestamp_ms;
-  int32_t first_error = 0;
-  bool all_ready = true;
-
-  if (out_pose != nullptr) {
-    int32_t error = 0;
-    if (pop_first_at_or_after(context->queued_pose, timestamp_ms, out_pose, &error, nullptr)) {
-      if (error != 0 && first_error == 0) {
-        first_error = error;
-      }
-    } else {
-      std::memset(out_pose, 0, sizeof(*out_pose));
-      all_ready = false;
-    }
-  }
-
-  if (out_hands != nullptr) {
-    int32_t error = 0;
-    if (pop_first_at_or_after(context->queued_hands, timestamp_ms, out_hands, &error, nullptr)) {
-      if (error != 0 && first_error == 0) {
-        first_error = error;
-      }
-    } else {
-      std::memset(out_hands, 0, sizeof(*out_hands));
-      all_ready = false;
-    }
-  }
-
-  if (out_face != nullptr) {
-    int32_t error = 0;
-    if (pop_first_at_or_after(context->queued_face, timestamp_ms, out_face, &error, nullptr)) {
-      if (error != 0 && first_error == 0) {
-        first_error = error;
-      }
-    } else {
-      std::memset(out_face, 0, sizeof(*out_face));
-      all_ready = false;
-    }
-  }
-
-  if (out_gestures != nullptr) {
-    int32_t error = 0;
-    if (pop_first_at_or_after(context->queued_gestures, timestamp_ms, out_gestures, &error, nullptr)) {
-      if (error != 0 && first_error == 0) {
-        first_error = error;
-      }
-    } else {
-      std::memset(out_gestures, 0, sizeof(*out_gestures));
-      all_ready = false;
-    }
-  }
-
-  if (out_holistic != nullptr) {
-    int32_t error = 0;
-    if (pop_first_at_or_after(context->queued_holistic, timestamp_ms, out_holistic, &error, nullptr)) {
-      if (error != 0 && first_error == 0) {
-        first_error = error;
-      }
-    } else {
-      std::memset(out_holistic, 0, sizeof(*out_holistic));
-      all_ready = false;
-    }
-  }
-
-  if (!all_ready && first_error == 0) {
-    return 30;
-  }
-  return first_error;
-}
-
-int32_t un_motion_mediapipe_poll_latest_timestamp_at(
-    void* raw_context,
+static int32_t poll_latest_locked(
+    UnMotionMediaPipeContext* context,
     int64_t timestamp_ms,
     UnMotionMediaPipePose* out_pose,
     UnMotionMediaPipeHands* out_hands,
@@ -1412,20 +1313,6 @@ int32_t un_motion_mediapipe_poll_latest_timestamp_at(
     UnMotionMediaPipeGestures* out_gestures,
     UnMotionMediaPipeHolistic* out_holistic,
     int64_t* out_result_timestamp_ms) {
-  if (out_result_timestamp_ms == nullptr) {
-    return 10;
-  }
-  *out_result_timestamp_ms = -1;
-  if (raw_context == nullptr) {
-    return 10;
-  }
-  if (out_pose == nullptr && out_hands == nullptr && out_face == nullptr &&
-      out_gestures == nullptr && out_holistic == nullptr) {
-    return 10;
-  }
-
-  auto* context = static_cast<UnMotionMediaPipeContext*>(raw_context);
-  std::lock_guard<std::mutex> lock(context->latest_mutex);
   const auto common_timestamp_ms = next_common_result_timestamp(
       context, timestamp_ms, out_pose != nullptr, out_hands != nullptr,
       out_face != nullptr, out_gestures != nullptr, out_holistic != nullptr);
@@ -1520,10 +1407,60 @@ int32_t un_motion_mediapipe_poll_latest_timestamp_at(
   if (!all_ready && first_error == 0) {
     return 30;
   }
-  if (result_timestamp_ms != std::numeric_limits<int64_t>::max()) {
+  if (out_result_timestamp_ms != nullptr &&
+      result_timestamp_ms != std::numeric_limits<int64_t>::max()) {
     *out_result_timestamp_ms = result_timestamp_ms;
   }
   return first_error;
+}
+
+int32_t un_motion_mediapipe_poll_latest_at(
+    void* raw_context,
+    int64_t timestamp_ms,
+    UnMotionMediaPipePose* out_pose,
+    UnMotionMediaPipeHands* out_hands,
+    UnMotionMediaPipeFace* out_face,
+    UnMotionMediaPipeGestures* out_gestures,
+    UnMotionMediaPipeHolistic* out_holistic) {
+  if (raw_context == nullptr) {
+    return 10;
+  }
+  if (out_pose == nullptr && out_hands == nullptr && out_face == nullptr &&
+      out_gestures == nullptr && out_holistic == nullptr) {
+    return 10;
+  }
+
+  auto* context = static_cast<UnMotionMediaPipeContext*>(raw_context);
+  std::lock_guard<std::mutex> lock(context->latest_mutex);
+  return poll_latest_locked(context, timestamp_ms, out_pose, out_hands, out_face,
+                            out_gestures, out_holistic, nullptr);
+}
+
+int32_t un_motion_mediapipe_poll_latest_timestamp_at(
+    void* raw_context,
+    int64_t timestamp_ms,
+    UnMotionMediaPipePose* out_pose,
+    UnMotionMediaPipeHands* out_hands,
+    UnMotionMediaPipeFace* out_face,
+    UnMotionMediaPipeGestures* out_gestures,
+    UnMotionMediaPipeHolistic* out_holistic,
+    int64_t* out_result_timestamp_ms) {
+  if (out_result_timestamp_ms == nullptr) {
+    return 10;
+  }
+  *out_result_timestamp_ms = -1;
+  if (raw_context == nullptr) {
+    return 10;
+  }
+  if (out_pose == nullptr && out_hands == nullptr && out_face == nullptr &&
+      out_gestures == nullptr && out_holistic == nullptr) {
+    return 10;
+  }
+
+  auto* context = static_cast<UnMotionMediaPipeContext*>(raw_context);
+  std::lock_guard<std::mutex> lock(context->latest_mutex);
+  return poll_latest_locked(context, timestamp_ms, out_pose, out_hands, out_face,
+                            out_gestures, out_holistic, out_result_timestamp_ms);
 }
 
 int32_t un_motion_mediapipe_live_stream_stats(
