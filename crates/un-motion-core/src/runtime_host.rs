@@ -379,17 +379,21 @@ impl CoreRuntimeHost {
 		let (control_tx, control_rx) = runtime_control_channel();
 		let (init_tx, init_rx) = mpsc::channel();
 		let join = thread::spawn(move || run_core_runtime(config, control_rx, init_tx, status_callback));
-		match init_rx
-			.recv_timeout(Duration::from_secs(5))
-			.context("core runtime did not finish startup")?
-		{
-			Ok(()) => Ok(Self {
+		match init_rx.recv_timeout(Duration::from_secs(5)) {
+			Ok(Ok(())) => Ok(Self {
 				control_tx,
 				join: Some(join),
 			}),
-			Err(error) => {
+			Ok(Err(error)) => {
 				let _ = join.join();
 				Err(error)
+			}
+			Err(error) => {
+				cancel_runtime_startup(&control_tx);
+				if join.is_finished() {
+					let _ = join.join();
+				}
+				Err(error).context("core runtime did not finish startup")
 			}
 		}
 	}
@@ -408,6 +412,10 @@ impl CoreRuntimeHost {
 		self.stop();
 		if let Some(join) = self.join.take() { join.join() } else { Ok(()) }
 	}
+}
+
+fn cancel_runtime_startup(control_tx: &SyncSender<CoreRuntimeControl>) {
+	let _ = control_tx.try_send(CoreRuntimeControl::Stop);
 }
 
 impl CoreRuntimeHandle {
@@ -2224,6 +2232,13 @@ mod tests {
 			tx.try_send(CoreRuntimeControl::Stop),
 			Err(std::sync::mpsc::TrySendError::Full(CoreRuntimeControl::Stop))
 		));
+	}
+
+	#[test]
+	fn cancelled_runtime_startup_queues_stop_control() {
+		let (control_tx, control_rx) = runtime_control_channel();
+		cancel_runtime_startup(&control_tx);
+		assert!(matches!(control_rx.try_recv(), Ok(CoreRuntimeControl::Stop)));
 	}
 
 	fn profile(runtime_selection: Option<ProfileRuntimeSettings>) -> CoreProfileDocumentProfile {
