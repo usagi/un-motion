@@ -15,13 +15,14 @@ use rosc::{OscMessage, OscPacket, OscType};
 use tracing::{debug, info, warn};
 use un_motion_frame::UNMotionFrame;
 use un_motion_output_vmc::{encode_vmc_datagrams, vmc_packets_for_frame, vmc_packets_for_frame_without_ok};
-use un_motion_output_vrc_osc::{VrcOscAvatarParameters, VrcOscOutputOptions, VrcOscOutputSink};
+use un_motion_output_vrc_osc::{MAX_VRC_AVATAR_PARAMETER_STATES, VrcOscAvatarParameters, VrcOscOutputOptions, VrcOscOutputSink};
 use un_motion_record::MessagePackStreamRecorder;
 
 use crate::signal_enrich::{enrich_frame_with_signal_derived_motion, frame_needs_signal_derived_motion};
 use crate::{ModifierConfig, ModifierPipeline, vmc_bone_name_to_humanoid_bone};
 
 const OSCQUERY_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const OSCQUERY_MAX_TREE_DEPTH: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutputDisconnected;
@@ -797,24 +798,34 @@ fn fetch_vrchat_avatar_parameters(port: u16) -> anyhow::Result<VrcOscAvatarParam
 	let response = http_get_loopback(port, "/avatar/parameters")?;
 	let value: serde_json::Value = serde_json::from_str(&response).context("VRChat OSCQuery avatar parameters JSON parse failed")?;
 	let mut parameters = VrcOscAvatarParameters::new();
-	collect_oscquery_avatar_parameters(&value, &mut parameters);
+	collect_oscquery_avatar_parameters(&value, &mut parameters, 0);
 	Ok(parameters)
 }
 
-fn collect_oscquery_avatar_parameters(value: &serde_json::Value, parameters: &mut VrcOscAvatarParameters) {
+fn collect_oscquery_avatar_parameters(value: &serde_json::Value, parameters: &mut VrcOscAvatarParameters, depth: usize) {
+	if depth > OSCQUERY_MAX_TREE_DEPTH || parameters.len() >= MAX_VRC_AVATAR_PARAMETER_STATES {
+		return;
+	}
 	let full_path = value.get("FULL_PATH").and_then(serde_json::Value::as_str);
 	let parameter = full_path.and_then(|path| path.strip_prefix("/avatar/parameters/"));
 	let type_tag = value.get("TYPE").and_then(serde_json::Value::as_str);
 	if let (Some(parameter), Some(type_tag)) = (parameter, type_tag) {
 		match type_tag {
-			"f" => parameters.insert_float(parameter),
-			"T" | "F" => parameters.insert_bool(parameter),
+			"f" => {
+				parameters.insert_float(parameter);
+			}
+			"T" | "F" => {
+				parameters.insert_bool(parameter);
+			}
 			_ => {}
 		}
 	}
 	if let Some(contents) = value.get("CONTENTS").and_then(serde_json::Value::as_object) {
 		for child in contents.values() {
-			collect_oscquery_avatar_parameters(child, parameters);
+			collect_oscquery_avatar_parameters(child, parameters, depth + 1);
+			if parameters.len() >= MAX_VRC_AVATAR_PARAMETER_STATES {
+				break;
+			}
 		}
 	}
 }
@@ -1005,6 +1016,22 @@ mod tests {
 		server.join().expect("server");
 
 		assert!(error.to_string().contains("response exceeds"));
+	}
+
+	#[test]
+	fn oscquery_parameter_collection_stops_at_tree_depth_limit() {
+		let mut value = serde_json::json!({
+			"FULL_PATH": "/avatar/parameters/too-deep",
+			"TYPE": "f"
+		});
+		for index in 0..=OSCQUERY_MAX_TREE_DEPTH {
+			value = serde_json::json!({ "CONTENTS": { format!("level-{index}"): value } });
+		}
+		let mut parameters = VrcOscAvatarParameters::new();
+
+		collect_oscquery_avatar_parameters(&value, &mut parameters, 0);
+
+		assert!(parameters.is_empty());
 	}
 
 	fn temp_record_path(label: &str) -> PathBuf {

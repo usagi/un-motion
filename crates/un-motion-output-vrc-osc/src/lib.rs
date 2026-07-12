@@ -10,6 +10,7 @@ const AVATAR_PARAMETER_PREFIX: &str = "/avatar/parameters/";
 const MAX_OSC_DATAGRAM_BYTES: usize = 4096;
 const MAX_VRC_PARAMETER_NAME_BYTES: usize = 256;
 const MAX_VRC_PARAMETER_STATES: usize = 1_024;
+pub const MAX_VRC_AVATAR_PARAMETER_STATES: usize = 1_024;
 const BINARY_PARAMETER_DEADZONE: f32 = 0.15;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,12 +44,43 @@ impl VrcOscAvatarParameters {
 		Self::default()
 	}
 
-	pub fn insert_float(&mut self, parameter: impl Into<String>) {
-		self.float_parameters.insert(normalize_avatar_parameter_key(parameter.into()));
+	pub fn insert_float(&mut self, parameter: impl Into<String>) -> bool {
+		self.insert(parameter.into(), true)
 	}
 
-	pub fn insert_bool(&mut self, parameter: impl Into<String>) {
-		self.bool_parameters.insert(normalize_avatar_parameter_key(parameter.into()));
+	pub fn insert_bool(&mut self, parameter: impl Into<String>) -> bool {
+		self.insert(parameter.into(), false)
+	}
+
+	pub fn len(&self) -> usize {
+		self.float_parameters.len() + self.bool_parameters.len()
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.float_parameters.is_empty() && self.bool_parameters.is_empty()
+	}
+
+	fn insert(&mut self, parameter: String, is_float: bool) -> bool {
+		let parameter = normalize_avatar_parameter_key(parameter);
+		if !valid_vrc_parameter_name(&parameter) {
+			return false;
+		}
+		let already_present = if is_float {
+			self.float_parameters.contains(&parameter)
+		} else {
+			self.bool_parameters.contains(&parameter)
+		};
+		if already_present {
+			return false;
+		}
+		if self.float_parameters.len() + self.bool_parameters.len() >= MAX_VRC_AVATAR_PARAMETER_STATES {
+			return false;
+		}
+		if is_float {
+			self.float_parameters.insert(parameter)
+		} else {
+			self.bool_parameters.insert(parameter)
+		}
 	}
 
 	pub fn supports_float(&self, parameter: &str) -> bool {
@@ -775,6 +807,17 @@ mod tests {
 		assert!(sink.last_values.is_empty());
 		sink.commit_parameters(changed);
 		assert!(sink.changed_parameters_for_frame(&frame).is_empty());
+	}
+
+	#[test]
+	fn avatar_parameter_capabilities_enforce_name_and_count_limits() {
+		let mut parameters = VrcOscAvatarParameters::new();
+		assert!(!parameters.insert_float("x".repeat(MAX_VRC_PARAMETER_NAME_BYTES + 1)));
+		for index in 0..MAX_VRC_AVATAR_PARAMETER_STATES {
+			assert!(parameters.insert_float(format!("parameter-{index}")));
+		}
+		assert!(!parameters.insert_bool("overflow"));
+		assert_eq!(parameters.len(), MAX_VRC_AVATAR_PARAMETER_STATES);
 	}
 
 	#[test]
