@@ -1956,24 +1956,29 @@ fn new_profile_runtime_defaults() -> ProfileRuntimeSettings {
 #[tauri::command]
 fn delete_profile(profile_id: String, state: State<'_, Mutex<SupervisorState>>) -> Result<(), String> {
 	let _profile_guard = lock_profile_store()?;
-	let state = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
 	let store = user_profile_store();
 	let mut doc = store.load();
 	if !doc.profiles.iter().any(|profile| profile.id == profile_id) {
 		return Err(format!("profile not found: {profile_id}"));
 	}
+	let profile_in_use = state
+		.lock()
+		.map_err(|_| "supervisor state poisoned".to_string())?
+		.capturers
+		.values()
+		.any(|capturer| {
+			matches!(
+				capturer.info.state,
+				CapturerState::Starting | CapturerState::Running | CapturerState::Stopping
+			) && capturer.info.profile_id.as_deref() == Some(profile_id.as_str())
+		});
+	if profile_in_use {
+		return Err(format!("profile is in use by a running capturer: {profile_id}"));
+	}
 	doc.profiles.retain(|profile| profile.id != profile_id);
 	doc.profile_sources.retain(|source| source.profile_id != profile_id);
 	if doc.selected_profile_id == profile_id {
 		doc.selected_profile_id = doc.profiles.first().map(|profile| profile.id.clone()).unwrap_or_default();
-	}
-	if state.capturers.values().any(|capturer| {
-		matches!(
-			capturer.info.state,
-			CapturerState::Starting | CapturerState::Running | CapturerState::Stopping
-		) && capturer.info.profile_id.as_deref() == Some(profile_id.as_str())
-	}) {
-		return Err(format!("profile is in use by a running capturer: {profile_id}"));
 	}
 	store.save(doc).map_err(|e| format!("save profile document: {e}"))?;
 	Ok(())
@@ -2049,7 +2054,6 @@ fn update_profile_field(
 	state: State<'_, Mutex<SupervisorState>>,
 ) -> Result<ProfileDetail, String> {
 	let _profile_guard = lock_profile_store()?;
-	let state_guard = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
 	let store = user_profile_store();
 	let mut doc = store.load();
 	{
@@ -2061,7 +2065,6 @@ fn update_profile_field(
 		apply_profile_field(profile, &field, value)?;
 	}
 	let saved = store.save(doc).map_err(|e| format!("save profile document: {e}"))?;
-	drop(state_guard);
 	push_document_to_matching_capturers(&state, &saved, &profile_id);
 	saved
 		.profiles
