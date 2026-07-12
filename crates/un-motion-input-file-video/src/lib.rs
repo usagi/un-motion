@@ -4,7 +4,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -233,21 +233,16 @@ fn run_frame_reader(
 		if offset != data.len() {
 			break;
 		}
-		loop {
-			match frame_tx.try_send(data) {
-				Ok(()) => break,
-				Err(TrySendError::Full(returned)) if !stop.load(Ordering::Acquire) => {
-					data = returned;
-					thread::sleep(std::time::Duration::from_millis(1));
-				}
-				Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
-					done.store(true, Ordering::Release);
-					return;
-				}
-			}
+		if !send_decoded_frame(&frame_tx, data) {
+			done.store(true, Ordering::Release);
+			return;
 		}
 	}
 	done.store(true, Ordering::Release);
+}
+
+fn send_decoded_frame(frame_tx: &SyncSender<Vec<u8>>, data: Vec<u8>) -> bool {
+	frame_tx.send(data).is_ok()
 }
 
 fn run_stderr_reader(mut stderr: ChildStderr, tail: Arc<Mutex<Vec<u8>>>) {
@@ -276,6 +271,7 @@ fn append_bounded_stderr(tail: &mut Vec<u8>, bytes: &[u8]) {
 impl Drop for FileVideoInputSource {
 	fn drop(&mut self) {
 		self.reader_stop.store(true, Ordering::Release);
+		self.frame_rx = None;
 		if let Some(mut child) = self.child.take() {
 			let _ = child.kill();
 			let _ = child.wait();
@@ -396,5 +392,12 @@ mod tests {
 		append_bounded_stderr(&mut tail, b"latest");
 		assert_eq!(tail.len(), STDERR_TAIL_MAX_BYTES);
 		assert!(tail.ends_with(b"latest"));
+	}
+
+	#[test]
+	fn decoded_frame_send_stops_when_receiver_disconnects() {
+		let (tx, rx) = mpsc::sync_channel(1);
+		drop(rx);
+		assert!(!send_decoded_frame(&tx, vec![1, 2, 3]));
 	}
 }
