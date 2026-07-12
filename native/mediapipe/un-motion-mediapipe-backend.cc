@@ -11,6 +11,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -151,6 +152,50 @@ bool pop_first_at_or_after(Queue& queue, int64_t timestamp_ms, typename Queue::v
   *out = queue.front();
   queue.pop_front();
   return true;
+}
+
+template <typename Queue>
+bool advance_to_timestamp(Queue& queue, int64_t timestamp_ms, int64_t* front_timestamp_ms) {
+  while (!queue.empty() && queue.front().timestamp_ms < timestamp_ms) {
+    queue.pop_front();
+  }
+  if (queue.empty()) {
+    return false;
+  }
+  *front_timestamp_ms = queue.front().timestamp_ms;
+  return true;
+}
+
+std::optional<int64_t> next_common_result_timestamp(
+    UnMotionMediaPipeContext* context,
+    int64_t minimum_timestamp_ms,
+    bool require_pose,
+    bool require_hands,
+    bool require_face,
+    bool require_gestures,
+    bool require_holistic) {
+  int64_t candidate = minimum_timestamp_ms;
+  for (;;) {
+    const int64_t previous_candidate = candidate;
+    int64_t front_timestamp_ms = -1;
+#define ADVANCE_REQUIRED_QUEUE(required, queue)                                      \
+  if ((required) &&                                                                  \
+      !advance_to_timestamp((queue), candidate, &front_timestamp_ms)) {              \
+    return std::nullopt;                                                             \
+  }                                                                                  \
+  if (required) {                                                                    \
+    candidate = std::max(candidate, front_timestamp_ms);                             \
+  }
+    ADVANCE_REQUIRED_QUEUE(require_pose, context->queued_pose);
+    ADVANCE_REQUIRED_QUEUE(require_hands, context->queued_hands);
+    ADVANCE_REQUIRED_QUEUE(require_face, context->queued_face);
+    ADVANCE_REQUIRED_QUEUE(require_gestures, context->queued_gestures);
+    ADVANCE_REQUIRED_QUEUE(require_holistic, context->queued_holistic);
+#undef ADVANCE_REQUIRED_QUEUE
+    if (candidate == previous_candidate) {
+      return candidate;
+    }
+  }
 }
 
 const char* pose_model_path() {
@@ -1296,6 +1341,18 @@ int32_t un_motion_mediapipe_poll_latest_at(
 
   auto* context = static_cast<UnMotionMediaPipeContext*>(raw_context);
   std::lock_guard<std::mutex> lock(context->latest_mutex);
+  const auto common_timestamp_ms = next_common_result_timestamp(
+      context, timestamp_ms, out_pose != nullptr, out_hands != nullptr,
+      out_face != nullptr, out_gestures != nullptr, out_holistic != nullptr);
+  if (!common_timestamp_ms.has_value()) {
+    if (out_pose != nullptr) std::memset(out_pose, 0, sizeof(*out_pose));
+    if (out_hands != nullptr) std::memset(out_hands, 0, sizeof(*out_hands));
+    if (out_face != nullptr) std::memset(out_face, 0, sizeof(*out_face));
+    if (out_gestures != nullptr) std::memset(out_gestures, 0, sizeof(*out_gestures));
+    if (out_holistic != nullptr) std::memset(out_holistic, 0, sizeof(*out_holistic));
+    return 30;
+  }
+  timestamp_ms = *common_timestamp_ms;
   int32_t first_error = 0;
   bool all_ready = true;
 
@@ -1393,6 +1450,18 @@ int32_t un_motion_mediapipe_poll_latest_timestamp_at(
 
   auto* context = static_cast<UnMotionMediaPipeContext*>(raw_context);
   std::lock_guard<std::mutex> lock(context->latest_mutex);
+  const auto common_timestamp_ms = next_common_result_timestamp(
+      context, timestamp_ms, out_pose != nullptr, out_hands != nullptr,
+      out_face != nullptr, out_gestures != nullptr, out_holistic != nullptr);
+  if (!common_timestamp_ms.has_value()) {
+    if (out_pose != nullptr) std::memset(out_pose, 0, sizeof(*out_pose));
+    if (out_hands != nullptr) std::memset(out_hands, 0, sizeof(*out_hands));
+    if (out_face != nullptr) std::memset(out_face, 0, sizeof(*out_face));
+    if (out_gestures != nullptr) std::memset(out_gestures, 0, sizeof(*out_gestures));
+    if (out_holistic != nullptr) std::memset(out_holistic, 0, sizeof(*out_holistic));
+    return 30;
+  }
+  timestamp_ms = *common_timestamp_ms;
   int32_t first_error = 0;
   bool all_ready = true;
   int64_t result_timestamp_ms = std::numeric_limits<int64_t>::max();
