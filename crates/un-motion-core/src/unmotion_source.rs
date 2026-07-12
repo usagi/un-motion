@@ -297,18 +297,7 @@ where
 	}
 
 	fn take_submitted_image_for_native(&mut self, native: &NativeMediaPipeOutput) -> Option<SubmittedImageFrame> {
-		let Some(result_timestamp_ms) = native.result_timestamp_ms else {
-			return self.pending_live_stream_inputs.pop_front();
-		};
-		let mut selected = None;
-		while let Some(candidate) = self.pending_live_stream_inputs.pop_front() {
-			let is_match = candidate.timestamp_ms >= result_timestamp_ms;
-			selected = Some(candidate);
-			if is_match {
-				break;
-			}
-		}
-		selected
+		take_submitted_image_for_timestamp(&mut self.pending_live_stream_inputs, native.result_timestamp_ms)
 	}
 
 	fn process_native_output_for_submitted(&mut self, submitted: SubmittedImageFrame, native: &NativeMediaPipeOutput) -> UNMotionFrame {
@@ -395,6 +384,29 @@ where
 			.atomics
 			.native_submission_errors
 			.store(counters.submission_errors, Ordering::Relaxed);
+	}
+}
+
+fn take_submitted_image_for_timestamp(
+	pending: &mut VecDeque<SubmittedImageFrame>,
+	result_timestamp_ms: Option<i64>,
+) -> Option<SubmittedImageFrame> {
+	let Some(result_timestamp_ms) = result_timestamp_ms else {
+		return pending.pop_front();
+	};
+	while pending
+		.front()
+		.is_some_and(|candidate| candidate.timestamp_ms < result_timestamp_ms)
+	{
+		pending.pop_front();
+	}
+	if pending
+		.front()
+		.is_some_and(|candidate| candidate.timestamp_ms == result_timestamp_ms)
+	{
+		pending.pop_front()
+	} else {
+		None
 	}
 }
 
@@ -1096,6 +1108,27 @@ mod tests {
 		assert_eq!(
 			pending.back().map(|frame| frame.sequence),
 			Some(LIVE_STREAM_PENDING_INPUT_CAPACITY as u64)
+		);
+	}
+
+	#[test]
+	fn live_result_requires_exact_input_timestamp() {
+		let submitted = |timestamp_ms| SubmittedImageFrame {
+			timestamp_ms,
+			sequence: timestamp_ms as u64,
+			capture_timestamp_ns: timestamp_ms as u64 * 1_000_000,
+			width: 1,
+			height: 1,
+			source_label: None,
+			debug_input_image_path: None,
+		};
+		let mut pending = VecDeque::from([submitted(10), submitted(12)]);
+
+		assert!(take_submitted_image_for_timestamp(&mut pending, Some(11)).is_none());
+		assert_eq!(pending.front().map(|frame| frame.timestamp_ms), Some(12));
+		assert_eq!(
+			take_submitted_image_for_timestamp(&mut pending, Some(12)).map(|frame| frame.sequence),
+			Some(12)
 		);
 	}
 
