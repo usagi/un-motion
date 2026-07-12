@@ -342,18 +342,23 @@ async fn events_stream(state: web::Data<CoreControlState>) -> HttpResponse {
 async fn events_response(state: web::Data<CoreControlState>) -> HttpResponse {
 	let (initial_event, receiver) = subscribe_before_snapshot(&state).await;
 	let initial = stream::once(async move { Ok::<Bytes, Error>(format_sse_event(&initial_event)) });
-	let event_stream = stream::unfold((state.clone(), receiver), |(state, mut receiver)| async move {
-		match classify_event_delivery(receiver.recv().await) {
-			EventDelivery::Event(event) => Some((Ok::<Bytes, Error>(format_sse_event(&event)), (state, receiver))),
-			EventDelivery::Snapshot => {
-				let event = state.snapshot_event().await;
-				Some((Ok::<Bytes, Error>(format_sse_event(&event)), (state, receiver)))
-			}
-			EventDelivery::Closed => None,
-		}
+	let event_stream = stream::unfold((state.clone(), receiver), |(state, receiver)| async move {
+		let (event, next_receiver) = receive_event_or_resync(&state, receiver).await?;
+		Some((Ok::<Bytes, Error>(format_sse_event(&event)), (state, next_receiver)))
 	});
 
 	sse_response(initial.chain(event_stream))
+}
+
+async fn receive_event_or_resync(
+	state: &CoreControlState,
+	mut receiver: tokio::sync::broadcast::Receiver<CoreEvent>,
+) -> Option<(CoreEvent, tokio::sync::broadcast::Receiver<CoreEvent>)> {
+	match classify_event_delivery(receiver.recv().await) {
+		EventDelivery::Event(event) => Some((*event, receiver)),
+		EventDelivery::Snapshot => Some(subscribe_before_snapshot(state).await),
+		EventDelivery::Closed => None,
+	}
 }
 
 async fn subscribe_before_snapshot(state: &CoreControlState) -> (CoreEvent, tokio::sync::broadcast::Receiver<CoreEvent>) {
@@ -423,6 +428,24 @@ mod tests {
 		let event = receiver.recv().await.expect("runtime event");
 		assert_eq!(event.kind, crate::CoreEventKind::RuntimeStarted);
 		state.stop_runtime().await;
+	}
+
+	#[actix_web::test]
+	async fn lagged_event_subscription_discards_pre_snapshot_queue() {
+		let state = CoreControlState::default();
+		let receiver = state.subscribe();
+		for index in 0..130 {
+			let mut document = state.profile_document().await;
+			document.profiles[0].name = format!("profile-{index}");
+			state.set_profile_document(document).await.expect("profile update");
+		}
+
+		let (event, mut receiver) = receive_event_or_resync(&state, receiver).await.expect("resync event");
+		assert_eq!(event.kind, crate::CoreEventKind::Snapshot);
+		assert!(matches!(
+			receiver.try_recv(),
+			Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+		));
 	}
 
 	#[actix_web::test]
