@@ -126,11 +126,12 @@ impl VrcOscOutputSink {
 	}
 
 	pub fn send(&mut self, frame: &UNMotionFrame) -> anyhow::Result<(u64, u64)> {
-		let packets = self.changed_packets_for_frame(frame);
-		if packets.is_empty() {
+		let changed = self.changed_parameters_for_frame(frame);
+		if changed.is_empty() {
 			return Ok((0, 0));
 		}
-		let packet_count = packets.len() as u64;
+		let packet_count = changed.len() as u64;
+		let packets = changed.iter().cloned().map(vrc_osc_packet_for_parameter).collect();
 		let datagrams = encode_packet_chunks(packets)?;
 		let datagram_count = datagrams.len() as u64;
 		for encoded in datagrams {
@@ -138,21 +139,27 @@ impl VrcOscOutputSink {
 				.send_to(&encoded, self.target)
 				.with_context(|| format!("VRC OSC UDP send failed: {}", self.target))?;
 		}
+		self.commit_parameters(changed);
 		Ok((datagram_count, packet_count))
 	}
 
-	fn changed_packets_for_frame(&mut self, frame: &UNMotionFrame) -> Vec<OscPacket> {
+	fn changed_parameters_for_frame(&self, frame: &UNMotionFrame) -> Vec<VrcOscParameter> {
 		let parameters = vrc_osc_parameters_for_frame(frame, &self.options);
-		let mut packets = Vec::new();
+		parameters
+			.into_iter()
+			.filter(|parameter| {
+				!self
+					.last_values
+					.get(&parameter.name)
+					.is_some_and(|old| parameter_value_unchanged(*old, parameter.value))
+			})
+			.collect()
+	}
+
+	fn commit_parameters(&mut self, parameters: Vec<VrcOscParameter>) {
 		for parameter in parameters {
-			let old = self.last_values.get(&parameter.name).copied();
-			if old.is_some_and(|old| parameter_value_unchanged(old, parameter.value)) {
-				continue;
-			}
-			self.last_values.insert(parameter.name.clone(), parameter.value);
-			packets.push(vrc_osc_packet_for_parameter(parameter));
+			self.last_values.insert(parameter.name, parameter.value);
 		}
-		packets
 	}
 }
 
@@ -734,6 +741,20 @@ mod tests {
 			panic!("arg should be bool");
 		};
 		(&message.addr, value)
+	}
+
+	#[test]
+	fn changed_parameter_cache_commits_only_after_success() {
+		let mut sink = VrcOscOutputSink::new("127.0.0.1:9000".parse().expect("target")).expect("sink");
+		let mut frame = UNMotionFrame::new(1);
+		frame.signals.push(scalar("face.jawOpen", 0.4));
+
+		let changed = sink.changed_parameters_for_frame(&frame);
+
+		assert!(!changed.is_empty());
+		assert!(sink.last_values.is_empty());
+		sink.commit_parameters(changed);
+		assert!(sink.changed_parameters_for_frame(&frame).is_empty());
 	}
 
 	fn try_packet_value(packet: &OscPacket) -> Option<(&str, f32)> {
