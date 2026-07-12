@@ -137,12 +137,27 @@ impl VmcPacketDecoder {
 	}
 
 	pub fn decode_datagram(&mut self, data: &[u8], received_timestamp_ns: u64) -> anyhow::Result<Option<VmcInputFrame>> {
+		self.decode_datagram_with_raw(data, received_timestamp_ns, true)
+	}
+
+	pub fn decode_datagram_without_raw(&mut self, data: &[u8], received_timestamp_ns: u64) -> anyhow::Result<Option<VmcInputFrame>> {
+		self.decode_datagram_with_raw(data, received_timestamp_ns, false)
+	}
+
+	fn decode_datagram_with_raw(
+		&mut self,
+		data: &[u8],
+		received_timestamp_ns: u64,
+		preserve_raw: bool,
+	) -> anyhow::Result<Option<VmcInputFrame>> {
 		if is_unsupported_waidayo_mp_datagram(data) {
 			return Ok(None);
 		}
 		let (_remaining, packet) = decoder::decode_udp(data)?;
 		Ok(self.decode_packet(&packet, received_timestamp_ns).map(|mut frame| {
-			frame.raw_datagram = Some(data.to_vec());
+			if preserve_raw {
+				frame.raw_datagram = Some(data.to_vec());
+			}
 			frame
 		}))
 	}
@@ -270,7 +285,7 @@ impl VmcInputSource {
 					received += 1;
 					let data = &buf[..len];
 					let was_dropped_as_non_vmc = is_unsupported_waidayo_mp_datagram(data);
-					match self.decoder.decode_datagram(data, now_unix_ns()) {
+					match self.decoder.decode_datagram_without_raw(data, now_unix_ns()) {
 						Ok(Some(frame)) => frames.push(frame),
 						Ok(None) => {
 							if was_dropped_as_non_vmc {
@@ -563,6 +578,18 @@ mod tests {
 		assert_eq!(frame.blendshapes.len(), 1);
 		assert_eq!(frame.blendshapes[0].name, "eyeBlinkLeft");
 		assert!(!frame.blend_apply);
+	}
+
+	#[test]
+	fn runtime_decode_can_skip_raw_datagram_copy() {
+		let packet = packet_message("/VMC/Ext/OK", vec![OscType::Int(1)]);
+		let encoded = encoder::encode(&packet).expect("encode");
+		let mut decoder = VmcPacketDecoder::new("vmc:runtime");
+
+		let frame = decoder.decode_datagram_without_raw(&encoded, 10).expect("decode").expect("frame");
+
+		assert!(frame.raw_datagram.is_none());
+		assert_eq!(frame.ok, Some(1));
 	}
 
 	#[test]
