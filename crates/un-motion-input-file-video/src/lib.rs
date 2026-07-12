@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use un_motion_interfaces::{ImageFrame, ImageInputSource};
+use un_motion_interfaces::{ImageFrame, ImageInputSource, checked_image_pixel_count};
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -311,6 +311,7 @@ fn validate_config(config: &FileVideoInputConfig) -> anyhow::Result<()> {
 	if config.output_width == 0 || config.output_height == 0 {
 		anyhow::bail!("video output dimensions must be non-zero");
 	}
+	checked_image_pixel_count(config.output_width, config.output_height)?;
 	if config.fps == 0 {
 		anyhow::bail!("video fps must be greater than zero");
 	}
@@ -318,10 +319,8 @@ fn validate_config(config: &FileVideoInputConfig) -> anyhow::Result<()> {
 }
 
 fn rgb_frame_len(width: u32, height: u32) -> anyhow::Result<usize> {
-	width
-		.checked_mul(height)
-		.and_then(|pixels| pixels.checked_mul(3))
-		.map(|bytes| bytes as usize)
+	checked_image_pixel_count(width, height)?
+		.checked_mul(3)
 		.ok_or_else(|| anyhow::anyhow!("video frame size overflow"))
 }
 
@@ -360,6 +359,13 @@ mod tests {
 		let config = FileVideoInputConfig::new("clip.mp4", 0, 480, 24);
 		let err = validate_config(&config).expect_err("zero width should fail");
 		assert!(err.to_string().contains("dimensions"));
+	}
+
+	#[test]
+	fn oversized_dimensions_are_rejected() {
+		let config = FileVideoInputConfig::new("clip.mp4", 8192, 8192, 24);
+		assert!(validate_config(&config).is_err());
+		assert!(rgb_frame_len(8192, 8192).is_err());
 	}
 
 	#[test]

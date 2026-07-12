@@ -10,6 +10,25 @@ pub enum PixelFormat {
 	Encoded,
 }
 
+pub const MAX_IMAGE_FRAME_DIMENSION: u32 = 16_384;
+pub const MAX_IMAGE_FRAME_PIXELS: usize = 32 * 1024 * 1024;
+
+pub fn checked_image_pixel_count(width: u32, height: u32) -> anyhow::Result<usize> {
+	if width == 0 || height == 0 {
+		anyhow::bail!("image dimensions must be non-zero");
+	}
+	if width > MAX_IMAGE_FRAME_DIMENSION || height > MAX_IMAGE_FRAME_DIMENSION {
+		anyhow::bail!("image dimensions exceed {MAX_IMAGE_FRAME_DIMENSION}: {width}x{height}");
+	}
+	let pixels = (width as usize)
+		.checked_mul(height as usize)
+		.ok_or_else(|| anyhow::anyhow!("image pixel count overflow: {width}x{height}"))?;
+	if pixels > MAX_IMAGE_FRAME_PIXELS {
+		anyhow::bail!("image pixel count exceeds {MAX_IMAGE_FRAME_PIXELS}: {width}x{height}");
+	}
+	Ok(pixels)
+}
+
 impl PixelFormat {
 	pub fn bytes_per_pixel(self) -> Option<u32> {
 		match self {
@@ -102,8 +121,9 @@ impl ImageFrame {
 		height: u32,
 		data: Vec<u8>,
 	) -> anyhow::Result<Self> {
-		let stride_bytes = width.saturating_mul(3);
-		let expected_len = stride_bytes as usize * height as usize;
+		let pixels = checked_image_pixel_count(width, height)?;
+		let stride_bytes = width.checked_mul(3).ok_or_else(|| anyhow::anyhow!("RGB stride overflow"))?;
+		let expected_len = pixels.checked_mul(3).ok_or_else(|| anyhow::anyhow!("RGB frame size overflow"))?;
 		if data.len() < expected_len {
 			anyhow::bail!("RGB frame buffer is shorter than stride * height");
 		}
@@ -212,6 +232,13 @@ mod tests {
 		assert_eq!(frame.pixel_format, PixelFormat::Rgb8);
 		assert_eq!(frame.metadata.sequence, 7);
 		assert_eq!(frame.metadata.source_id, "image:test");
+	}
+
+	#[test]
+	fn image_dimensions_allow_8k_and_reject_oversized_frames() {
+		assert_eq!(checked_image_pixel_count(7680, 4320).unwrap(), 33_177_600);
+		assert!(checked_image_pixel_count(MAX_IMAGE_FRAME_DIMENSION + 1, 1).is_err());
+		assert!(checked_image_pixel_count(8192, 8192).is_err());
 	}
 
 	#[test]

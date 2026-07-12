@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use image::{ImageBuffer, RgbaImage, imageops};
-use un_motion_interfaces::{ImageFrame, ImageInputSource, ImageResizeOptions, PixelFormat, ResizeAxis, TimestampBasis};
+use un_motion_interfaces::{
+	ImageFrame, ImageInputSource, ImageResizeOptions, PixelFormat, ResizeAxis, TimestampBasis, checked_image_pixel_count,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileImageEmissionMode {
@@ -45,6 +47,15 @@ pub struct FileImageInputSource {
 
 impl FileImageInputSource {
 	pub fn open(config: FileImageInputConfig) -> anyhow::Result<Self> {
+		let (source_width, source_height) = image::image_dimensions(&config.path)?;
+		checked_image_pixel_count(source_width, source_height)?;
+		if let Some(resize) = config.resize
+			&& resize.output_width > 0
+			&& resize.output_height > 0
+			&& resize.reference_length > 0
+		{
+			checked_image_pixel_count(resize.output_width, resize.output_height)?;
+		}
 		let image = image::open(&config.path)?;
 		let image = if let Some(resize) = config.resize {
 			resize_rgba(image.to_rgba8(), resize)
@@ -164,7 +175,8 @@ fn scale_other_axis(reference: u32, src_reference: u32, src_other: u32) -> u32 {
 }
 
 fn rgba_to_rgb(image: RgbaImage) -> Vec<u8> {
-	let mut rgb = Vec::with_capacity(image.width() as usize * image.height() as usize * 3);
+	let pixels = checked_image_pixel_count(image.width(), image.height()).expect("validated image dimensions");
+	let mut rgb = Vec::with_capacity(pixels * 3);
 	for pixel in image.pixels() {
 		rgb.extend_from_slice(&pixel.0[..3]);
 	}
@@ -206,6 +218,23 @@ mod tests {
 		let frame = source.next_image_frame().unwrap().expect("frame");
 		assert_eq!((frame.width, frame.height), (4, 4));
 		assert_eq!(&frame.data[..3], &[1, 2, 3]);
+		let _ = std::fs::remove_file(path);
+	}
+
+	#[test]
+	fn oversized_resize_canvas_is_rejected_before_allocation() {
+		let path = temp_image_path("oversized-resize.png");
+		write_test_image(&path);
+		let mut config = FileImageInputConfig::once(&path);
+		config.resize = Some(ImageResizeOptions {
+			preserve_aspect_ratio: false,
+			reference_axis: ResizeAxis::Width,
+			reference_length: 1,
+			output_width: 8192,
+			output_height: 8192,
+			pad_color: RgbaColor::BLACK,
+		});
+		assert!(FileImageInputSource::open(config).is_err());
 		let _ = std::fs::remove_file(path);
 	}
 
