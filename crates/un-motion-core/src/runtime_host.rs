@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{
 	Arc,
+	atomic::{AtomicBool, Ordering},
 	mpsc::{self, Receiver, Sender, SyncSender, TryRecvError},
 };
 use std::thread::{self, JoinHandle};
@@ -378,6 +379,7 @@ impl CoreRuntimeHost {
 	pub(crate) fn spawn(config: CoreRuntimeConfig, status_callback: StatusCallback) -> anyhow::Result<Self> {
 		let (control_tx, control_rx) = runtime_control_channel();
 		let (init_tx, init_rx) = mpsc::channel();
+		let (status_callback, status_enabled) = gated_status_callback(status_callback);
 		let join = thread::spawn(move || run_core_runtime(config, control_rx, init_tx, status_callback));
 		match init_rx.recv_timeout(Duration::from_secs(5)) {
 			Ok(Ok(())) => Ok(Self {
@@ -385,10 +387,12 @@ impl CoreRuntimeHost {
 				join: Some(join),
 			}),
 			Ok(Err(error)) => {
+				status_enabled.store(false, Ordering::Release);
 				let _ = join.join();
 				Err(error)
 			}
 			Err(error) => {
+				status_enabled.store(false, Ordering::Release);
 				cancel_runtime_startup(&control_tx);
 				if join.is_finished() {
 					let _ = join.join();
@@ -412,6 +416,17 @@ impl CoreRuntimeHost {
 		self.stop();
 		if let Some(join) = self.join.take() { join.join() } else { Ok(()) }
 	}
+}
+
+fn gated_status_callback(status_callback: StatusCallback) -> (StatusCallback, Arc<AtomicBool>) {
+	let enabled = Arc::new(AtomicBool::new(true));
+	let callback_enabled = Arc::clone(&enabled);
+	let callback = Arc::new(move |update| {
+		if callback_enabled.load(Ordering::Acquire) {
+			status_callback(update);
+		}
+	});
+	(callback, enabled)
 }
 
 fn cancel_runtime_startup(control_tx: &SyncSender<CoreRuntimeControl>) {
@@ -2259,6 +2274,25 @@ mod tests {
 		let (control_tx, control_rx) = runtime_control_channel();
 		cancel_runtime_startup(&control_tx);
 		assert!(matches!(control_rx.try_recv(), Ok(CoreRuntimeControl::Stop)));
+	}
+
+	#[test]
+	fn failed_runtime_startup_disables_status_callback() {
+		let (status_tx, status_rx) = mpsc::channel();
+		let callback: StatusCallback = Arc::new(move |update| {
+			let _ = status_tx.send(update);
+		});
+		let (callback, enabled) = gated_status_callback(callback);
+		enabled.store(false, Ordering::Release);
+		callback(CoreRuntimeStatusUpdate {
+			active_profile_id: "default".to_string(),
+			running: false,
+			health: "stopped".to_string(),
+			frame_count: 0,
+			packet_count: 0,
+			runtime_snapshot: None,
+		});
+		assert!(matches!(status_rx.try_recv(), Err(TryRecvError::Empty)));
 	}
 
 	#[test]
