@@ -416,31 +416,20 @@ impl CoreControlState {
 				return status;
 			}
 		};
-		let install_result = match self.inner.runtime_host.lock() {
-			Ok(current) if current.is_some() => Err((host, false)),
-			Ok(mut current) => {
+		let install_result = {
+			let mut current = self.runtime_host_lock();
+			if current.is_some() {
+				Err(host)
+			} else {
 				*current = Some(host);
 				Ok(())
 			}
-			Err(_) => Err((host, true)),
 		};
-		if let Err((rejected_host, lock_poisoned)) = install_result {
+		if let Err(rejected_host) = install_result {
 			if let Some(error) = join_runtime_host(rejected_host).await {
 				tracing::error!(error = %error, "rejected runtime host failed to stop");
 			}
-			if !lock_poisoned {
-				return self.status().await;
-			}
-			let status = {
-				let mut state = self.inner.state.write().await;
-				state.status.running = false;
-				state.status.health = "failed: runtime host lock poisoned".to_string();
-				state.runtime_snapshot = None;
-				state.status.updated_at_ms = now_unix_ms();
-				state.status.clone()
-			};
-			self.emit(CoreEventKind::RuntimeStopped).await;
-			return status;
+			return self.status().await;
 		}
 		let status = {
 			let mut state = self.inner.state.write().await;
@@ -633,16 +622,23 @@ impl CoreControlState {
 	}
 
 	fn runtime_host_is_running(&self) -> bool {
-		self.inner.runtime_host.lock().map(|host| host.is_some()).unwrap_or(false)
+		self.runtime_host_lock().is_some()
 	}
 
 	fn runtime_handle(&self) -> anyhow::Result<CoreRuntimeHandle> {
-		let host = self.inner.runtime_host.lock().map_err(|_| anyhow!("runtime host lock poisoned"))?;
+		let host = self.runtime_host_lock();
 		Ok(host.as_ref().context("runtime is not running")?.handle())
 	}
 
+	fn runtime_host_lock(&self) -> std::sync::MutexGuard<'_, Option<CoreRuntimeHost>> {
+		self.inner.runtime_host.lock().unwrap_or_else(|poisoned| {
+			tracing::error!("recovering poisoned runtime host lock");
+			poisoned.into_inner()
+		})
+	}
+
 	async fn stop_runtime_host(&self) -> RuntimeStopOutcome {
-		let host = self.inner.runtime_host.lock().ok().and_then(|mut host| host.take());
+		let host = self.runtime_host_lock().take();
 		if let Some(host) = host {
 			let error = join_runtime_host(host).await;
 			if let Some(error) = &error {
@@ -783,6 +779,24 @@ mod tests {
 			runtime_thread_join_error(Err(Box::new(42_u32))),
 			Some("runtime thread panicked: non-string panic payload".to_string())
 		);
+	}
+
+	#[tokio::test]
+	async fn poisoned_runtime_host_lock_remains_recoverable() {
+		let state = CoreControlState::default();
+		let inner = state.inner.clone();
+		let panic = std::thread::spawn(move || {
+			let _host = inner.runtime_host.lock().expect("runtime host lock");
+			panic!("poison runtime host lock");
+		})
+		.join();
+		assert!(panic.is_err());
+
+		assert!(!state.runtime_host_is_running());
+		assert!(state.runtime_handle().is_err());
+		let stop = state.stop_runtime_host().await;
+		assert!(!stop.was_running);
+		assert!(stop.error.is_none());
 	}
 
 	#[tokio::test]
