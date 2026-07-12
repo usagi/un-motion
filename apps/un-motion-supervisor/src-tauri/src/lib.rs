@@ -538,6 +538,7 @@ fn launch_capturer(
 	state: State<'_, Mutex<SupervisorState>>,
 	app_settings: State<'_, Mutex<AppRuntimeSettings>>,
 ) -> Result<CapturerInstance, String> {
+	let state_handle = &state;
 	let api_worker_threads = app_settings
 		.lock()
 		.map(|settings| normalize_api_worker_threads(settings.api_worker_threads))
@@ -568,6 +569,10 @@ fn launch_capturer(
 	} else if let Some(existing) = state.capturers.values().find(|c| is_live(c) && c.info.profile_id.is_none()) {
 		return Ok(existing.info.clone());
 	}
+	state.next_id = state.next_id.saturating_add(1);
+	let id = state.next_id;
+	let http_client = state.http_client.clone();
+	drop(state);
 
 	let bind_addr = reserve_loopback_address()?;
 	let mut command = capturer_command(
@@ -585,36 +590,38 @@ fn launch_capturer(
 		.map_err(|e| format!("launch capturer: {e}"))?;
 	let stderr_tail = spawn_stderr_tail(child.stderr.take());
 	let pid = child.id();
-	state.next_id = state.next_id.saturating_add(1);
-	let id = state.next_id;
 	let started_at = Instant::now();
 	// healthz を待つ前にプロセスが死ぬケースを早期検出する。
-	if let Err(e) = wait_for_healthz(&state.http_client, bind_addr, &mut child, &stderr_tail) {
+	if let Err(e) = wait_for_healthz(&http_client, bind_addr, &mut child, &stderr_tail) {
 		let _ = force_stop_capturer_child(&mut child, "launch_capturer: healthz failed, abort spawn");
 		let tail = stderr_tail.lock().map(|tail| tail.clone()).unwrap_or_default();
 		let exit_code = child.try_wait().ok().flatten().and_then(|status| status.code());
-		state.capturers.insert(
-			id,
-			ManagedCapturer {
-				info: CapturerInstance {
-					id,
-					name: format!("Capturer #{id}"),
-					state: CapturerState::Crashed,
-					pid: None,
-					bind_addr: Some(bind_addr.to_string()),
-					profile_id: resolved_profile_id,
-					uptime_secs: started_at.elapsed().as_secs(),
-					last_stderr: tail.last().cloned(),
-					stderr_tail: tail,
-					exit_code,
+		state_handle
+			.lock()
+			.map_err(|_| "supervisor state poisoned".to_string())?
+			.capturers
+			.insert(
+				id,
+				ManagedCapturer {
+					info: CapturerInstance {
+						id,
+						name: format!("Capturer #{id}"),
+						state: CapturerState::Crashed,
+						pid: None,
+						bind_addr: Some(bind_addr.to_string()),
+						profile_id: resolved_profile_id,
+						uptime_secs: started_at.elapsed().as_secs(),
+						last_stderr: tail.last().cloned(),
+						stderr_tail: tail,
+						exit_code,
+					},
+					child,
+					bind_addr,
+					started_at,
+					stderr_tail,
+					prev_telemetry: None,
 				},
-				child,
-				bind_addr,
-				started_at,
-				stderr_tail,
-				prev_telemetry: None,
-			},
-		);
+			);
 		return Err(e);
 	}
 	let info = CapturerInstance {
@@ -630,17 +637,21 @@ fn launch_capturer(
 		exit_code: None,
 	};
 	let info_for_return = info.clone();
-	state.capturers.insert(
-		id,
-		ManagedCapturer {
-			info,
-			child,
-			bind_addr,
-			started_at,
-			stderr_tail,
-			prev_telemetry: None,
-		},
-	);
+	state_handle
+		.lock()
+		.map_err(|_| "supervisor state poisoned".to_string())?
+		.capturers
+		.insert(
+			id,
+			ManagedCapturer {
+				info,
+				child,
+				bind_addr,
+				started_at,
+				stderr_tail,
+				prev_telemetry: None,
+			},
+		);
 	Ok(info_for_return)
 }
 
@@ -648,25 +659,40 @@ fn launch_capturer(
 /// 一定時間内に終わらなければ kill する。
 #[tauri::command]
 fn stop_capturer(id: u32, state: State<'_, Mutex<SupervisorState>>) -> Result<(), String> {
-	let mut state = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
-	let http_client = state.http_client.clone();
-	if let Some(capturer) = state.capturers.get_mut(&id) {
-		stop_managed_capturer(id, capturer, &http_client)?;
+	let (http_client, mut capturer) = {
+		let mut guard = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
+		(guard.http_client.clone(), guard.capturers.remove(&id))
+	};
+	let result = if let Some(capturer) = capturer.as_mut() {
+		stop_managed_capturer(id, capturer, &http_client)
+	} else {
+		Ok(())
+	};
+	if let Some(capturer) = capturer {
+		state
+			.lock()
+			.map_err(|_| "supervisor state poisoned".to_string())?
+			.capturers
+			.insert(id, capturer);
 	}
-	Ok(())
+	result
 }
 
 /// Capturer の `/api/runtime/snapshot` を取得して GUI 用 DTO に詰め直す。
 #[tauri::command]
 fn capturer_runtime_status(id: u32, state: State<'_, Mutex<SupervisorState>>) -> Result<CapturerRuntimeStatus, String> {
-	let mut state = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
-	refresh_capturers(&mut state);
-	let http_client = state.http_client.clone();
-	let capturer = state.capturers.get_mut(&id).ok_or_else(|| format!("capturer not found: {id}"))?;
-	let bind_addr = capturer.bind_addr;
-	let info_state = capturer.info.state.clone();
-	let pid = capturer.info.pid;
-	let uptime_secs = capturer.info.uptime_secs;
+	let (http_client, bind_addr, info_state, pid, uptime_secs) = {
+		let mut guard = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
+		refresh_capturers(&mut guard);
+		let capturer = guard.capturers.get(&id).ok_or_else(|| format!("capturer not found: {id}"))?;
+		(
+			guard.http_client.clone(),
+			capturer.bind_addr,
+			capturer.info.state.clone(),
+			capturer.info.pid,
+			capturer.info.uptime_secs,
+		)
+	};
 
 	let (healthy, note, snapshot) = if matches!(info_state, CapturerState::Running | CapturerState::Starting) {
 		match fetch_runtime_snapshot(&http_client, bind_addr) {
@@ -680,9 +706,10 @@ fn capturer_runtime_status(id: u32, state: State<'_, Mutex<SupervisorState>>) ->
 	// Phase E telemetry: snapshot から累積カウンタを抜き出し、前回サンプルと
 	// 差分を取って FPS を算出する。初回観測 (`prev_telemetry` が None) では
 	// `fps = None` を返し、サンプルだけ保存する。
-	let fps = if let Some(snapshot_value) = snapshot.as_ref()
-		&& let Some(cur_sample) = extract_telemetry_sample(snapshot_value)
-	{
+	let current_sample = snapshot.as_ref().and_then(extract_telemetry_sample);
+	let fps = if let Some(cur_sample) = current_sample {
+		let mut guard = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
+		let capturer = guard.capturers.get_mut(&id).ok_or_else(|| format!("capturer not found: {id}"))?;
 		let computed = capturer
 			.prev_telemetry
 			.as_ref()
@@ -706,6 +733,18 @@ fn capturer_runtime_status(id: u32, state: State<'_, Mutex<SupervisorState>>) ->
 	})
 }
 
+fn capturer_action_context(
+	state: &Mutex<SupervisorState>,
+	id: u32,
+) -> Result<(reqwest::blocking::Client, SocketAddr, Option<String>), String> {
+	let guard = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
+	let capturer = guard.capturers.get(&id).ok_or_else(|| format!("capturer not found: {id}"))?;
+	if !matches!(capturer.info.state, CapturerState::Running | CapturerState::Starting) {
+		return Err(format!("capturer is not running: {id}"));
+	}
+	Ok((guard.http_client.clone(), capturer.bind_addr, capturer.info.profile_id.clone()))
+}
+
 #[tauri::command]
 fn calibrate_capturer_neutral(
 	id: u32,
@@ -713,24 +752,16 @@ fn calibrate_capturer_neutral(
 	valid_sample_count: Option<usize>,
 	state: State<'_, Mutex<SupervisorState>>,
 ) -> Result<ProfileDetail, String> {
-	let state = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
-	let capturer = state.capturers.get(&id).ok_or_else(|| format!("capturer not found: {id}"))?;
-	if !matches!(capturer.info.state, CapturerState::Running | CapturerState::Starting) {
-		return Err(format!("capturer is not running: {id}"));
-	}
-	let profile_id = capturer
-		.info
-		.profile_id
-		.clone()
-		.or_else(|| fetch_capturer_active_profile_id(&state.http_client, capturer.bind_addr))
+	let (http_client, bind_addr, configured_profile_id) = capturer_action_context(&state, id)?;
+	let profile_id = configured_profile_id
+		.or_else(|| fetch_capturer_active_profile_id(&http_client, bind_addr))
 		.ok_or_else(|| "active profile is unknown".to_string())?;
-	let url = format!("http://{}/api/runtime/calibration/neutral", capturer.bind_addr);
+	let url = format!("http://{bind_addr}/api/runtime/calibration/neutral");
 	let body = serde_json::json!({
 		"pose": pose.as_deref().unwrap_or("U"),
 		"validSampleCount": valid_sample_count.unwrap_or(45).clamp(1, 240),
 	});
-	let response = state
-		.http_client
+	let response = http_client
 		.post(&url)
 		.timeout(HTTP_RUNTIME_ACTION_TIMEOUT)
 		.json(&body)
@@ -753,20 +784,12 @@ fn calibrate_capturer_neutral(
 
 #[tauri::command]
 fn clear_capturer_neutral_calibration(id: u32, state: State<'_, Mutex<SupervisorState>>) -> Result<ProfileDetail, String> {
-	let state = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
-	let capturer = state.capturers.get(&id).ok_or_else(|| format!("capturer not found: {id}"))?;
-	if !matches!(capturer.info.state, CapturerState::Running | CapturerState::Starting) {
-		return Err(format!("capturer is not running: {id}"));
-	}
-	let profile_id = capturer
-		.info
-		.profile_id
-		.clone()
-		.or_else(|| fetch_capturer_active_profile_id(&state.http_client, capturer.bind_addr))
+	let (http_client, bind_addr, configured_profile_id) = capturer_action_context(&state, id)?;
+	let profile_id = configured_profile_id
+		.or_else(|| fetch_capturer_active_profile_id(&http_client, bind_addr))
 		.ok_or_else(|| "active profile is unknown".to_string())?;
-	let url = format!("http://{}/api/runtime/calibration/neutral/clear", capturer.bind_addr);
-	let response = state
-		.http_client
+	let url = format!("http://{bind_addr}/api/runtime/calibration/neutral/clear");
+	let response = http_client
 		.post(&url)
 		.send()
 		.map_err(|error| format!("POST {url} failed: {error}"))?;
@@ -793,23 +816,15 @@ fn build_capturer_face_pose_model(
 	valid_sample_count: Option<usize>,
 	state: State<'_, Mutex<SupervisorState>>,
 ) -> Result<ProfileDetail, String> {
-	let state = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
-	let capturer = state.capturers.get(&id).ok_or_else(|| format!("capturer not found: {id}"))?;
-	if !matches!(capturer.info.state, CapturerState::Running | CapturerState::Starting) {
-		return Err(format!("capturer is not running: {id}"));
-	}
-	let profile_id = capturer
-		.info
-		.profile_id
-		.clone()
-		.or_else(|| fetch_capturer_active_profile_id(&state.http_client, capturer.bind_addr))
+	let (http_client, bind_addr, configured_profile_id) = capturer_action_context(&state, id)?;
+	let profile_id = configured_profile_id
+		.or_else(|| fetch_capturer_active_profile_id(&http_client, bind_addr))
 		.ok_or_else(|| "active profile is unknown".to_string())?;
-	let url = format!("http://{}/api/runtime/face-pose-model/build", capturer.bind_addr);
+	let url = format!("http://{bind_addr}/api/runtime/face-pose-model/build");
 	let body = serde_json::json!({
 		"validSampleCount": valid_sample_count.unwrap_or(90).clamp(1, 240),
 	});
-	let response = state
-		.http_client
+	let response = http_client
 		.post(&url)
 		.timeout(HTTP_RUNTIME_ACTION_TIMEOUT)
 		.json(&body)
@@ -1957,7 +1972,7 @@ fn update_profile_field(
 	value: serde_json::Value,
 	state: State<'_, Mutex<SupervisorState>>,
 ) -> Result<ProfileDetail, String> {
-	let state = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
+	let state_guard = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
 	let store = user_profile_store();
 	let mut doc = store.load();
 	{
@@ -1969,6 +1984,7 @@ fn update_profile_field(
 		apply_profile_field(profile, &field, value)?;
 	}
 	let saved = store.save(doc).map_err(|e| format!("save profile document: {e}"))?;
+	drop(state_guard);
 	push_document_to_matching_capturers(&state, &saved, &profile_id);
 	saved
 		.profiles
@@ -2088,20 +2104,20 @@ fn enumerate_webcam_formats(backend: String, device_id_or_name: String) -> Resul
 /// 動作中の Capturer をすべて停止する。CloseRequested ハンドラと Tauri command の両方
 /// から呼ばれるので、`SupervisorState` への lock 取得とエラーハンドリングをここに集約。
 fn stop_all_in_state(state: &Mutex<SupervisorState>) {
-	let Ok(mut state) = state.lock() else {
-		return;
+	let (http_client, mut capturers) = {
+		let Ok(mut guard) = state.lock() else { return };
+		(guard.http_client.clone(), std::mem::take(&mut guard.capturers))
 	};
-	let http_client = state.http_client.clone();
-	let ids: Vec<u32> = state.capturers.keys().copied().collect();
-	for id in ids {
-		if let Some(capturer) = state.capturers.get_mut(&id) {
-			if matches!(capturer.info.state, CapturerState::Exited | CapturerState::Crashed) {
-				continue;
-			}
-			if let Err(e) = stop_managed_capturer(id, capturer, &http_client) {
-				tracing::warn!(target: "un_motion_supervisor", capturer_id = id, error = %e, "stop_all: stop_managed_capturer failed");
-			}
+	for (id, capturer) in &mut capturers {
+		if matches!(capturer.info.state, CapturerState::Exited | CapturerState::Crashed) {
+			continue;
 		}
+		if let Err(e) = stop_managed_capturer(*id, capturer, &http_client) {
+			tracing::warn!(target: "un_motion_supervisor", capturer_id = *id, error = %e, "stop_all: stop_managed_capturer failed");
+		}
+	}
+	if let Ok(mut guard) = state.lock() {
+		guard.capturers.append(&mut capturers);
 	}
 }
 
@@ -3292,18 +3308,24 @@ fn opt_f32(value: &serde_json::Value, field: &str) -> Result<Option<f32>, String
 /// 編集された profile を実行しているプロセスだけに同期する。
 ///
 /// 失敗は警告のみで握りつぶす (再起動すれば user profile store から復元できるため致命的でない)。
-fn push_document_to_matching_capturers(state: &SupervisorState, doc: &CoreProfileDocument, profile_id: &str) {
+fn push_document_to_matching_capturers(state: &Mutex<SupervisorState>, doc: &CoreProfileDocument, profile_id: &str) {
+	let (http_client, targets) = {
+		let Ok(state) = state.lock() else { return };
+		let targets = state
+			.capturers
+			.values()
+			.filter(|capturer| {
+				matches!(capturer.info.state, CapturerState::Running) && capturer.info.profile_id.as_deref() == Some(profile_id)
+			})
+			.map(|capturer| (capturer.info.id, capturer.bind_addr))
+			.collect::<Vec<_>>();
+		(state.http_client.clone(), targets)
+	};
 	let body = serde_json::json!({ "selection": doc });
-	for capturer in state.capturers.values() {
-		if !matches!(capturer.info.state, CapturerState::Running) {
-			continue;
-		}
-		if capturer.info.profile_id.as_deref() != Some(profile_id) {
-			continue;
-		}
-		let url = format!("http://{}/api/profiles/document/sync", capturer.bind_addr);
-		if let Err(error) = state.http_client.put(&url).json(&body).send() {
-			tracing::warn!(id = capturer.info.id, %error, "sync profile document via capturer failed");
+	for (id, bind_addr) in targets {
+		let url = format!("http://{bind_addr}/api/profiles/document/sync");
+		if let Err(error) = http_client.put(&url).json(&body).send() {
+			tracing::warn!(id, %error, "sync profile document via capturer failed");
 		}
 	}
 }
