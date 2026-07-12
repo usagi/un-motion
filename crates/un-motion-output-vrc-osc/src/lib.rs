@@ -178,7 +178,10 @@ fn encode_packet_chunks(packets: Vec<OscPacket>) -> anyhow::Result<Vec<Vec<u8>>>
 		let mut candidate = chunk.clone();
 		candidate.push(packet.clone());
 		let encoded = encode_bundle(candidate).context("VRC OSC encode failed")?;
-		if encoded.len() <= MAX_OSC_DATAGRAM_BYTES || chunk.is_empty() {
+		if encoded.len() > MAX_OSC_DATAGRAM_BYTES && chunk.is_empty() {
+			anyhow::bail!("VRC OSC packet exceeds {MAX_OSC_DATAGRAM_BYTES} byte datagram limit");
+		}
+		if encoded.len() <= MAX_OSC_DATAGRAM_BYTES {
 			chunk.push(packet);
 			continue;
 		}
@@ -1179,6 +1182,18 @@ mod tests {
 
 		assert!(datagrams.len() > 1);
 		assert!(datagrams.iter().all(|datagram| datagram.len() <= MAX_OSC_DATAGRAM_BYTES));
+	}
+
+	#[test]
+	fn rejects_single_vrc_packet_over_datagram_limit() {
+		let packet = OscPacket::Message(OscMessage {
+			addr: format!("{AVATAR_PARAMETER_PREFIX}{}", "x".repeat(MAX_OSC_DATAGRAM_BYTES)),
+			args: vec![OscType::Float(0.5)],
+		});
+
+		let error = encode_packet_chunks(vec![packet]).expect_err("oversized packet must fail");
+
+		assert!(error.to_string().contains("packet exceeds"));
 	}
 
 	#[test]
