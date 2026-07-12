@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::{SocketAddr, UdpSocket};
 
 use anyhow::Context;
-use rosc::{OscBundle, OscMessage, OscPacket, OscTime, OscType, encoder};
+use rosc::{OscMessage, OscPacket, OscType, encoder};
 use serde::{Deserialize, Serialize};
 use un_motion_frame::{MotionSignalValue, SampleState, UNMotionFrame};
 
@@ -173,32 +173,38 @@ fn parameter_value_unchanged(old: VrcOscParameterValue, new: VrcOscParameterValu
 
 fn encode_packet_chunks(packets: Vec<OscPacket>) -> anyhow::Result<Vec<Vec<u8>>> {
 	let mut datagrams = Vec::new();
-	let mut chunk = Vec::<OscPacket>::new();
+	let mut chunk = Vec::new();
+	let mut chunk_len = 16usize;
 	for packet in packets {
-		let mut candidate = chunk.clone();
-		candidate.push(packet.clone());
-		let encoded = encode_bundle(candidate).context("VRC OSC encode failed")?;
-		if encoded.len() > MAX_OSC_DATAGRAM_BYTES && chunk.is_empty() {
+		let encoded = encoder::encode(&packet).context("VRC OSC packet encode failed")?;
+		let bundled_len = 4usize.saturating_add(encoded.len());
+		if 16usize.saturating_add(bundled_len) > MAX_OSC_DATAGRAM_BYTES {
 			anyhow::bail!("VRC OSC packet exceeds {MAX_OSC_DATAGRAM_BYTES} byte datagram limit");
 		}
-		if encoded.len() <= MAX_OSC_DATAGRAM_BYTES {
-			chunk.push(packet);
-			continue;
+		if chunk_len.saturating_add(bundled_len) > MAX_OSC_DATAGRAM_BYTES {
+			datagrams.push(encode_bundle_elements(&chunk, chunk_len));
+			chunk.clear();
+			chunk_len = 16;
 		}
-		datagrams.push(encode_bundle(std::mem::take(&mut chunk)).context("VRC OSC encode failed")?);
-		chunk.push(packet);
+		chunk_len += bundled_len;
+		chunk.push(encoded);
 	}
 	if !chunk.is_empty() {
-		datagrams.push(encode_bundle(chunk).context("VRC OSC encode failed")?);
+		datagrams.push(encode_bundle_elements(&chunk, chunk_len));
 	}
 	Ok(datagrams)
 }
 
-fn encode_bundle(content: Vec<OscPacket>) -> Result<Vec<u8>, rosc::OscError> {
-	encoder::encode(&OscPacket::Bundle(OscBundle {
-		timetag: OscTime { seconds: 0, fractional: 1 },
-		content,
-	}))
+fn encode_bundle_elements(elements: &[Vec<u8>], encoded_len: usize) -> Vec<u8> {
+	let mut bundle = Vec::with_capacity(encoded_len);
+	bundle.extend_from_slice(b"#bundle\0");
+	bundle.extend_from_slice(&0u32.to_be_bytes());
+	bundle.extend_from_slice(&1u32.to_be_bytes());
+	for element in elements {
+		bundle.extend_from_slice(&(element.len() as u32).to_be_bytes());
+		bundle.extend_from_slice(element);
+	}
+	bundle
 }
 
 pub fn vrc_osc_packets_for_frame(frame: &UNMotionFrame, options: &VrcOscOutputOptions) -> Vec<OscPacket> {
@@ -701,7 +707,7 @@ fn parameter_supports_negative(parameter: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-	use rosc::OscPacket;
+	use rosc::{OscBundle, OscPacket, OscTime};
 	use un_motion_frame::{ExpressionSample, FaceMotion, MotionSignal, SampleState, TrackingState, UNMotionFrame};
 
 	use super::*;
@@ -758,6 +764,21 @@ mod tests {
 		assert!(sink.last_values.is_empty());
 		sink.commit_parameters(changed);
 		assert!(sink.changed_parameters_for_frame(&frame).is_empty());
+	}
+
+	#[test]
+	fn optimized_vrc_bundle_encoding_matches_rosc() {
+		let packets = vec![vrc_osc_packet_for_parameter(VrcOscParameter {
+			name: "FT/v2/JawOpen".to_string(),
+			value: VrcOscParameterValue::Float(0.5),
+		})];
+		let expected = encoder::encode(&OscPacket::Bundle(OscBundle {
+			timetag: OscTime { seconds: 0, fractional: 1 },
+			content: packets.clone(),
+		}))
+		.expect("reference bundle");
+
+		assert_eq!(encode_packet_chunks(packets).expect("optimized bundle"), vec![expected]);
 	}
 
 	fn try_packet_value(packet: &OscPacket) -> Option<(&str, f32)> {
