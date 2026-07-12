@@ -217,6 +217,7 @@ struct CoreControlInner {
 	profile_store: Option<CoreProfileDocumentStore>,
 	runtime_host: Mutex<Option<CoreRuntimeHost>>,
 	pending_runtime_status: ArcSwapOption<CoreRuntimeStatusUpdate>,
+	runtime_status_apply: AsyncMutex<()>,
 	events: broadcast::Sender<CoreEvent>,
 	next_event_sequence: AtomicU64,
 }
@@ -268,6 +269,7 @@ impl CoreControlState {
 				profile_store,
 				runtime_host: Mutex::new(None),
 				pending_runtime_status: ArcSwapOption::empty(),
+				runtime_status_apply: AsyncMutex::new(()),
 				events,
 				next_event_sequence: AtomicU64::new(1),
 			}),
@@ -395,7 +397,7 @@ impl CoreControlState {
 		if self.runtime_host_is_running() {
 			return self.status().await;
 		}
-		self.inner.pending_runtime_status.store(None);
+		self.clear_pending_runtime_status().await;
 		let status_callback = self.runtime_status_callback();
 		let host = match core_runtime_config_from_document(&document) {
 			Ok(config) => run_blocking_runtime_operation(move || CoreRuntimeHost::spawn(config, status_callback)).await,
@@ -638,6 +640,7 @@ impl CoreControlState {
 	}
 
 	async fn stop_runtime_host(&self) -> RuntimeStopOutcome {
+		let _apply = self.inner.runtime_status_apply.lock().await;
 		let host = self.runtime_host_lock().take();
 		if let Some(host) = host {
 			let error = join_runtime_host(host).await;
@@ -665,6 +668,7 @@ impl CoreControlState {
 	}
 
 	async fn apply_pending_runtime_status(&self) {
+		let _apply = self.inner.runtime_status_apply.lock().await;
 		let Some(update) = self.inner.pending_runtime_status.swap(None) else {
 			return;
 		};
@@ -678,6 +682,11 @@ impl CoreControlState {
 		state.status.packet_count = update.packet_count;
 		state.runtime_snapshot.clone_from(&update.runtime_snapshot);
 		state.status.updated_at_ms = now_unix_ms();
+	}
+
+	async fn clear_pending_runtime_status(&self) {
+		let _apply = self.inner.runtime_status_apply.lock().await;
+		self.inner.pending_runtime_status.store(None);
 	}
 }
 
@@ -766,6 +775,41 @@ mod tests {
 		assert!(status.running);
 		assert_eq!(status.frame_count, 12);
 		assert_eq!(status.packet_count, 34);
+	}
+
+	#[tokio::test]
+	async fn runtime_status_consumers_apply_the_latest_update_serially() {
+		let state = CoreControlState::default();
+		let callback = state.runtime_status_callback();
+		let apply = state.inner.runtime_status_apply.lock().await;
+		callback(CoreRuntimeStatusUpdate {
+			active_profile_id: "default".to_string(),
+			running: true,
+			health: "first".to_string(),
+			frame_count: 1,
+			packet_count: 1,
+			runtime_snapshot: None,
+		});
+		let status_state = state.clone();
+		let mut status_task = tokio::spawn(async move { status_state.status().await });
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(20), &mut status_task)
+				.await
+				.is_err()
+		);
+		callback(CoreRuntimeStatusUpdate {
+			active_profile_id: "default".to_string(),
+			running: true,
+			health: "latest".to_string(),
+			frame_count: 2,
+			packet_count: 2,
+			runtime_snapshot: None,
+		});
+		drop(apply);
+
+		let status = status_task.await.expect("status task");
+		assert_eq!(status.health, "latest");
+		assert_eq!(status.frame_count, 2);
 	}
 
 	#[test]
