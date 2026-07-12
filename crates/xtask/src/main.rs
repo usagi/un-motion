@@ -4879,12 +4879,15 @@ fn unmf_capture_frame(repo: &Path, raw_args: Vec<OsString>) -> Result<()> {
 	let strategy = ZenohTopicStrategy::new(args.base_key_expr.clone(), args.topic_mode);
 	let subscribe_key_expr = strategy.subscribe_key_expr();
 	let mut backend = ZenohSubscriberBackend::open_default().context("UNMF/Z capture Zenoh open failed")?;
-	let subscriber = Subscriber::declare(&mut backend, strategy)
-		.with_context(|| format!("UNMF/Z capture subscribe failed on {subscribe_key_expr}"))?;
+	let subscriber =
+		Subscriber::declare(&mut backend, strategy).with_context(|| format!("UNMF/Z capture subscribe failed on {subscribe_key_expr}"))?;
 	let started = Instant::now();
 	let frame = loop {
 		if started.elapsed() >= args.timeout {
-			bail!("UNMF/Z capture timed out after {} ms on {subscribe_key_expr}", args.timeout.as_millis());
+			bail!(
+				"UNMF/Z capture timed out after {} ms on {subscribe_key_expr}",
+				args.timeout.as_millis()
+			);
 		}
 		match subscriber.recv_frame_timeout(Duration::from_millis(50)) {
 			Ok(Some(frame)) => {
@@ -4903,11 +4906,7 @@ fn unmf_capture_frame(repo: &Path, raw_args: Vec<OsString>) -> Result<()> {
 	}
 	let json = serde_json::to_string_pretty(&frame)?;
 	fs::write(&output_path, format!("{json}\n")).with_context(|| format!("failed to write {}", output_path.display()))?;
-	println!(
-		"captured UNMotionFrame from {} to {}",
-		subscribe_key_expr,
-		output_path.display()
-	);
+	println!("captured UNMotionFrame from {} to {}", subscribe_key_expr, output_path.display());
 	Ok(())
 }
 

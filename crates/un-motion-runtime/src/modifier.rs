@@ -2251,10 +2251,10 @@ mod tests {
 		// hands_enabled=false で LeftHand は smoothing 対象外。LeftHand に
 		// 強い回転を入れても smoothing は触らない (が、後段 BoneFilter で除去される)。
 		let target_hand = FrameQuat {
-			x: 0.7071,
+			x: std::f32::consts::FRAC_1_SQRT_2,
 			y: 0.0,
 			z: 0.0,
-			w: 0.7071,
+			w: std::f32::consts::FRAC_1_SQRT_2,
 		};
 		let mut frame = UNMotionFrame::new(1);
 		frame.body = Some(BodyMotion {

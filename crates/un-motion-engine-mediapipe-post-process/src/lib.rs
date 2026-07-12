@@ -342,7 +342,6 @@ fn mediapipe_observation_qualities(native: &NativeMediaPipeOutput, config: &Medi
 		arms: arms_observation_quality(
 			pose,
 			config.min_landmark_confidence,
-			config.hands_enabled,
 			config.arms_ik_enabled && config.rules.arm_ik_from_hands,
 			&left_hand,
 			&right_hand,
@@ -1323,7 +1322,6 @@ fn head_observation_quality(pose: &NativePose, face: &NativeFace, min_confidence
 fn arms_observation_quality(
 	pose: &NativePose,
 	min_confidence: f32,
-	hands_enabled: bool,
 	hand_ik_enabled: bool,
 	left_hand: &ObservationQuality,
 	right_hand: &ObservationQuality,
@@ -5920,32 +5918,5 @@ mod tests {
 			.map(|(value, _confidence)| value)
 			.unwrap_or_else(|| panic!("missing signal {name}"));
 		assert!((value - expected).abs() < 0.0001, "signal {name} expected {expected}, got {value}");
-	}
-
-	fn assert_quat_near(actual: &Quatf, expected: [f32; 4], epsilon: f32) {
-		assert!(
-			(actual.x - expected[0]).abs() <= epsilon,
-			"quat x expected {}, got {}",
-			expected[0],
-			actual.x
-		);
-		assert!(
-			(actual.y - expected[1]).abs() <= epsilon,
-			"quat y expected {}, got {}",
-			expected[1],
-			actual.y
-		);
-		assert!(
-			(actual.z - expected[2]).abs() <= epsilon,
-			"quat z expected {}, got {}",
-			expected[2],
-			actual.z
-		);
-		assert!(
-			(actual.w - expected[3]).abs() <= epsilon,
-			"quat w expected {}, got {}",
-			expected[3],
-			actual.w
-		);
 	}
 }

@@ -247,9 +247,9 @@ mod tests {
 		let blink = face
 			.expressions
 			.iter()
-			.find(|e| e.name == "eyeBlinkLeft")
+			.find(|e| e.name == "EyeBlinkLeft")
 			.expect("eyeBlinkLeft expression");
-		assert!((blink.value - 0.42).abs() < 1e-4, "blink.value = {}", blink.value);
+		assert!((blink.value - 0.275).abs() < 1e-4, "blink.value = {}", blink.value);
 
 		let snap = source.telemetry.atomics.snapshot();
 		assert_eq!(snap.raw_received, 1, "raw_received = {}", snap.raw_received);
@@ -302,8 +302,12 @@ mod tests {
 
 		let frame = source.next_frame().expect("poll").expect("frame should be produced");
 		let face = frame.face.as_ref().expect("face populated");
-		let blink = face.expressions.iter().find(|e| e.name == "eyeBlinkLeft").expect("blink");
-		assert!((blink.value - 0.90).abs() < 1e-4, "latest datagram should win; got {}", blink.value);
+		let blink = face.expressions.iter().find(|e| e.name == "EyeBlinkLeft").expect("blink");
+		assert!(
+			(blink.value - 0.875).abs() < 1e-4,
+			"latest datagram should win; got {}",
+			blink.value
+		);
 
 		let snap = source.telemetry.atomics.snapshot();
 		assert_eq!(snap.raw_received, 2);
