@@ -207,6 +207,7 @@ impl CoreProfileDocumentStore {
 	pub fn load(&self) -> CoreProfileDocument {
 		let mut profiles = Vec::new();
 		let mut profile_sources = Vec::new();
+		let profile_manifest = load_profile_manifest(&self.conf_path);
 		if let Ok(entries) = fs::read_dir(&self.profiles_dir) {
 			for entry in entries.flatten() {
 				let path = entry.path();
@@ -219,6 +220,9 @@ impl CoreProfileDocumentStore {
 				let Ok(profile) = toml::from_str::<CoreProfileFile>(&raw) else {
 					continue;
 				};
+				if profile_manifest.as_ref().is_some_and(|manifest| !manifest.contains(&profile.id)) {
+					continue;
+				}
 				for source in profile.sources {
 					let kind = normalize_source_kind(&source.kind);
 					profile_sources.push(CoreProfileDocumentSource {
@@ -710,6 +714,13 @@ fn load_profile_order(path: &Path) -> Vec<String> {
 		.unwrap_or_default()
 }
 
+fn load_profile_manifest(path: &Path) -> Option<HashSet<String>> {
+	let raw = fs::read_to_string(path).ok()?;
+	let doc = raw.parse::<toml::Value>().ok()?;
+	let ids = doc.get("desktop")?.get("profile_ids")?.as_array()?;
+	Some(ids.iter().filter_map(toml::Value::as_str).map(ToString::to_string).collect())
+}
+
 fn sort_profiles_by_saved_order(profiles: &mut [CoreProfileDocumentProfile], order: &[String]) {
 	let order_index = order
 		.iter()
@@ -748,6 +759,10 @@ fn save_profile_metadata(path: &Path, active_profile_id: &str, profile_order: &[
 	desktop.insert("active_profile_id".to_string(), toml::Value::String(active_profile_id.to_string()));
 	desktop.insert(
 		"profile_order".to_string(),
+		toml::Value::Array(profile_order.iter().map(|id| toml::Value::String(id.clone())).collect()),
+	);
+	desktop.insert(
+		"profile_ids".to_string(),
 		toml::Value::Array(profile_order.iter().map(|id| toml::Value::String(id.clone())).collect()),
 	);
 	let raw = toml::to_string_pretty(&doc).context("failed to format conf.toml")?;
@@ -858,6 +873,15 @@ mirrorCorrectionEnabled = true
 		);
 		let profile_text = fs::read_to_string(profile_file_for_id(&root, "p2")).expect("profile");
 		assert!(profile_text.contains("host = \"0.0.0.0\""));
+		let stale = profile_text
+			.replace("id = \"p2\"", "id = \"stale\"")
+			.replace("name = \"Profile 2\"", "name = \"Stale\"");
+		fs::write(root.join("profiles/stale.toml"), stale).expect("simulate stale profile after metadata commit");
+		let reloaded = store.load();
+		assert_eq!(
+			reloaded.profiles.iter().map(|profile| profile.id.as_str()).collect::<Vec<_>>(),
+			vec!["p2"]
+		);
 	}
 
 	#[test]
