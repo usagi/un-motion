@@ -935,7 +935,7 @@ fn resize_ccap_frame_to_rgb8(
 	if x_map.len() != dst_width_usize {
 		anyhow::bail!("RGB resize x-map length does not match destination width");
 	}
-	let src: &[u8] = frame.data.as_ref();
+	let src: &[u8] = frame.data;
 	let stride = frame.stride as usize;
 	let row_bytes = ccap_pixel_row_bytes(frame.pixel_format, src_width)?;
 	if stride < row_bytes {
@@ -984,7 +984,7 @@ fn checked_rgb8_output_len(width: u32, height: u32) -> anyhow::Result<usize> {
 fn convert_ccap_frame_to_rgb8(frame: &PendingDirectShowFrame<'_>) -> anyhow::Result<Vec<u8>> {
 	let width = frame.width as usize;
 	let height = frame.height as usize;
-	let src: &[u8] = frame.data.as_ref();
+	let src: &[u8] = frame.data;
 	let stride = frame.stride as usize;
 	let row_bytes = ccap_pixel_row_bytes(frame.pixel_format, width)?;
 	if stride < row_bytes {

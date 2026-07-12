@@ -1265,13 +1265,15 @@ mirrorCorrectionEnabled = true
 		let root = temp_root("oversized-document");
 		let store = CoreProfileDocumentStore::from_root(&root);
 		let profile = default_profiles().remove(0);
-		let mut too_many_profiles = CoreProfileDocument::default();
-		too_many_profiles.profiles = (0..=MAX_PROFILE_FILES)
-			.map(|index| CoreProfileDocumentProfile {
-				id: format!("profile-{index}"),
-				..profile.clone()
-			})
-			.collect();
+		let too_many_profiles = CoreProfileDocument {
+			profiles: (0..=MAX_PROFILE_FILES)
+				.map(|index| CoreProfileDocumentProfile {
+					id: format!("profile-{index}"),
+					..profile.clone()
+				})
+				.collect(),
+			..CoreProfileDocument::default()
+		};
 		assert!(
 			store
 				.save(too_many_profiles)
