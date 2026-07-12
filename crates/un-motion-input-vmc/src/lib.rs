@@ -373,13 +373,14 @@ fn osc_string(value: &OscType) -> Option<&str> {
 }
 
 fn osc_float(value: &OscType) -> Option<f32> {
-	match value {
+	let value = match value {
 		OscType::Float(value) => Some(*value),
 		OscType::Double(value) => Some(*value as f32),
 		OscType::Int(value) => Some(*value as f32),
 		OscType::Long(value) => Some(*value as f32),
 		_ => None,
-	}
+	}?;
+	value.is_finite().then_some(value)
 }
 
 fn osc_int(value: &OscType) -> Option<i32> {
@@ -439,6 +440,25 @@ mod tests {
 			decoder
 				.decode_packet(&nested_bundle(MAX_OSC_BUNDLE_DEPTH + 1, message()), 2)
 				.is_none()
+		);
+	}
+
+	#[test]
+	fn rejects_non_finite_osc_numbers() {
+		assert_eq!(osc_float(&OscType::Float(f32::NAN)), None);
+		assert_eq!(osc_float(&OscType::Double(f64::INFINITY)), None);
+		assert!(
+			parse_transform(&[
+				OscType::String("Head".to_string()),
+				OscType::Float(f32::NAN),
+				OscType::Float(0.0),
+				OscType::Float(0.0),
+				OscType::Float(0.0),
+				OscType::Float(0.0),
+				OscType::Float(0.0),
+				OscType::Float(1.0),
+			])
+			.is_none()
 		);
 	}
 

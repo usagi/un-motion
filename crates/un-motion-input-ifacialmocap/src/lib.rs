@@ -358,8 +358,8 @@ pub fn parse_ifacialmocap_frame(packet: &str, source_id: &str, received_timestam
 		} else if field_name.eq_ignore_ascii_case("rightEye") {
 			right_eye = Some(parse_triplet(raw_value)?);
 		} else if field_name.eq_ignore_ascii_case("confidence") {
-			confidence = raw_value.parse::<f32>().unwrap_or(confidence).clamp(0.0, 1.0);
-		} else if let Ok(value) = raw_value.parse::<f32>() {
+			confidence = parse_finite_f32(raw_value).unwrap_or(confidence).clamp(0.0, 1.0);
+		} else if let Some(value) = parse_finite_f32(raw_value) {
 			push_expression_if_supported(
 				&mut expressions,
 				normalize_expression_name(field_name),
@@ -393,6 +393,17 @@ fn parse_next_triplet_value<'a>(values: &mut impl Iterator<Item = &'a str>, raw:
 		.ok_or_else(|| anyhow::anyhow!("invalid triplet '{raw}': missing {label}"))?
 		.parse::<f32>()
 		.map_err(|error| anyhow::anyhow!("invalid triplet '{raw}': {error}"))
+		.and_then(|value| {
+			value
+				.is_finite()
+				.then_some(value)
+				.ok_or_else(|| anyhow::anyhow!("invalid triplet '{raw}': {label} is not finite"))
+		})
+}
+
+fn parse_finite_f32(raw: &str) -> Option<f32> {
+	let value = raw.parse::<f32>().ok()?;
+	value.is_finite().then_some(value)
 }
 
 fn normalize_payload(bytes: &[u8]) -> &str {
@@ -434,7 +445,7 @@ fn parse_blendshape_segment(segment: &str) -> Option<(String, f32)> {
 	if name.is_empty() {
 		return None;
 	}
-	let value = raw_value.parse::<f32>().ok()?;
+	let value = parse_finite_f32(raw_value)?;
 	Some((normalize_expression_name(name), normalize_blendshape_value(value)))
 }
 
@@ -1333,6 +1344,17 @@ mod tests {
 			frame.expressions,
 			vec![("eyeBlinkLeft".to_string(), 0.7), ("mouthSmileRight".to_string(), 0.65)]
 		);
+	}
+
+	#[test]
+	fn rejects_non_finite_tracking_values() {
+		let invalid_head = "head#NaN,0,0|leftEye#0,0,0|rightEye#0,0,0";
+		assert!(parse_ifacialmocap_frame(invalid_head, "ifm:test", 1).is_err());
+
+		let packet = "head#0,0,0|leftEye#0,0,0|rightEye#0,0,0|confidence#NaN|jawOpen#inf";
+		let frame = parse_ifacialmocap_frame(packet, "ifm:test", 1).expect("parse finite fields");
+		assert_eq!(frame.confidence, 1.0);
+		assert!(frame.expressions.iter().all(|(name, _)| name != "jawOpen"));
 	}
 
 	#[test]
