@@ -978,11 +978,6 @@ fn run_core_runtime(
 			&mut latest_unmotion_frame,
 			&mut packet_count,
 			&mut health,
-			&active_profile_id,
-			frame_count,
-			&config,
-			&output_telemetry,
-			&status_callback,
 		);
 		collect_pending_neutral_calibration(&mut neutral_calibration, &latest_states);
 		collect_pending_face_pose_model(&mut face_pose_model, &latest_unmotion_frame);
@@ -1011,16 +1006,18 @@ fn run_core_runtime(
 					health = "zenoh output disconnected".to_string();
 				}
 				sent = true;
-				workers.refresh_source_telemetry(&mut output_telemetry);
-				status_callback(CoreRuntimeStatusUpdate {
-					active_profile_id: active_profile_id.clone(),
-					running: true,
-					health: health.clone(),
-					frame_count,
-					packet_count,
-					runtime_snapshot: Some(runtime_snapshot(&config, &latest_states, RuntimeState::Running, &output_telemetry)),
-				});
 			}
+		}
+		if received_unmotion || sent {
+			workers.refresh_source_telemetry(&mut output_telemetry);
+			status_callback(CoreRuntimeStatusUpdate {
+				active_profile_id: active_profile_id.clone(),
+				running: true,
+				health: health.clone(),
+				frame_count,
+				packet_count,
+				runtime_snapshot: Some(runtime_snapshot(&config, &latest_states, RuntimeState::Running, &output_telemetry)),
+			});
 		}
 
 		if !control.received && !received_unmotion && !sent {
@@ -1656,18 +1653,12 @@ fn quat_from_rotation_matrix(m: [[f32; 3]; 3]) -> [f32; 4] {
 	normalize_quat_array([(m[0][2] + m[2][0]) / s, (m[1][2] + m[2][1]) / s, 0.25 * s, (m[1][0] - m[0][1]) / s])
 }
 
-#[allow(clippy::too_many_arguments)]
 fn refresh_latest_motion_frames(
 	frame_streams: &[LatestMotionFrameStreamWorkerHandle],
 	latest_states: &mut HashMap<StreamId, Arc<StreamState>>,
 	latest_unmotion_frame: &mut Option<Arc<un_motion_frame::UNMotionFrame>>,
 	packet_count: &mut u64,
 	health: &mut String,
-	active_profile_id: &str,
-	frame_count: u64,
-	config: &CoreRuntimeConfig,
-	output_telemetry: &OutputTelemetry,
-	status_callback: &StatusCallback,
 ) -> bool {
 	refresh_latest_motion_frames_from_loaded(
 		frame_streams.iter().filter_map(|handle| handle.slot.load()),
@@ -1675,26 +1666,15 @@ fn refresh_latest_motion_frames(
 		latest_unmotion_frame,
 		packet_count,
 		health,
-		active_profile_id,
-		frame_count,
-		config,
-		output_telemetry,
-		status_callback,
 	)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn refresh_latest_motion_frames_from_loaded(
 	latest_frames: impl Iterator<Item = Arc<LatestMotionFrame>>,
 	latest_states: &mut HashMap<StreamId, Arc<StreamState>>,
 	latest_unmotion_frame: &mut Option<Arc<un_motion_frame::UNMotionFrame>>,
 	packet_count: &mut u64,
 	health: &mut String,
-	active_profile_id: &str,
-	frame_count: u64,
-	config: &CoreRuntimeConfig,
-	output_telemetry: &OutputTelemetry,
-	status_callback: &StatusCallback,
 ) -> bool {
 	let mut received = false;
 	for latest in latest_frames {
@@ -1707,14 +1687,6 @@ fn refresh_latest_motion_frames_from_loaded(
 		*health = "streaming".to_string();
 		*latest_unmotion_frame = Some(latest.frame.clone());
 		latest_states.insert(latest.stream_id.clone(), latest.state.clone());
-		status_callback(CoreRuntimeStatusUpdate {
-			active_profile_id: active_profile_id.to_string(),
-			running: true,
-			health: health.clone(),
-			frame_count,
-			packet_count: *packet_count,
-			runtime_snapshot: Some(runtime_snapshot(config, latest_states, RuntimeState::Running, output_telemetry)),
-		});
 	}
 	received
 }
@@ -2631,10 +2603,6 @@ mod tests {
 			frame_streams: vec![test_frame_stream_config("mediapipe-main")],
 		};
 		let mut latest_states = initial_stream_states(&config);
-		let (status_tx, status_rx) = mpsc::channel();
-		let status_callback: StatusCallback = Arc::new(move |update| {
-			let _ = status_tx.send(update);
-		});
 		let mut frame = UNMotionFrame::new(7);
 		frame.face = Some(FaceMotion {
 			tracking_state: TrackingState::Valid,
@@ -2660,7 +2628,6 @@ mod tests {
 		let mut packet_count = 0;
 		let mut health = String::new();
 
-		let output_telemetry = OutputTelemetry::default();
 		let mut latest_unmotion_frame = None;
 		let received = refresh_latest_motion_frames_from_loaded(
 			std::iter::once(slot.load().expect("latest frame")),
@@ -2668,19 +2635,13 @@ mod tests {
 			&mut latest_unmotion_frame,
 			&mut packet_count,
 			&mut health,
-			"unmotion-profile",
-			0,
-			&config,
-			&output_telemetry,
-			&status_callback,
 		);
 
 		assert!(received);
 		assert_eq!(packet_count, 1);
 		assert_eq!(health, "streaming");
 		assert_eq!(latest_states[&StreamId::new("unmotion:mediapipe-main")].blendshapes["jawOpen"], 0.7);
-		let update = status_rx.recv_timeout(Duration::from_secs(1)).expect("status");
-		let snapshot = update.runtime_snapshot.expect("snapshot");
+		let snapshot = runtime_snapshot(&config, &latest_states, RuntimeState::Running, &OutputTelemetry::default());
 		assert!(
 			snapshot
 				.streams

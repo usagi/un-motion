@@ -576,6 +576,9 @@ impl VrcOscOutputWorker {
 		match frame {
 			VrcOscOutputFrame::UnmotionFrame(mut frame) => self.send_unmotion_frame(&mut frame),
 			VrcOscOutputFrame::SharedUnmotionFrame(frame) => {
+				if self.config.modifier.is_pass_through() {
+					return self.send_borrowed_unmotion_frame(&frame);
+				}
 				let mut frame = (*frame).clone();
 				self.send_unmotion_frame(&mut frame)
 			}
@@ -583,8 +586,12 @@ impl VrcOscOutputWorker {
 	}
 
 	fn send_unmotion_frame(&mut self, frame: &mut UNMotionFrame) -> anyhow::Result<VrcOscOutputEvent> {
-		self.refresh_avatar_parameters_if_due();
 		self.modifier_pipeline.apply(frame);
+		self.send_borrowed_unmotion_frame(frame)
+	}
+
+	fn send_borrowed_unmotion_frame(&mut self, frame: &UNMotionFrame) -> anyhow::Result<VrcOscOutputEvent> {
+		self.refresh_avatar_parameters_if_due();
 		let (datagrams, packets) = self.sink.send(frame)?;
 		if datagrams == 0 || packets == 0 {
 			self.stats.skipped_frames = self.stats.skipped_frames.saturating_add(1);
