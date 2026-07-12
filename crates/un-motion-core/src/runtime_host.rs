@@ -1056,11 +1056,11 @@ fn run_core_runtime(
 	// `Arc<SourceStageAtomics>` への参照を 1 つしか残さないが、Capturer の最後の
 	// `runtime_snapshot` に「停止時点の最終値」が乗ったほうが UI で混乱が無い。
 	workers.refresh_source_telemetry(&mut output_telemetry);
-	workers.stop();
+	let shutdown_error = workers.stop(&mut health, &mut output_telemetry);
 	status_callback(CoreRuntimeStatusUpdate {
 		active_profile_id,
 		running: false,
-		health: "stopped".to_string(),
+		health: shutdown_error.map_or_else(|| "stopped".to_string(), |error| format!("failed: {error}")),
 		frame_count,
 		packet_count,
 		runtime_snapshot: Some(runtime_snapshot(&config, &latest_states, RuntimeState::Stopped, &output_telemetry)),
@@ -1991,19 +1991,39 @@ impl CoreRuntimeWorkers {
 		})
 	}
 
-	fn stop(self) {
+	fn stop(self, health: &mut String, output_telemetry: &mut OutputTelemetry) -> Option<String> {
+		let mut join_error = None;
 		for stream in self.frame_streams {
-			let _ = stream.join();
+			let stream_id = stream.stream_id.0.clone();
+			record_worker_join_result(&format!("Motion frame stream {stream_id}"), stream.join(), &mut join_error);
 		}
 		if let Some(output) = self.vmc_output {
-			let _ = output.join();
+			record_worker_join_result("VMC output", output.join(), &mut join_error);
 		}
 		if let Some(output) = self.vrc_osc_output {
-			let _ = output.join();
+			record_worker_join_result("VRC OSC output", output.join(), &mut join_error);
 		}
 		if let Some(output) = self.zenoh_output {
-			let _ = output.join();
+			record_worker_join_result("Zenoh output", output.join(), &mut join_error);
 		}
+		drain_output_messages(&self.output_event_rx, health, output_telemetry);
+		drain_vrc_osc_output_messages(&self.vrc_osc_event_rx, health, output_telemetry);
+		drain_zenoh_output_messages(&self.zenoh_event_rx, health, output_telemetry);
+		join_error
+	}
+}
+
+fn record_worker_join_result(label: &str, result: thread::Result<()>, join_error: &mut Option<String>) {
+	if let Err(payload) = result {
+		let message = if let Some(message) = payload.downcast_ref::<String>() {
+			message.as_str()
+		} else if let Some(message) = payload.downcast_ref::<&'static str>() {
+			message
+		} else {
+			"non-string panic payload"
+		};
+		*join_error = Some(format!("{label} worker panicked: {message}"));
+		tracing::error!(worker = label, panic = message, "runtime worker failed during shutdown");
 	}
 }
 
@@ -2239,6 +2259,15 @@ mod tests {
 		let (control_tx, control_rx) = runtime_control_channel();
 		cancel_runtime_startup(&control_tx);
 		assert!(matches!(control_rx.try_recv(), Ok(CoreRuntimeControl::Stop)));
+	}
+
+	#[test]
+	fn worker_join_panics_are_preserved_for_final_status() {
+		let mut error = None;
+		record_worker_join_result("VMC output", Ok(()), &mut error);
+		assert!(error.is_none());
+		record_worker_join_result("VMC output", Err(Box::new("send panic")), &mut error);
+		assert_eq!(error.as_deref(), Some("VMC output worker panicked: send panic"));
 	}
 
 	fn profile(runtime_selection: Option<ProfileRuntimeSettings>) -> CoreProfileDocumentProfile {
