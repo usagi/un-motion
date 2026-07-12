@@ -12,6 +12,7 @@ use un_motion_frame::{
 pub const IFACIALMOCAP_UDP_PORT: u16 = 49983;
 pub const IFACIALMOCAP_TCP_PORT: u16 = 49986;
 const TCP_REASSEMBLY_MAX_BYTES: usize = 64 * 1024;
+const MAX_RECEIVES_PER_POLL: usize = 64;
 const TCP_FRAME_DELIMITER: &str = "___iFacialMocap";
 const IFACIALMOCAP_EYE_ROTATION_SCALE: f32 = 0.35;
 const IFACIALMOCAP_EYE_ROTATION_CLAMP_DEG: f32 = 8.0;
@@ -257,9 +258,16 @@ impl IfacialMocapInputSource {
 			return batch;
 		};
 
+		let mut receives = 0;
 		loop {
 			match socket.recv_from(&mut self.receive_buffer) {
-				Ok((len, _addr)) => self.parse_payload_bytes(&mut batch, &self.receive_buffer[..len]),
+				Ok((len, _addr)) => {
+					receives += 1;
+					self.parse_payload_bytes(&mut batch, &self.receive_buffer[..len]);
+					if receives >= MAX_RECEIVES_PER_POLL {
+						break;
+					}
+				}
 				Err(error) if error.kind() == ErrorKind::WouldBlock => break,
 				Err(error) => {
 					push_decode_error(&mut batch, format!("UDP receive failed: {error}"));
@@ -276,6 +284,7 @@ impl IfacialMocapInputSource {
 			return Ok(batch);
 		};
 
+		let mut reads = 0;
 		loop {
 			match stream.read(&mut self.tcp_read_buffer) {
 				Ok(0) => {
@@ -283,9 +292,13 @@ impl IfacialMocapInputSource {
 					break;
 				}
 				Ok(len) => {
+					reads += 1;
 					self.tcp_reassembly_buffer.extend_from_slice(&self.tcp_read_buffer[..len]);
 					self.trim_tcp_reassembly_buffer(&mut batch);
 					self.parse_reassembled_tcp_frames(&mut batch);
+					if reads >= MAX_RECEIVES_PER_POLL {
+						break;
+					}
 				}
 				Err(error) if error.kind() == ErrorKind::WouldBlock => break,
 				Err(error) => {
@@ -1621,6 +1634,31 @@ mod tests {
 		assert_eq!(batch.decode_errors, 1);
 		assert_eq!(batch.frames[0].head.pitch, 6.0);
 		assert_eq!(batch.frames[0].head.yaw, -2.0);
+	}
+
+	#[test]
+	fn udp_receiver_bounds_work_per_poll() {
+		let mut source = IfacialMocapInputSource::bind(IfacialMocapInputConfig {
+			source_id: "ifm:udp".to_string(),
+			bind_addr: "127.0.0.1:0".parse().expect("addr"),
+			remote_addr: None,
+			transport: IfacialMocapTransport::Udp,
+			start_command: None,
+		})
+		.expect("bind udp");
+		let target = source.local_addr().expect("local addr");
+		let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
+		let packet = b"head#0,0,0|leftEye#0,0,0|rightEye#0,0,0";
+		for _ in 0..(MAX_RECEIVES_PER_POLL + 1) {
+			sender.send_to(packet, target).expect("send frame");
+		}
+		thread::sleep(Duration::from_millis(20));
+
+		let first = source.poll_batch().expect("first poll");
+		let second = source.poll_batch().expect("second poll");
+
+		assert_eq!(first.frames.len(), MAX_RECEIVES_PER_POLL);
+		assert_eq!(second.frames.len(), 1);
 	}
 
 	#[test]
