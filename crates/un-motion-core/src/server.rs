@@ -342,17 +342,32 @@ async fn events_stream(state: web::Data<CoreControlState>) -> HttpResponse {
 async fn events_response(state: web::Data<CoreControlState>) -> HttpResponse {
 	let initial_event = state.snapshot_event().await;
 	let initial = stream::once(async move { Ok::<Bytes, Error>(format_sse_event(&initial_event)) });
-	let event_stream = stream::unfold(state.subscribe(), |mut receiver| async move {
-		loop {
-			match receiver.recv().await {
-				Ok(event) => return Some((Ok::<Bytes, Error>(format_sse_event(&event)), receiver)),
-				Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-				Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+	let event_stream = stream::unfold((state.clone(), state.subscribe()), |(state, mut receiver)| async move {
+		match classify_event_delivery(receiver.recv().await) {
+			EventDelivery::Event(event) => Some((Ok::<Bytes, Error>(format_sse_event(&event)), (state, receiver))),
+			EventDelivery::Snapshot => {
+				let event = state.snapshot_event().await;
+				Some((Ok::<Bytes, Error>(format_sse_event(&event)), (state, receiver)))
 			}
+			EventDelivery::Closed => None,
 		}
 	});
 
 	sse_response(initial.chain(event_stream))
+}
+
+enum EventDelivery {
+	Event(Box<CoreEvent>),
+	Snapshot,
+	Closed,
+}
+
+fn classify_event_delivery(result: Result<CoreEvent, tokio::sync::broadcast::error::RecvError>) -> EventDelivery {
+	match result {
+		Ok(event) => EventDelivery::Event(Box::new(event)),
+		Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => EventDelivery::Snapshot,
+		Err(tokio::sync::broadcast::error::RecvError::Closed) => EventDelivery::Closed,
+	}
 }
 
 fn sse_response<S>(body: S) -> HttpResponse
@@ -384,6 +399,14 @@ mod tests {
 	};
 
 	use super::*;
+
+	#[actix_web::test]
+	async fn lagged_event_delivery_requests_a_snapshot() {
+		assert!(matches!(
+			classify_event_delivery(Err(tokio::sync::broadcast::error::RecvError::Lagged(7))),
+			EventDelivery::Snapshot
+		));
+	}
 
 	#[actix_web::test]
 	async fn rest_start_stop_status_endpoints_work() {
