@@ -380,7 +380,11 @@ impl CoreControlState {
 			return self.status().await;
 		}
 		let status_callback = self.runtime_status_callback();
-		let host = match core_runtime_config_from_document(&document).and_then(|config| CoreRuntimeHost::spawn(config, status_callback)) {
+		let host = match core_runtime_config_from_document(&document) {
+			Ok(config) => run_blocking_runtime_operation(move || CoreRuntimeHost::spawn(config, status_callback)).await,
+			Err(error) => Err(error),
+		};
+		let host = match host {
 			Ok(host) => host,
 			Err(error) => {
 				let status = {
@@ -649,6 +653,16 @@ impl CoreControlState {
 	}
 }
 
+async fn run_blocking_runtime_operation<T, F>(operation: F) -> anyhow::Result<T>
+where
+	T: Send + 'static,
+	F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+	tokio::task::spawn_blocking(operation)
+		.await
+		.map_err(|error| anyhow!("blocking runtime operation task failed: {error}"))?
+}
+
 fn now_unix_ms() -> u64 {
 	SystemTime::now()
 		.duration_since(UNIX_EPOCH)
@@ -660,6 +674,26 @@ fn now_unix_ms() -> u64 {
 mod tests {
 	use super::*;
 	use un_motion_profile_schema::CoreProfileDocumentProfile;
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn blocking_runtime_operations_do_not_stall_async_tasks() {
+		let operation = tokio::spawn(async {
+			run_blocking_runtime_operation(|| {
+				std::thread::sleep(std::time::Duration::from_millis(50));
+				Ok(42)
+			})
+			.await
+		});
+		tokio::task::yield_now().await;
+
+		tokio::time::timeout(
+			std::time::Duration::from_millis(20),
+			tokio::time::sleep(std::time::Duration::from_millis(1)),
+		)
+		.await
+		.expect("async timer must remain responsive");
+		assert_eq!(operation.await.expect("operation task").expect("blocking operation"), 42);
+	}
 
 	#[tokio::test]
 	async fn profile_mutations_wait_for_the_shared_operation_gate() {
