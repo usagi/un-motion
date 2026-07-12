@@ -641,7 +641,11 @@ pub struct SmoothingStage {
 	root_rotation_state: Option<QuatSmoothingState>,
 	face_expression_state: HashMap<String, ScalarSmoothingState>,
 	signal_scalar_state: HashMap<String, ScalarSmoothingState>,
+	generation: u64,
 }
+
+const MAX_DYNAMIC_SMOOTHING_STATES: usize = 1_024;
+const DYNAMIC_SMOOTHING_STATE_TTL_FRAMES: u64 = 300;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SmoothingMode {
@@ -700,6 +704,7 @@ struct ScalarSmoothingState {
 	last_raw: f32,
 	smoothed_speed: f32,
 	last_timestamp_ns: Option<u64>,
+	last_seen_generation: u64,
 }
 
 impl SmoothingStage {
@@ -739,6 +744,7 @@ impl SmoothingStage {
 			root_rotation_state: None,
 			face_expression_state: HashMap::new(),
 			signal_scalar_state: HashMap::new(),
+			generation: 0,
 		})
 	}
 
@@ -1004,11 +1010,27 @@ impl SmoothingStage {
 	}
 
 	fn step_expression(&mut self, name: &str, current: f32, timestamp_ns: u64, confidence: f32) -> f32 {
-		Self::step_named_scalar(&mut self.face_expression_state, self.mode, name, current, timestamp_ns, confidence)
+		Self::step_named_scalar(
+			&mut self.face_expression_state,
+			self.mode,
+			name,
+			current,
+			timestamp_ns,
+			confidence,
+			self.generation,
+		)
 	}
 
 	fn step_signal_scalar(&mut self, name: &str, current: f32, timestamp_ns: u64, confidence: f32) -> f32 {
-		Self::step_named_scalar(&mut self.signal_scalar_state, self.mode, name, current, timestamp_ns, confidence)
+		Self::step_named_scalar(
+			&mut self.signal_scalar_state,
+			self.mode,
+			name,
+			current,
+			timestamp_ns,
+			confidence,
+			self.generation,
+		)
 	}
 
 	fn step_named_scalar(
@@ -1018,10 +1040,25 @@ impl SmoothingStage {
 		current: f32,
 		timestamp_ns: u64,
 		confidence: f32,
+		generation: u64,
 	) -> f32 {
 		if let Some(state) = state_map.get_mut(name) {
+			state.last_seen_generation = generation;
 			Self::step_scalar(mode, state, current, timestamp_ns, confidence)
 		} else {
+			if state_map.len() >= MAX_DYNAMIC_SMOOTHING_STATES {
+				let oldest = state_map
+					.iter()
+					.map(|(name, state)| (name, generation.wrapping_sub(state.last_seen_generation)))
+					.max_by_key(|(_, age)| *age)
+					.map(|(name, age)| (name.clone(), age));
+				if let Some((oldest, age)) = oldest {
+					if age == 0 {
+						return current;
+					}
+					state_map.remove(&oldest);
+				}
+			}
 			state_map.insert(
 				name.to_string(),
 				ScalarSmoothingState {
@@ -1029,6 +1066,7 @@ impl SmoothingStage {
 					last_raw: current,
 					smoothed_speed: 0.0,
 					last_timestamp_ns: if timestamp_ns > 0 { Some(timestamp_ns) } else { None },
+					last_seen_generation: generation,
 				},
 			);
 			current
@@ -1099,6 +1137,7 @@ impl ModifierStage for SmoothingStage {
 	}
 
 	fn apply(&mut self, frame: &mut UNMotionFrame) {
+		self.generation = self.generation.wrapping_add(1);
 		// timestamp は header の frame_timestamp_ns を最優先で使う。0 のときは
 		// Adaptive の dt 推定ができないが、step_quat 内で fallback (Fixed 0.45 相当)
 		// が走るので致命的にはならない。
@@ -1151,6 +1190,11 @@ impl ModifierStage for SmoothingStage {
 			};
 			signal.value = MotionSignalValue::Scalar(self.step_signal_scalar(&signal.name, value, timestamp_ns, signal.confidence));
 		}
+		let generation = self.generation;
+		self.face_expression_state
+			.retain(|_, state| generation.wrapping_sub(state.last_seen_generation) <= DYNAMIC_SMOOTHING_STATE_TTL_FRAMES);
+		self.signal_scalar_state
+			.retain(|_, state| generation.wrapping_sub(state.last_seen_generation) <= DYNAMIC_SMOOTHING_STATE_TTL_FRAMES);
 	}
 }
 
@@ -2570,6 +2614,78 @@ mod tests {
 		let expression = &f2.face.as_ref().unwrap().expressions[0];
 		// α=0.45 → lerp(0, 1, 0.45) = 0.45
 		assert!((expression.value - 0.45).abs() < 1e-3);
+	}
+
+	#[test]
+	fn smoothing_discards_dynamic_scalar_state_after_ttl() {
+		let config = SmoothingConfig {
+			preset: SmoothingPreset::Medium,
+			..SmoothingConfig::default()
+		};
+		let mut stage = SmoothingStage::from_config(&config, BoneSubsetConfig::default()).expect("smoothing stage");
+		let mut first = make_face_frame_with_expression("oldExpression", 0.5);
+		first.signals.push(un_motion_frame::MotionSignal {
+			name: "old.signal".to_string(),
+			value: MotionSignalValue::Scalar(0.5),
+			confidence: 1.0,
+			source_index: None,
+			state: SampleState::Valid,
+		});
+		stage.apply(&mut first);
+		assert!(stage.face_expression_state.contains_key("oldExpression"));
+		assert!(stage.signal_scalar_state.contains_key("old.signal"));
+		for sequence in 0..=DYNAMIC_SMOOTHING_STATE_TTL_FRAMES {
+			stage.apply(&mut UNMotionFrame::new(sequence));
+		}
+		assert!(stage.face_expression_state.is_empty());
+		assert!(stage.signal_scalar_state.is_empty());
+
+		let mut second = make_face_frame_with_expression("newExpression", 0.5);
+		second.signals.push(un_motion_frame::MotionSignal {
+			name: "new.signal".to_string(),
+			value: MotionSignalValue::Scalar(0.5),
+			confidence: 1.0,
+			source_index: None,
+			state: SampleState::Valid,
+		});
+		stage.apply(&mut second);
+
+		assert_eq!(stage.face_expression_state.len(), 1);
+		assert!(stage.face_expression_state.contains_key("newExpression"));
+		assert_eq!(stage.signal_scalar_state.len(), 1);
+		assert!(stage.signal_scalar_state.contains_key("new.signal"));
+	}
+
+	#[test]
+	fn smoothing_caps_dynamic_scalar_state_count() {
+		let config = SmoothingConfig {
+			preset: SmoothingPreset::Medium,
+			..SmoothingConfig::default()
+		};
+		let mut stage = SmoothingStage::from_config(&config, BoneSubsetConfig::default()).expect("smoothing stage");
+		let mut frame = UNMotionFrame::new(1);
+		for index in 0..(MAX_DYNAMIC_SMOOTHING_STATES + 100) {
+			frame.signals.push(un_motion_frame::MotionSignal {
+				name: format!("dynamic.{index}"),
+				value: MotionSignalValue::Scalar(0.5),
+				confidence: 1.0,
+				source_index: None,
+				state: SampleState::Valid,
+			});
+		}
+		stage.apply(&mut frame);
+		assert_eq!(stage.signal_scalar_state.len(), MAX_DYNAMIC_SMOOTHING_STATES);
+		let mut replacement = UNMotionFrame::new(2);
+		replacement.signals.push(un_motion_frame::MotionSignal {
+			name: "replacement".to_string(),
+			value: MotionSignalValue::Scalar(0.5),
+			confidence: 1.0,
+			source_index: None,
+			state: SampleState::Valid,
+		});
+		stage.apply(&mut replacement);
+		assert_eq!(stage.signal_scalar_state.len(), MAX_DYNAMIC_SMOOTHING_STATES);
+		assert!(stage.signal_scalar_state.contains_key("replacement"));
 	}
 
 	#[test]
