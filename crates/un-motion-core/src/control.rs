@@ -390,12 +390,29 @@ impl CoreControlState {
 				return status;
 			}
 		};
-		if let Ok(mut current) = self.inner.runtime_host.lock() {
-			if current.is_some() {
-				let _ = host.join();
+		let install_result = match self.inner.runtime_host.lock() {
+			Ok(current) if current.is_some() => Err((host, false)),
+			Ok(mut current) => {
+				*current = Some(host);
+				Ok(())
+			}
+			Err(_) => Err((host, true)),
+		};
+		if let Err((rejected_host, lock_poisoned)) = install_result {
+			let _ = tokio::task::spawn_blocking(move || rejected_host.join()).await;
+			if !lock_poisoned {
 				return self.status().await;
 			}
-			*current = Some(host);
+			let status = {
+				let mut state = self.inner.state.write().await;
+				state.status.running = false;
+				state.status.health = "failed: runtime host lock poisoned".to_string();
+				state.runtime_snapshot = None;
+				state.status.updated_at_ms = now_unix_ms();
+				state.status.clone()
+			};
+			self.emit(CoreEventKind::RuntimeStopped).await;
+			return status;
 		}
 		let status = {
 			let mut state = self.inner.state.write().await;
