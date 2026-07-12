@@ -3140,6 +3140,132 @@ fn push_arm_pose_signals(signals: &mut Vec<MotionSignal>, pose: &NativePose, con
 	}
 }
 
+const LEFT_ARM_SIGNAL_NAMES: [&str; 12] = [
+	"arm.left.shoulder.x",
+	"arm.left.shoulder.y",
+	"arm.left.shoulder.z",
+	"arm.left.elbow.x",
+	"arm.left.elbow.y",
+	"arm.left.elbow.z",
+	"arm.left.wrist.x",
+	"arm.left.wrist.y",
+	"arm.left.wrist.z",
+	"arm.left.elbow.bend",
+	"arm.left.upper.angle",
+	"arm.left.lower.angle",
+];
+const RIGHT_ARM_SIGNAL_NAMES: [&str; 12] = [
+	"arm.right.shoulder.x",
+	"arm.right.shoulder.y",
+	"arm.right.shoulder.z",
+	"arm.right.elbow.x",
+	"arm.right.elbow.y",
+	"arm.right.elbow.z",
+	"arm.right.wrist.x",
+	"arm.right.wrist.y",
+	"arm.right.wrist.z",
+	"arm.right.elbow.bend",
+	"arm.right.upper.angle",
+	"arm.right.lower.angle",
+];
+const LEFT_TORSO_SIGNAL_NAMES: [&str; 6] = [
+	"torso.left.shoulder.x",
+	"torso.left.shoulder.y",
+	"torso.left.shoulder.z",
+	"torso.left.hip.x",
+	"torso.left.hip.y",
+	"torso.left.hip.z",
+];
+const RIGHT_TORSO_SIGNAL_NAMES: [&str; 6] = [
+	"torso.right.shoulder.x",
+	"torso.right.shoulder.y",
+	"torso.right.shoulder.z",
+	"torso.right.hip.x",
+	"torso.right.hip.y",
+	"torso.right.hip.z",
+];
+const LEFT_LEG_SIGNAL_NAMES: [&str; 9] = [
+	"leg.left.hip.x",
+	"leg.left.hip.y",
+	"leg.left.hip.z",
+	"leg.left.knee.x",
+	"leg.left.knee.y",
+	"leg.left.knee.z",
+	"leg.left.ankle.x",
+	"leg.left.ankle.y",
+	"leg.left.ankle.z",
+];
+const RIGHT_LEG_SIGNAL_NAMES: [&str; 9] = [
+	"leg.right.hip.x",
+	"leg.right.hip.y",
+	"leg.right.hip.z",
+	"leg.right.knee.x",
+	"leg.right.knee.y",
+	"leg.right.knee.z",
+	"leg.right.ankle.x",
+	"leg.right.ankle.y",
+	"leg.right.ankle.z",
+];
+const LEFT_FOOT_SIGNAL_NAMES: [&str; 9] = [
+	"foot.left.ankle.x",
+	"foot.left.ankle.y",
+	"foot.left.ankle.z",
+	"foot.left.heel.x",
+	"foot.left.heel.y",
+	"foot.left.heel.z",
+	"foot.left.index.x",
+	"foot.left.index.y",
+	"foot.left.index.z",
+];
+const RIGHT_FOOT_SIGNAL_NAMES: [&str; 9] = [
+	"foot.right.ankle.x",
+	"foot.right.ankle.y",
+	"foot.right.ankle.z",
+	"foot.right.heel.x",
+	"foot.right.heel.y",
+	"foot.right.heel.z",
+	"foot.right.index.x",
+	"foot.right.index.y",
+	"foot.right.index.z",
+];
+
+fn push_static_scalar_values<const N: usize>(signals: &mut Vec<MotionSignal>, names: &[&str; N], values: [f32; N], confidence: f32) {
+	for (name, value) in names.iter().zip(values) {
+		push_scalar(signals, name, value.clamp(-1.0, 1.0), confidence);
+	}
+}
+
+fn push_arm_point_signals(
+	signals: &mut Vec<MotionSignal>,
+	side: &str,
+	shoulder: Point3,
+	elbow: Point3,
+	wrist: Point3,
+	bend: f32,
+	confidence: f32,
+) {
+	let names = if side == "left" {
+		&LEFT_ARM_SIGNAL_NAMES
+	} else {
+		&RIGHT_ARM_SIGNAL_NAMES
+	};
+	let values = [
+		shoulder.x,
+		shoulder.y,
+		shoulder.z,
+		elbow.x,
+		elbow.y,
+		elbow.z,
+		wrist.x,
+		wrist.y,
+		wrist.z,
+		bend,
+		((shoulder.y - elbow.y).atan2(elbow.x - shoulder.x) / std::f32::consts::PI).clamp(-1.0, 1.0),
+		((elbow.y - wrist.y).atan2(wrist.x - elbow.x) / std::f32::consts::PI).clamp(-1.0, 1.0),
+	];
+	push_static_scalar_values(signals, names, values, confidence);
+}
+
 fn push_arm_pose_side_signals(
 	signals: &mut Vec<MotionSignal>,
 	side: &str,
@@ -3163,28 +3289,7 @@ fn push_arm_pose_side_signals(
 	let wrist = pose_arm_point(pose, wrist_index, use_world);
 	let bend = arm_bend_signal(shoulder, elbow, wrist);
 
-	for (name, value) in [
-		(format!("arm.{side}.shoulder.x"), shoulder.x),
-		(format!("arm.{side}.shoulder.y"), shoulder.y),
-		(format!("arm.{side}.shoulder.z"), shoulder.z),
-		(format!("arm.{side}.elbow.x"), elbow.x),
-		(format!("arm.{side}.elbow.y"), elbow.y),
-		(format!("arm.{side}.elbow.z"), elbow.z),
-		(format!("arm.{side}.wrist.x"), wrist.x),
-		(format!("arm.{side}.wrist.y"), wrist.y),
-		(format!("arm.{side}.wrist.z"), wrist.z),
-		(format!("arm.{side}.elbow.bend"), bend),
-		(
-			format!("arm.{side}.upper.angle"),
-			((shoulder.y - elbow.y).atan2(elbow.x - shoulder.x) / std::f32::consts::PI).clamp(-1.0, 1.0),
-		),
-		(
-			format!("arm.{side}.lower.angle"),
-			((elbow.y - wrist.y).atan2(wrist.x - elbow.x) / std::f32::consts::PI).clamp(-1.0, 1.0),
-		),
-	] {
-		push_scalar_owned(signals, name, value.clamp(-1.0, 1.0), confidence);
-	}
+	push_arm_point_signals(signals, side, shoulder, elbow, wrist, bend, confidence);
 }
 
 fn pose_arm_point(pose: &NativePose, index: usize, use_world: bool) -> Point3 {
@@ -3226,16 +3331,17 @@ fn push_torso_signals(signals: &mut Vec<MotionSignal>, pose: &NativePose, config
 		let use_world = pose.world_landmark_count > hip as u32;
 		let shoulder = pose_body_point(pose, shoulder, use_world);
 		let hip = pose_body_point(pose, hip, use_world);
-		for (name, value) in [
-			(format!("torso.{side}.shoulder.x"), shoulder.x),
-			(format!("torso.{side}.shoulder.y"), shoulder.y),
-			(format!("torso.{side}.shoulder.z"), shoulder.z),
-			(format!("torso.{side}.hip.x"), hip.x),
-			(format!("torso.{side}.hip.y"), hip.y),
-			(format!("torso.{side}.hip.z"), hip.z),
-		] {
-			push_scalar_owned(signals, name, value.clamp(-1.0, 1.0), confidence);
-		}
+		let names = if side == "left" {
+			&LEFT_TORSO_SIGNAL_NAMES
+		} else {
+			&RIGHT_TORSO_SIGNAL_NAMES
+		};
+		push_static_scalar_values(
+			signals,
+			names,
+			[shoulder.x, shoulder.y, shoulder.z, hip.x, hip.y, hip.z],
+			confidence,
+		);
 	}
 }
 
@@ -3252,19 +3358,17 @@ fn push_leg_signals(signals: &mut Vec<MotionSignal>, pose: &NativePose, config: 
 		let hip = pose_body_point(pose, hip, use_world);
 		let knee = pose_body_point(pose, knee, use_world);
 		let ankle = pose_body_point(pose, ankle, use_world);
-		for (name, value) in [
-			(format!("leg.{side}.hip.x"), hip.x),
-			(format!("leg.{side}.hip.y"), hip.y),
-			(format!("leg.{side}.hip.z"), hip.z),
-			(format!("leg.{side}.knee.x"), knee.x),
-			(format!("leg.{side}.knee.y"), knee.y),
-			(format!("leg.{side}.knee.z"), knee.z),
-			(format!("leg.{side}.ankle.x"), ankle.x),
-			(format!("leg.{side}.ankle.y"), ankle.y),
-			(format!("leg.{side}.ankle.z"), ankle.z),
-		] {
-			push_scalar_owned(signals, name, value.clamp(-1.0, 1.0), confidence);
-		}
+		let names = if side == "left" {
+			&LEFT_LEG_SIGNAL_NAMES
+		} else {
+			&RIGHT_LEG_SIGNAL_NAMES
+		};
+		push_static_scalar_values(
+			signals,
+			names,
+			[hip.x, hip.y, hip.z, knee.x, knee.y, knee.z, ankle.x, ankle.y, ankle.z],
+			confidence,
+		);
 	}
 }
 
@@ -3281,19 +3385,27 @@ fn push_feet_signals(signals: &mut Vec<MotionSignal>, pose: &NativePose, config:
 		let ankle = pose_body_point(pose, ankle, use_world);
 		let heel = pose_body_point(pose, heel, use_world);
 		let foot_index = pose_body_point(pose, foot_index, use_world);
-		for (name, value) in [
-			(format!("foot.{side}.ankle.x"), ankle.x),
-			(format!("foot.{side}.ankle.y"), ankle.y),
-			(format!("foot.{side}.ankle.z"), ankle.z),
-			(format!("foot.{side}.heel.x"), heel.x),
-			(format!("foot.{side}.heel.y"), heel.y),
-			(format!("foot.{side}.heel.z"), heel.z),
-			(format!("foot.{side}.index.x"), foot_index.x),
-			(format!("foot.{side}.index.y"), foot_index.y),
-			(format!("foot.{side}.index.z"), foot_index.z),
-		] {
-			push_scalar_owned(signals, name, value.clamp(-1.0, 1.0), confidence);
-		}
+		let names = if side == "left" {
+			&LEFT_FOOT_SIGNAL_NAMES
+		} else {
+			&RIGHT_FOOT_SIGNAL_NAMES
+		};
+		push_static_scalar_values(
+			signals,
+			names,
+			[
+				ankle.x,
+				ankle.y,
+				ankle.z,
+				heel.x,
+				heel.y,
+				heel.z,
+				foot_index.x,
+				foot_index.y,
+				foot_index.z,
+			],
+			confidence,
+		);
 	}
 }
 
@@ -3355,28 +3467,7 @@ fn push_arm_ik_side_from_hand_signals(signals: &mut Vec<MotionSignal>, side: &st
 	});
 	let (elbow, bend) = solve_arm_ik(side_sign, shoulder, wrist, preferred);
 
-	for (name, value) in [
-		(format!("arm.{side}.shoulder.x"), shoulder.x),
-		(format!("arm.{side}.shoulder.y"), shoulder.y),
-		(format!("arm.{side}.shoulder.z"), shoulder.z),
-		(format!("arm.{side}.elbow.x"), elbow.x),
-		(format!("arm.{side}.elbow.y"), elbow.y),
-		(format!("arm.{side}.elbow.z"), elbow.z),
-		(format!("arm.{side}.wrist.x"), wrist.x),
-		(format!("arm.{side}.wrist.y"), wrist.y),
-		(format!("arm.{side}.wrist.z"), wrist.z),
-		(format!("arm.{side}.elbow.bend"), bend),
-		(
-			format!("arm.{side}.upper.angle"),
-			((shoulder.y - elbow.y).atan2(elbow.x - shoulder.x) / std::f32::consts::PI).clamp(-1.0, 1.0),
-		),
-		(
-			format!("arm.{side}.lower.angle"),
-			((elbow.y - wrist.y).atan2(wrist.x - elbow.x) / std::f32::consts::PI).clamp(-1.0, 1.0),
-		),
-	] {
-		push_scalar_owned(signals, name, value.clamp(-1.0, 1.0), confidence);
-	}
+	push_arm_point_signals(signals, side, shoulder, elbow, wrist, bend, confidence);
 }
 
 fn landmark_confidence<const N: usize>(landmarks: [un_motion_mediapipe_native::NativeLandmark; N]) -> f32 {
