@@ -288,6 +288,7 @@ impl IfacialMocapInputSource {
 		loop {
 			match stream.read(&mut self.tcp_read_buffer) {
 				Ok(0) => {
+					self.tcp_stream = None;
 					push_decode_error(&mut batch, "TCP stream closed by peer".to_string());
 					break;
 				}
@@ -1690,5 +1691,30 @@ mod tests {
 		assert_eq!(frames[0].head.pitch, 3.0);
 		assert_eq!(frames[0].head.yaw, -1.5);
 		assert_eq!(frames[0].confidence, 0.9);
+	}
+
+	#[test]
+	fn tcp_receiver_reports_peer_close_once() {
+		let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+		let remote_addr = listener.local_addr().expect("listener addr");
+		let writer = thread::spawn(move || drop(listener.accept().expect("accept")));
+		let mut source = IfacialMocapInputSource::bind(IfacialMocapInputConfig::tcp(remote_addr)).expect("connect tcp");
+		writer.join().expect("writer");
+
+		let mut closed = None;
+		for _ in 0..20 {
+			let batch = source.poll_batch().expect("poll close");
+			if batch.decode_errors != 0 {
+				closed = Some(batch);
+				break;
+			}
+			thread::sleep(Duration::from_millis(10));
+		}
+
+		let closed = closed.expect("peer close must be observed");
+		assert_eq!(closed.decode_errors, 1);
+		assert_eq!(closed.decode_error_examples, vec!["TCP stream closed by peer"]);
+		assert_eq!(source.poll_batch().expect("poll after close").decode_errors, 0);
+		assert!(source.local_addr().is_err());
 	}
 }
