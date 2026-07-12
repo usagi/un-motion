@@ -1706,8 +1706,8 @@ fn refresh_latest_motion_frames_from_loaded(
 ) -> bool {
 	let mut received = false;
 	for latest in latest_frames {
-		let previous = latest_states.get(&latest.stream_id).and_then(|state| state.last_event_at_ns);
-		if previous == latest.state.last_event_at_ns {
+		let previous_packet_count = latest_states.get(&latest.stream_id).map(|state| state.packet_count);
+		if previous_packet_count == Some(latest.state.packet_count) {
 			continue;
 		}
 		received = true;
@@ -2731,6 +2731,42 @@ mod tests {
 				.iter()
 				.any(|stream| stream.stream_id == StreamId::new("unmotion:mediapipe-main") && stream.health == StreamHealth::Live)
 		);
+	}
+
+	#[test]
+	fn runtime_host_refreshes_frames_without_motion_events() {
+		let config = CoreRuntimeConfig {
+			active_profile_id: "unmotion-profile".to_string(),
+			fps: 60,
+			vmc_output: None,
+			vrc_osc_output: None,
+			zenoh_output: None,
+			frame_streams: vec![test_frame_stream_config("mediapipe-main")],
+		};
+		let mut latest_states = initial_stream_states(&config);
+		let stream_id = StreamId::new("unmotion:mediapipe-main");
+		let frame = UNMotionFrame::new(8);
+		let state = stream_state_from_unmotion_frame(stream_id.clone(), &frame, now_unix_ns());
+		assert_eq!(state.last_event_at_ns, None);
+		assert_eq!(state.packet_count, 1);
+		let latest = LatestMotionFrame {
+			stream_id: stream_id.clone(),
+			frame: Arc::new(frame),
+			state: Arc::new(state),
+		};
+		let mut latest_frame = None;
+		let mut packet_count = 0;
+		let mut health = String::new();
+
+		assert!(refresh_latest_motion_frames_from_loaded(
+			std::iter::once(Arc::new(latest)),
+			&mut latest_states,
+			&mut latest_frame,
+			&mut packet_count,
+			&mut health,
+		));
+		assert_eq!(latest_states[&stream_id].packet_count, 1);
+		assert_eq!(latest_frame.expect("latest frame").header.sequence, 8);
 	}
 
 	#[test]
