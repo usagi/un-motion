@@ -21,6 +21,8 @@ use un_motion_record::MessagePackStreamRecorder;
 use crate::signal_enrich::{enrich_frame_with_signal_derived_motion, frame_needs_signal_derived_motion};
 use crate::{ModifierConfig, ModifierPipeline, vmc_bone_name_to_humanoid_bone};
 
+const OSCQUERY_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutputDisconnected;
 
@@ -827,9 +829,13 @@ fn http_get_loopback(port: u16, path: &str) -> anyhow::Result<String> {
 		.write_all(request.as_bytes())
 		.context("VRChat OSCQuery request write failed")?;
 	let mut response = String::new();
-	stream
+	(&mut stream)
+		.take((OSCQUERY_MAX_RESPONSE_BYTES + 1) as u64)
 		.read_to_string(&mut response)
 		.context("VRChat OSCQuery response read failed")?;
+	if response.len() > OSCQUERY_MAX_RESPONSE_BYTES {
+		anyhow::bail!("VRChat OSCQuery response exceeds {OSCQUERY_MAX_RESPONSE_BYTES} byte limit");
+	}
 	let (headers, body) = response
 		.split_once("\r\n\r\n")
 		.context("VRChat OSCQuery response did not contain HTTP header terminator")?;
@@ -971,7 +977,7 @@ fn run_file_output_worker(worker: &mut FileOutputWorker, command_rx: Receiver<Fi
 #[cfg(test)]
 mod tests {
 	use std::fs::{self, File};
-	use std::net::UdpSocket;
+	use std::net::{TcpListener, UdpSocket};
 	use std::sync::mpsc;
 	use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -980,6 +986,26 @@ mod tests {
 	use un_motion_record::decode_framed_stream;
 
 	use super::*;
+
+	#[test]
+	fn oscquery_response_size_is_bounded() {
+		let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+		let port = listener.local_addr().expect("listener addr").port();
+		let server = std::thread::spawn(move || {
+			let (mut stream, _) = listener.accept().expect("accept");
+			let mut request = [0u8; 1024];
+			let _ = stream.read(&mut request);
+			stream
+				.write_all(b"HTTP/1.0 200 OK\r\nConnection: close\r\n\r\n")
+				.expect("write headers");
+			let _ = stream.write_all(&vec![b'x'; OSCQUERY_MAX_RESPONSE_BYTES + 1]);
+		});
+
+		let error = http_get_loopback(port, "/avatar/parameters").expect_err("oversized response must fail");
+		server.join().expect("server");
+
+		assert!(error.to_string().contains("response exceeds"));
+	}
 
 	fn temp_record_path(label: &str) -> PathBuf {
 		let nonce = SystemTime::now().duration_since(UNIX_EPOCH).expect("system time").as_nanos();
