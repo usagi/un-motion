@@ -349,13 +349,18 @@ impl IfacialMocapInputSource {
 	}
 
 	fn parse_reassembled_tcp_frames(&mut self, batch: &mut IfacialMocapPollBatch) {
-		while let Some(delimiter_start) = find_tcp_frame_delimiter(&self.tcp_reassembly_buffer) {
-			let delimiter_len = tcp_delimiter_len(&self.tcp_reassembly_buffer[delimiter_start..]);
-			let raw_frame: Vec<u8> = self.tcp_reassembly_buffer.drain(..delimiter_start).collect();
-			self.tcp_reassembly_buffer.drain(..delimiter_len);
+		while let Some(raw_frame) = take_reassembled_tcp_frame(&mut self.tcp_reassembly_buffer) {
 			self.parse_payload_bytes(batch, &raw_frame);
 		}
 	}
+}
+
+fn take_reassembled_tcp_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+	let delimiter_start = find_tcp_frame_delimiter(buffer)?;
+	let delimiter_len = tcp_delimiter_len(&buffer[delimiter_start..]);
+	let mut raw_frame = buffer.drain(..delimiter_start + delimiter_len).collect::<Vec<_>>();
+	raw_frame.truncate(delimiter_start);
+	Some(raw_frame)
 }
 
 pub fn parse_ifacialmocap_frame(packet: &str, source_id: &str, received_timestamp_ns: u64) -> anyhow::Result<IfacialMocapFrame> {
@@ -1363,6 +1368,16 @@ pub fn resolve_socket_addr(addr: impl ToSocketAddrs) -> anyhow::Result<SocketAdd
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn tcp_reassembly_extracts_one_frame_and_delimiter_per_pass() {
+		let mut buffer = format!("first{TCP_FRAME_DELIMITER}second\npartial").into_bytes();
+
+		assert_eq!(take_reassembled_tcp_frame(&mut buffer), Some(b"first".to_vec()));
+		assert_eq!(take_reassembled_tcp_frame(&mut buffer), Some(b"second".to_vec()));
+		assert_eq!(take_reassembled_tcp_frame(&mut buffer), None);
+		assert_eq!(buffer, b"partial");
+	}
 	use std::io::Write;
 	use std::net::TcpListener;
 	use std::thread;
