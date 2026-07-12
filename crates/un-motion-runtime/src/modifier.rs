@@ -685,6 +685,7 @@ struct QuatSmoothingState {
 	smoothed_speed: f32,
 	/// Adaptive 専用: 前回サンプルの timestamp (ns)。0 / None は「未初期化」。
 	last_timestamp_ns: Option<u64>,
+	last_seen_generation: u64,
 }
 
 /// Vec3 (root translation) の smoothing state。Adaptive モードでは各成分独立の
@@ -695,6 +696,7 @@ struct Vec3SmoothingState {
 	last_raw: Vec3f,
 	smoothed_speed: Vec3f,
 	last_timestamp_ns: Option<u64>,
+	last_seen_generation: u64,
 }
 
 /// Scalar (face expression value) の smoothing state。
@@ -705,6 +707,22 @@ struct ScalarSmoothingState {
 	smoothed_speed: f32,
 	last_timestamp_ns: Option<u64>,
 	last_seen_generation: u64,
+}
+
+trait DynamicSmoothingState {
+	fn last_seen_generation(&self) -> u64;
+}
+
+impl DynamicSmoothingState for QuatSmoothingState {
+	fn last_seen_generation(&self) -> u64 {
+		self.last_seen_generation
+	}
+}
+
+impl DynamicSmoothingState for Vec3SmoothingState {
+	fn last_seen_generation(&self) -> u64 {
+		self.last_seen_generation
+	}
 }
 
 impl SmoothingStage {
@@ -973,6 +991,7 @@ impl SmoothingStage {
 					last_raw: current,
 					smoothed_speed: 0.0,
 					last_timestamp_ns: if timestamp_ns > 0 { Some(timestamp_ns) } else { None },
+					last_seen_generation: self.generation,
 				},
 			);
 			current
@@ -989,6 +1008,7 @@ impl SmoothingStage {
 				last_raw: current,
 				smoothed_speed: Vec3f { x: 0.0, y: 0.0, z: 0.0 },
 				last_timestamp_ns: if timestamp_ns > 0 { Some(timestamp_ns) } else { None },
+				last_seen_generation: self.generation,
 			});
 			current
 		}
@@ -1004,6 +1024,7 @@ impl SmoothingStage {
 				last_raw: current,
 				smoothed_speed: 0.0,
 				last_timestamp_ns: if timestamp_ns > 0 { Some(timestamp_ns) } else { None },
+				last_seen_generation: self.generation,
 			});
 			current
 		}
@@ -1076,8 +1097,10 @@ impl SmoothingStage {
 	fn step_named_translation(&mut self, name: &str, current: Vec3f, timestamp_ns: u64, confidence: f32) -> Vec3f {
 		let mode = self.mode;
 		if let Some(state) = self.named_vec3_state.get_mut(name) {
+			state.last_seen_generation = self.generation;
 			Self::step_vec3(mode, state, current, timestamp_ns, confidence)
 		} else {
+			Self::evict_oldest_dynamic_state(&mut self.named_vec3_state, self.generation);
 			self.named_vec3_state.insert(
 				name.to_string(),
 				Vec3SmoothingState {
@@ -1085,6 +1108,7 @@ impl SmoothingStage {
 					last_raw: current,
 					smoothed_speed: Vec3f { x: 0.0, y: 0.0, z: 0.0 },
 					last_timestamp_ns: if timestamp_ns > 0 { Some(timestamp_ns) } else { None },
+					last_seen_generation: self.generation,
 				},
 			);
 			current
@@ -1094,8 +1118,10 @@ impl SmoothingStage {
 	fn step_named_rotation(&mut self, name: &str, current: Quatf, timestamp_ns: u64, confidence: f32) -> Quatf {
 		let mode = self.mode;
 		if let Some(state) = self.named_quat_state.get_mut(name) {
+			state.last_seen_generation = self.generation;
 			Self::step_quat(mode, state, current, timestamp_ns, confidence)
 		} else {
+			Self::evict_oldest_dynamic_state(&mut self.named_quat_state, self.generation);
 			self.named_quat_state.insert(
 				name.to_string(),
 				QuatSmoothingState {
@@ -1103,9 +1129,23 @@ impl SmoothingStage {
 					last_raw: current,
 					smoothed_speed: 0.0,
 					last_timestamp_ns: if timestamp_ns > 0 { Some(timestamp_ns) } else { None },
+					last_seen_generation: self.generation,
 				},
 			);
 			current
+		}
+	}
+
+	fn evict_oldest_dynamic_state<T: DynamicSmoothingState>(state_map: &mut HashMap<String, T>, generation: u64) {
+		if state_map.len() < MAX_DYNAMIC_SMOOTHING_STATES {
+			return;
+		}
+		if let Some(oldest) = state_map
+			.iter()
+			.max_by_key(|(_, state)| generation.wrapping_sub(state.last_seen_generation()))
+			.map(|(name, _)| name.clone())
+		{
+			state_map.remove(&oldest);
 		}
 	}
 
@@ -1194,6 +1234,10 @@ impl ModifierStage for SmoothingStage {
 		self.face_expression_state
 			.retain(|_, state| generation.wrapping_sub(state.last_seen_generation) <= DYNAMIC_SMOOTHING_STATE_TTL_FRAMES);
 		self.signal_scalar_state
+			.retain(|_, state| generation.wrapping_sub(state.last_seen_generation) <= DYNAMIC_SMOOTHING_STATE_TTL_FRAMES);
+		self.named_vec3_state
+			.retain(|_, state| generation.wrapping_sub(state.last_seen_generation) <= DYNAMIC_SMOOTHING_STATE_TTL_FRAMES);
+		self.named_quat_state
 			.retain(|_, state| generation.wrapping_sub(state.last_seen_generation) <= DYNAMIC_SMOOTHING_STATE_TTL_FRAMES);
 	}
 }
@@ -2686,6 +2730,35 @@ mod tests {
 		stage.apply(&mut replacement);
 		assert_eq!(stage.signal_scalar_state.len(), MAX_DYNAMIC_SMOOTHING_STATES);
 		assert!(stage.signal_scalar_state.contains_key("replacement"));
+	}
+
+	#[test]
+	fn smoothing_bounds_and_expires_named_transform_states() {
+		let config = SmoothingConfig {
+			preset: SmoothingPreset::Medium,
+			..SmoothingConfig::default()
+		};
+		let mut stage = SmoothingStage::from_config(&config, BoneSubsetConfig::default()).expect("smoothing stage");
+		let translation = Vec3f { x: 1.0, y: 2.0, z: 3.0 };
+		let rotation = Quatf {
+			x: 0.0,
+			y: 0.0,
+			z: 0.0,
+			w: 1.0,
+		};
+		for index in 0..(MAX_DYNAMIC_SMOOTHING_STATES + 100) {
+			let name = format!("dynamic-transform-{index}");
+			stage.step_named_translation(&name, translation, 1, 1.0);
+			stage.step_named_rotation(&name, rotation, 1, 1.0);
+		}
+		assert_eq!(stage.named_vec3_state.len(), MAX_DYNAMIC_SMOOTHING_STATES);
+		assert_eq!(stage.named_quat_state.len(), MAX_DYNAMIC_SMOOTHING_STATES);
+
+		for sequence in 0..=DYNAMIC_SMOOTHING_STATE_TTL_FRAMES {
+			stage.apply(&mut UNMotionFrame::new(sequence));
+		}
+		assert!(stage.named_vec3_state.is_empty());
+		assert!(stage.named_quat_state.is_empty());
 	}
 
 	#[test]
