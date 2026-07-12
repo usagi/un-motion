@@ -61,7 +61,7 @@ impl VrcOscAvatarParameters {
 	}
 
 	fn insert(&mut self, parameter: String, is_float: bool) -> bool {
-		let parameter = normalize_avatar_parameter_key(parameter);
+		let parameter = normalize_avatar_parameter_key_owned(parameter);
 		if !valid_vrc_parameter_name(&parameter) {
 			return false;
 		}
@@ -84,15 +84,15 @@ impl VrcOscAvatarParameters {
 	}
 
 	pub fn supports_float(&self, parameter: &str) -> bool {
-		self.float_parameters.contains(&normalize_avatar_parameter_key(parameter))
+		self.float_parameters.contains(normalized_avatar_parameter_key(parameter))
 	}
 
 	pub fn supports_bool(&self, parameter: &str) -> bool {
-		self.bool_parameters.contains(&normalize_avatar_parameter_key(parameter))
+		self.bool_parameters.contains(normalized_avatar_parameter_key(parameter))
 	}
 
 	fn binary_spec(&self, parameter: &str) -> Option<BinaryParameterSpec> {
-		let parameter = normalize_avatar_parameter_key(parameter);
+		let parameter = normalized_avatar_parameter_key(parameter);
 		let bits = [1_u8, 2, 4, 8]
 			.into_iter()
 			.filter(|bit| self.bool_parameters.contains(&format!("{parameter}{bit}")))
@@ -107,13 +107,17 @@ impl VrcOscAvatarParameters {
 	}
 }
 
-fn normalize_avatar_parameter_key(parameter: impl AsRef<str>) -> String {
-	parameter
-		.as_ref()
-		.trim()
-		.trim_start_matches(AVATAR_PARAMETER_PREFIX)
-		.trim_start_matches('/')
-		.to_string()
+fn normalized_avatar_parameter_key(parameter: &str) -> &str {
+	parameter.trim().trim_start_matches(AVATAR_PARAMETER_PREFIX).trim_start_matches('/')
+}
+
+fn normalize_avatar_parameter_key_owned(parameter: String) -> String {
+	let normalized = normalized_avatar_parameter_key(&parameter);
+	if normalized.len() == parameter.len() {
+		parameter
+	} else {
+		normalized.to_string()
+	}
 }
 
 #[derive(Clone, Debug, PartialEq)]
