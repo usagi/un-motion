@@ -404,10 +404,6 @@ impl CoreRuntimeHost {
 		}
 	}
 
-	pub(crate) fn capture_analysis_extras(&self, output_dir: PathBuf, duration: Duration) -> anyhow::Result<Vec<serde_json::Value>> {
-		self.handle().capture_analysis_extras(output_dir, duration)
-	}
-
 	pub(crate) fn join(mut self) -> thread::Result<()> {
 		self.stop();
 		if let Some(join) = self.join.take() { join.join() } else { Ok(()) }
@@ -443,7 +439,7 @@ impl CoreRuntimeHandle {
 			.context("UNMotionFrame capture timed out")?
 	}
 
-	fn capture_analysis_extras(&self, output_dir: PathBuf, duration: Duration) -> anyhow::Result<Vec<serde_json::Value>> {
+	pub(crate) fn capture_analysis_extras(&self, output_dir: PathBuf, duration: Duration) -> anyhow::Result<Vec<serde_json::Value>> {
 		fs::create_dir_all(&output_dir).with_context(|| format!("create analysis output dir {}", output_dir.display()))?;
 		let max_samples = analysis_extras_max_samples(duration);
 		let (begin_tx, begin_rx) = mpsc::channel();

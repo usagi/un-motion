@@ -533,10 +533,8 @@ impl CoreControlState {
 		duration_ms: u64,
 	) -> anyhow::Result<Vec<serde_json::Value>> {
 		let duration = std::time::Duration::from_millis(duration_ms.clamp(100, 3000));
-		let host = self.inner.runtime_host.lock().map_err(|_| anyhow!("runtime host lock poisoned"))?;
-		host.as_ref()
-			.context("runtime is not running")?
-			.capture_analysis_extras(output_dir, duration)
+		let handle = self.runtime_handle()?;
+		run_blocking_runtime_operation(move || handle.capture_analysis_extras(output_dir, duration)).await
 	}
 
 	pub async fn set_active_profile(&self, profile_id: &str) -> anyhow::Result<RuntimeStatus> {
