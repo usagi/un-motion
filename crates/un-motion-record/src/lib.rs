@@ -4,6 +4,8 @@ use anyhow::Context;
 use un_motion_frame::UNMotionFrame;
 use un_motion_interfaces::OutputSink;
 
+pub const MAX_FRAME_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
 pub struct MessagePackStreamRecorder<W: Write> {
 	writer: W,
 }
@@ -15,6 +17,9 @@ impl<W: Write> MessagePackStreamRecorder<W> {
 
 	pub fn write_frame(&mut self, frame: &UNMotionFrame) -> anyhow::Result<()> {
 		let payload = rmp_serde::to_vec_named(frame).context("messagepack encode failed")?;
+		if payload.len() > MAX_FRAME_PAYLOAD_BYTES {
+			anyhow::bail!("frame payload exceeds {MAX_FRAME_PAYLOAD_BYTES} byte limit");
+		}
 		let payload_len: u32 = payload.len().try_into().context("frame payload too large for u32 length prefix")?;
 
 		self.writer
@@ -46,6 +51,9 @@ pub fn decode_framed_stream<R: Read>(mut reader: R) -> anyhow::Result<Vec<UNMoti
 		}
 
 		let payload_len = u32::from_le_bytes(len_buf) as usize;
+		if payload_len > MAX_FRAME_PAYLOAD_BYTES {
+			anyhow::bail!("frame payload exceeds {MAX_FRAME_PAYLOAD_BYTES} byte limit: {payload_len}");
+		}
 		let mut payload = vec![0_u8; payload_len];
 		reader.read_exact(&mut payload).context("failed to read frame payload")?;
 
@@ -110,6 +118,13 @@ mod tests {
 
 		let err = decode_framed_stream(bytes.as_slice()).expect_err("should fail on truncated payload");
 		assert!(err.to_string().contains("failed to read frame payload"));
+	}
+
+	#[test]
+	fn decode_rejects_oversized_payload_before_allocation() {
+		let oversized = (MAX_FRAME_PAYLOAD_BYTES as u32 + 1).to_le_bytes();
+		let error = decode_framed_stream(oversized.as_slice()).expect_err("oversized payload must fail");
+		assert!(error.to_string().contains("frame payload exceeds"));
 	}
 
 	#[test]
