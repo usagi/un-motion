@@ -83,6 +83,8 @@ pub struct VmcUnmotionSource {
 	source: VmcInputSource,
 	source_id: String,
 	sequence: u64,
+	/// `/VMC/Ext/OK` が示す送信元のtracking状態。
+	pending_ok: Option<i32>,
 	/// per-bundle に届く root transform の最新値。
 	pending_root: Option<VmcTransform>,
 	/// bone 名 (VMC 規約上は HumanoidBone enum と 1:1 の "Hips", "Spine" 等) →
@@ -134,6 +136,7 @@ impl VmcUnmotionSource {
 			source,
 			source_id: source_id.clone(),
 			sequence: 0,
+			pending_ok: None,
 			pending_root: None,
 			pending_bones: BTreeMap::new(),
 			pending_blendshapes: BTreeMap::new(),
@@ -150,6 +153,19 @@ impl VmcUnmotionSource {
 	/// 1 つの `VmcInputFrame` を accumulator にマージする。同じ channel の値が
 	/// 既にあれば上書き (=「最後に届いた値が現在の状態」)。
 	fn merge_bundle(&mut self, frame: &VmcInputFrame) {
+		if let Some(ok) = frame.ok {
+			self.pending_ok = Some(ok);
+			if ok <= 0 {
+				self.pending_root = None;
+				self.pending_bones.clear();
+				self.pending_blendshapes.clear();
+				self.staged_blendshapes.clear();
+				self.pending_received_ts = self.pending_received_ts.max(frame.received_timestamp_ns);
+				self.pending_dirty = true;
+				self.telemetry.atomics.bundles_merged.fetch_add(1, Ordering::Relaxed);
+				return;
+			}
+		}
 		if let Some(root) = &frame.root {
 			self.pending_root = Some(root.clone());
 		}
@@ -187,7 +203,7 @@ impl VmcUnmotionSource {
 			source_id: self.source_id.clone(),
 			received_timestamp_ns: self.pending_received_ts,
 			raw_datagram: None,
-			ok: None,
+			ok: self.pending_ok,
 			root: self.pending_root.clone(),
 			bones: self.pending_bones.values().cloned().collect(),
 			blendshapes: self
@@ -383,6 +399,20 @@ pub fn vmc_input_frame_to_unmotion_frame(frame: &VmcInputFrame, sequence: u64) -
 	output.header.coordinate_space = CoordinateSpace::Vmc;
 	output.header.handedness = Handedness::LeftHanded;
 	output.header.length_unit = LengthUnit::Meter;
+	if frame.ok.is_some_and(|ok| ok <= 0) {
+		output.body = Some(BodyMotion {
+			tracking_state: TrackingState::Lost,
+			confidence: 0.0,
+			humanoid: None,
+		});
+		output.face = Some(FaceMotion {
+			tracking_state: TrackingState::Lost,
+			confidence: 0.0,
+			head: None,
+			expressions: Vec::new(),
+		});
+		return output;
+	}
 
 	let root_sample = frame.root.as_ref().map(vmc_transform_to_frame_transform);
 	let bone_samples: Vec<BoneSample> = frame
@@ -982,6 +1012,45 @@ mod tests {
 		source.merge_bundle(&frame);
 		assert!(!source.pending_blendshapes.contains_key("Joy"));
 		assert_eq!(source.pending_blendshapes.get("Blink"), Some(&1.0));
+	}
+
+	#[test]
+	fn accumulator_clears_tracked_state_when_vmc_reports_not_ok() {
+		let mut source = VmcUnmotionSource::bind("tracking-loss", "127.0.0.1:0".parse().unwrap()).expect("bind");
+		source.pending_root = Some(VmcTransform {
+			name: "root".to_string(),
+			position: [0.0; 3],
+			rotation: [0.0, 0.0, 0.0, 1.0],
+		});
+		source.pending_bones.insert(
+			"Head".to_string(),
+			VmcBoneSample {
+				name: "Head".to_string(),
+				position: [0.0; 3],
+				rotation: [0.0, 0.0, 0.0, 1.0],
+			},
+		);
+		source.pending_blendshapes.insert("Joy".to_string(), 1.0);
+		let lost = VmcInputFrame {
+			source_id: "tracking-loss".to_string(),
+			received_timestamp_ns: 2,
+			raw_datagram: None,
+			ok: Some(0),
+			root: None,
+			bones: Vec::new(),
+			blendshapes: Vec::new(),
+			blend_apply: false,
+			message_count: 1,
+		};
+
+		source.merge_bundle(&lost);
+		let frame = source.build_frame_from_accumulator(4);
+
+		assert!(source.pending_root.is_none());
+		assert!(source.pending_bones.is_empty());
+		assert!(source.pending_blendshapes.is_empty());
+		assert_eq!(frame.body.expect("lost body").tracking_state, TrackingState::Lost);
+		assert_eq!(frame.face.expect("lost face").tracking_state, TrackingState::Lost);
 	}
 
 	#[test]
