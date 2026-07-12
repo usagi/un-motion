@@ -298,7 +298,7 @@ struct ActiveDirectShowCapture {
 }
 
 #[cfg(windows)]
-struct PendingDirectShowFrame {
+struct PendingDirectShowFrame<'a> {
 	timestamp_ns: u64,
 	frame_timestamp_ns: u64,
 	width: u32,
@@ -309,7 +309,7 @@ struct PendingDirectShowFrame {
 	stride: u32,
 	plane_lengths: [usize; 3],
 	frame_index: u64,
-	data: Vec<u8>,
+	data: &'a [u8],
 }
 
 #[cfg(windows)]
@@ -496,7 +496,7 @@ impl ActiveDirectShowCapture {
 		self.stats.observed_source_fps
 	}
 
-	fn observe_frame_sample(&mut self, pending: &PendingDirectShowFrame) {
+	fn observe_frame_sample(&mut self, pending: &PendingDirectShowFrame<'_>) {
 		if let Some(previous) = self.stats.last_consumer_timestamp_ns {
 			let interval_ms = pending.timestamp_ns.saturating_sub(previous) as f32 / 1_000_000.0;
 			if interval_ms > 0.0 {
@@ -541,7 +541,7 @@ impl ActiveDirectShowCapture {
 		self.stats.frames = self.stats.frames.saturating_add(1);
 	}
 
-	fn log_frame_probe(&self, pending: &PendingDirectShowFrame) {
+	fn log_frame_probe(&self, pending: &PendingDirectShowFrame<'_>) {
 		if self.stats.frames < 3 || self.stats.frames == 30 {
 			tracing::info!(
 				target: "un_motion_input_webcam_directshow",
@@ -564,7 +564,7 @@ impl ActiveDirectShowCapture {
 		}
 	}
 
-	fn apply_effective_orientation(&self, pending: &mut PendingDirectShowFrame) {
+	fn apply_effective_orientation(&self, pending: &mut PendingDirectShowFrame<'_>) {
 		if is_yuv_request(self.config.pixel_format.as_deref())
 			&& is_packed_rgb_frame(pending.pixel_format)
 			&& matches!(pending.reported_orientation, ccap::FrameOrientation::TopToBottom)
@@ -653,7 +653,7 @@ fn store_cached_capture(active: ActiveDirectShowCapture) {
 }
 
 #[cfg(windows)]
-fn pending_frame_from_ccap_frame(frame: &ccap::VideoFrame) -> anyhow::Result<PendingDirectShowFrame> {
+fn pending_frame_from_ccap_frame(frame: &ccap::VideoFrame) -> anyhow::Result<PendingDirectShowFrame<'_>> {
 	let info = frame.info()?;
 	let Some(src) = info.data_planes[0] else {
 		anyhow::bail!("DirectShow frame has no first data plane");
@@ -675,7 +675,7 @@ fn pending_frame_from_ccap_frame(frame: &ccap::VideoFrame) -> anyhow::Result<Pen
 		stride: info.strides[0],
 		plane_lengths,
 		frame_index: info.frame_index,
-		data: src.to_vec(),
+		data: src,
 	})
 }
 
@@ -899,7 +899,7 @@ fn log_capture_negotiation(
 }
 
 #[cfg(windows)]
-fn resize_ccap_frame_to_rgb8(frame: &PendingDirectShowFrame, dst_width: u32, dst_height: u32) -> anyhow::Result<Vec<u8>> {
+fn resize_ccap_frame_to_rgb8(frame: &PendingDirectShowFrame<'_>, dst_width: u32, dst_height: u32) -> anyhow::Result<Vec<u8>> {
 	if frame.width == 0 || frame.height == 0 || dst_width == 0 || dst_height == 0 {
 		anyhow::bail!("invalid RGB resize dimensions");
 	}
@@ -961,7 +961,7 @@ fn checked_rgb8_output_len(width: u32, height: u32) -> anyhow::Result<usize> {
 }
 
 #[cfg(windows)]
-fn convert_ccap_frame_to_rgb8(frame: &PendingDirectShowFrame) -> anyhow::Result<Vec<u8>> {
+fn convert_ccap_frame_to_rgb8(frame: &PendingDirectShowFrame<'_>) -> anyhow::Result<Vec<u8>> {
 	let width = frame.width as usize;
 	let height = frame.height as usize;
 	let src: &[u8] = frame.data.as_ref();
@@ -1080,7 +1080,7 @@ fn ccap_pixel_row_bytes(pixel_format: ccap::PixelFormat, width: usize) -> anyhow
 }
 
 #[cfg(windows)]
-fn read_ccap_rgb_pixel(frame: &PendingDirectShowFrame, src: &[u8], stride: usize, x: usize, y: usize) -> anyhow::Result<[u8; 3]> {
+fn read_ccap_rgb_pixel(frame: &PendingDirectShowFrame<'_>, src: &[u8], stride: usize, x: usize, y: usize) -> anyhow::Result<[u8; 3]> {
 	match frame.pixel_format {
 		ccap::PixelFormat::Rgb24 | ccap::PixelFormat::Bgr24 | ccap::PixelFormat::Rgba32 | ccap::PixelFormat::Bgra32 => {
 			let (channels, order) = ccap_pixel_layout(frame.pixel_format)?;
