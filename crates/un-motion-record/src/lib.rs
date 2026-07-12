@@ -6,6 +6,28 @@ use un_motion_interfaces::OutputSink;
 
 pub const MAX_FRAME_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
+struct BoundedVecWriter<'a> {
+	buffer: &'a mut Vec<u8>,
+	max_len: usize,
+}
+
+impl Write for BoundedVecWriter<'_> {
+	fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+		if self.buffer.len().saturating_add(bytes.len()) > self.max_len {
+			return Err(std::io::Error::new(
+				ErrorKind::InvalidData,
+				format!("frame payload exceeds {} byte limit", self.max_len),
+			));
+		}
+		self.buffer.extend_from_slice(bytes);
+		Ok(bytes.len())
+	}
+
+	fn flush(&mut self) -> std::io::Result<()> {
+		Ok(())
+	}
+}
+
 pub struct MessagePackStreamRecorder<W: Write> {
 	writer: W,
 	payload_buffer: Vec<u8>,
@@ -21,7 +43,14 @@ impl<W: Write> MessagePackStreamRecorder<W> {
 
 	pub fn write_frame(&mut self, frame: &UNMotionFrame) -> anyhow::Result<()> {
 		self.payload_buffer.clear();
-		rmp_serde::encode::write_named(&mut self.payload_buffer, frame).context("messagepack encode failed")?;
+		rmp_serde::encode::write_named(
+			&mut BoundedVecWriter {
+				buffer: &mut self.payload_buffer,
+				max_len: MAX_FRAME_PAYLOAD_BYTES,
+			},
+			frame,
+		)
+		.context("messagepack encode failed")?;
 		if self.payload_buffer.len() > MAX_FRAME_PAYLOAD_BYTES {
 			anyhow::bail!("frame payload exceeds {MAX_FRAME_PAYLOAD_BYTES} byte limit");
 		}
@@ -139,6 +168,18 @@ mod tests {
 		recorder.write_frame(&UNMotionFrame::new(2)).expect("second frame");
 
 		assert_eq!(recorder.payload_buffer.capacity(), capacity);
+	}
+
+	#[test]
+	fn recorder_stops_serialization_at_payload_limit() {
+		let mut frame = UNMotionFrame::new(1);
+		frame.metadata.notes.push("x".repeat(MAX_FRAME_PAYLOAD_BYTES + 1));
+		let mut recorder = MessagePackStreamRecorder::new(Vec::<u8>::new());
+
+		let error = recorder.write_frame(&frame).expect_err("oversized frame must fail");
+
+		assert!(error.to_string().contains("messagepack encode failed"));
+		assert!(recorder.payload_buffer.len() <= MAX_FRAME_PAYLOAD_BYTES);
 	}
 
 	#[test]
