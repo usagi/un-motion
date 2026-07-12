@@ -258,6 +258,23 @@ pub struct RgbImageRef<'a> {
 	pub stride: u32,
 }
 
+fn validate_rgb_image(image: RgbImageRef<'_>) -> anyhow::Result<()> {
+	if image.bytes.is_empty() || image.width == 0 || image.height == 0 || image.stride == 0 {
+		anyhow::bail!("RGB image must have non-empty bytes and non-zero dimensions");
+	}
+	let minimum_stride = image.width.checked_mul(3).context("RGB image width overflows row size")?;
+	if image.stride < minimum_stride {
+		anyhow::bail!("RGB image stride is shorter than width * 3");
+	}
+	let minimum_len = (image.stride as usize)
+		.checked_mul(image.height as usize)
+		.context("RGB image stride * height overflows buffer size")?;
+	if image.bytes.len() < minimum_len {
+		anyhow::bail!("RGB image buffer is shorter than stride * height");
+	}
+	Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct NativeMediaPipeOutput {
 	pub return_code: i32,
@@ -526,9 +543,7 @@ impl NativeMediaPipeRuntime {
 		mut timestamp_ms: i64,
 		include_gestures: bool,
 	) -> anyhow::Result<NativeMediaPipeOutput> {
-		if image.bytes.is_empty() || image.width == 0 || image.height == 0 || image.stride == 0 {
-			anyhow::bail!("RGB image must have non-empty bytes and non-zero dimensions");
-		}
+		validate_rgb_image(image)?;
 		if timestamp_ms <= self.last_timestamp_ms {
 			timestamp_ms = self.last_timestamp_ms.saturating_add(1);
 		}
@@ -812,5 +827,51 @@ mod tests {
 		assert_eq!(std::mem::size_of::<NativeHand>(), 20 * HAND_LANDMARK_COUNT * 2 + 20);
 		assert_eq!(std::mem::size_of::<NativeFaceBlendshape>(), BLENDSHAPE_NAME_BYTES + 4);
 		assert_eq!(std::mem::size_of::<NativeGestureCategory>(), GESTURE_NAME_BYTES + 4);
+	}
+
+	#[test]
+	fn rgb_image_validation_rejects_short_stride_and_buffer() {
+		let bytes = [0_u8; 12];
+		assert!(
+			validate_rgb_image(RgbImageRef {
+				bytes: &bytes,
+				width: 2,
+				height: 2,
+				stride: 5
+			})
+			.is_err()
+		);
+		assert!(
+			validate_rgb_image(RgbImageRef {
+				bytes: &bytes[..11],
+				width: 2,
+				height: 2,
+				stride: 6
+			})
+			.is_err()
+		);
+		assert!(
+			validate_rgb_image(RgbImageRef {
+				bytes: &bytes,
+				width: 2,
+				height: 2,
+				stride: 6
+			})
+			.is_ok()
+		);
+	}
+
+	#[test]
+	fn rgb_image_validation_rejects_dimension_overflow() {
+		let bytes = [0_u8; 1];
+		assert!(
+			validate_rgb_image(RgbImageRef {
+				bytes: &bytes,
+				width: u32::MAX,
+				height: 1,
+				stride: u32::MAX,
+			})
+			.is_err()
+		);
 	}
 }
