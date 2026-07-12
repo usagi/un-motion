@@ -2,7 +2,7 @@ use std::io::Read;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -13,6 +13,7 @@ use un_motion_interfaces::{ImageFrame, ImageInputSource};
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+const STDERR_TAIL_MAX_BYTES: usize = 8 * 1024;
 
 fn command_without_console(command: &mut Command) -> &mut Command {
 	#[cfg(windows)]
@@ -58,6 +59,8 @@ pub struct FileVideoInputSource {
 	reader_done: Arc<AtomicBool>,
 	reader_error: Arc<Mutex<Option<String>>>,
 	reader_join: Option<JoinHandle<()>>,
+	stderr_tail: Arc<Mutex<Vec<u8>>>,
+	stderr_join: Option<JoinHandle<()>>,
 	sequence: u64,
 	frame_len: usize,
 	exhausted: bool,
@@ -75,6 +78,8 @@ impl FileVideoInputSource {
 			reader_done: Arc::new(AtomicBool::new(false)),
 			reader_error: Arc::new(Mutex::new(None)),
 			reader_join: None,
+			stderr_tail: Arc::new(Mutex::new(Vec::new())),
+			stderr_join: None,
 			sequence: 0,
 			frame_len,
 			exhausted: false,
@@ -114,7 +119,7 @@ impl FileVideoInputSource {
 			.args(Self::ffmpeg_args(&self.config))
 			.stdin(Stdio::null())
 			.stdout(Stdio::piped())
-			.stderr(Stdio::null());
+			.stderr(Stdio::piped());
 		let mut child = command_without_console(&mut command)
 			.spawn()
 			.map_err(|error| anyhow::anyhow!("failed to start ffmpeg at {}: {error}", self.config.ffmpeg_path.display()))?;
@@ -122,6 +127,10 @@ impl FileVideoInputSource {
 			.stdout
 			.take()
 			.ok_or_else(|| anyhow::anyhow!("ffmpeg stdout pipe was not created"))?;
+		let stderr = child
+			.stderr
+			.take()
+			.ok_or_else(|| anyhow::anyhow!("ffmpeg stderr pipe was not created"))?;
 		let (frame_tx, frame_rx) = mpsc::sync_channel(1);
 		let stop = Arc::clone(&self.reader_stop);
 		let done = Arc::clone(&self.reader_done);
@@ -130,6 +139,8 @@ impl FileVideoInputSource {
 		self.reader_join = Some(thread::spawn(move || {
 			run_frame_reader(stdout, frame_len, frame_tx, stop, done, error)
 		}));
+		let stderr_tail = Arc::clone(&self.stderr_tail);
+		self.stderr_join = Some(thread::spawn(move || run_stderr_reader(stderr, stderr_tail)));
 		self.frame_rx = Some(frame_rx);
 		self.child = Some(child);
 		Ok(())
@@ -150,10 +161,43 @@ impl FileVideoInputSource {
 		match frame_rx.try_recv() {
 			Ok(data) => Ok(Some(data)),
 			Err(TryRecvError::Empty) if !self.reader_done.load(Ordering::Acquire) => Ok(None),
-			Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
-				self.exhausted = true;
-				Ok(None)
-			}
+			Err(TryRecvError::Empty | TryRecvError::Disconnected) => self.finish_ffmpeg(),
+		}
+	}
+
+	fn finish_ffmpeg(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+		let Some(child) = self.child.as_mut() else {
+			self.exhausted = true;
+			return Ok(None);
+		};
+		let Some(status) = child.try_wait()? else {
+			return Ok(None);
+		};
+		self.child = None;
+		self.exhausted = true;
+		self.join_reader_threads();
+		if status.success() {
+			return Ok(None);
+		}
+		let stderr = self
+			.stderr_tail
+			.lock()
+			.map(|tail| String::from_utf8_lossy(&tail).trim().to_string())
+			.unwrap_or_default();
+		let detail = if stderr.is_empty() {
+			"stderr was empty".to_string()
+		} else {
+			stderr
+		};
+		Err(anyhow::anyhow!("ffmpeg exited with status {status}: {detail}"))
+	}
+
+	fn join_reader_threads(&mut self) {
+		if let Some(reader_join) = self.reader_join.take() {
+			let _ = reader_join.join();
+		}
+		if let Some(stderr_join) = self.stderr_join.take() {
+			let _ = stderr_join.join();
 		}
 	}
 }
@@ -206,6 +250,29 @@ fn run_frame_reader(
 	done.store(true, Ordering::Release);
 }
 
+fn run_stderr_reader(mut stderr: ChildStderr, tail: Arc<Mutex<Vec<u8>>>) {
+	let mut buffer = [0_u8; 1024];
+	loop {
+		match stderr.read(&mut buffer) {
+			Ok(0) => return,
+			Ok(read) => {
+				let Ok(mut tail) = tail.lock() else { return };
+				append_bounded_stderr(&mut tail, &buffer[..read]);
+			}
+			Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+			Err(_) => return,
+		}
+	}
+}
+
+fn append_bounded_stderr(tail: &mut Vec<u8>, bytes: &[u8]) {
+	tail.extend_from_slice(bytes);
+	let overflow = tail.len().saturating_sub(STDERR_TAIL_MAX_BYTES);
+	if overflow > 0 {
+		tail.drain(..overflow);
+	}
+}
+
 impl Drop for FileVideoInputSource {
 	fn drop(&mut self) {
 		self.reader_stop.store(true, Ordering::Release);
@@ -213,9 +280,7 @@ impl Drop for FileVideoInputSource {
 			let _ = child.kill();
 			let _ = child.wait();
 		}
-		if let Some(reader_join) = self.reader_join.take() {
-			let _ = reader_join.join();
-		}
+		self.join_reader_threads();
 	}
 }
 
@@ -308,6 +373,8 @@ mod tests {
 			reader_done: Arc::new(AtomicBool::new(true)),
 			reader_error: Arc::new(Mutex::new(None)),
 			reader_join: None,
+			stderr_tail: Arc::new(Mutex::new(Vec::new())),
+			stderr_join: None,
 			sequence: 0,
 			frame_len: 640 * 480 * 3,
 			exhausted: true,
@@ -315,5 +382,13 @@ mod tests {
 		assert!(source.next_rgb_bytes().expect("first idle poll").is_none());
 		assert!(source.next_rgb_bytes().expect("repeated idle poll").is_none());
 		assert!(source.exhausted);
+	}
+
+	#[test]
+	fn stderr_tail_keeps_only_latest_bounded_bytes() {
+		let mut tail = vec![b'a'; STDERR_TAIL_MAX_BYTES];
+		append_bounded_stderr(&mut tail, b"latest");
+		assert_eq!(tail.len(), STDERR_TAIL_MAX_BYTES);
+		assert!(tail.ends_with(b"latest"));
 	}
 }
