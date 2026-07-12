@@ -91,21 +91,11 @@ struct UnMotionMediaPipeContext {
   int64_t next_timestamp_ms = 0;
   vision_core::RunningMode running_mode = vision_core::RunningMode::VIDEO;
   std::mutex latest_mutex;
-  UnMotionMediaPipePose latest_pose = {};
-  UnMotionMediaPipeHands latest_hands = {};
-  UnMotionMediaPipeFace latest_face = {};
-  UnMotionMediaPipeGestures latest_gestures = {};
-  UnMotionMediaPipeHolistic latest_holistic = {};
   std::deque<QueuedPoseResult> queued_pose;
   std::deque<QueuedHandsResult> queued_hands;
   std::deque<QueuedFaceResult> queued_face;
   std::deque<QueuedGesturesResult> queued_gestures;
   std::deque<QueuedHolisticResult> queued_holistic;
-  int32_t latest_pose_error = 20;
-  int32_t latest_hands_error = 0;
-  int32_t latest_face_error = 0;
-  int32_t latest_gestures_error = 0;
-  int32_t latest_holistic_error = 0;
   int64_t latest_pose_timestamp_ms = -1;
   int64_t latest_hands_timestamp_ms = -1;
   int64_t latest_face_timestamp_ms = -1;
@@ -126,11 +116,6 @@ struct UnMotionMediaPipeContext {
   uint64_t face_callback_count = 0;
   uint64_t gestures_callback_count = 0;
   uint64_t holistic_callback_count = 0;
-  bool latest_pose_ready = false;
-  bool latest_hands_ready = false;
-  bool latest_face_ready = false;
-  bool latest_gestures_ready = false;
-  bool latest_holistic_ready = false;
 };
 
 template <typename Queue, typename Item>
@@ -840,12 +825,9 @@ void* un_motion_mediapipe_create_with_options(const UnMotionMediaPipeOptions* ra
               error = copy_pose_result(*result, &copied);
             }
             std::lock_guard<std::mutex> lock(callback_context->latest_mutex);
-            callback_context->latest_pose = copied;
-            callback_context->latest_pose_error = error;
             callback_context->latest_pose_timestamp_ms = timestamp_ms;
             callback_context->pose_callback_count += 1;
             push_bounded(callback_context->queued_pose, QueuedPoseResult{copied, error, timestamp_ms});
-            callback_context->latest_pose_ready = true;
           };
     }
 
@@ -886,12 +868,9 @@ void* un_motion_mediapipe_create_with_options(const UnMotionMediaPipeOptions* ra
               error = copy_face_result(*result, &copied);
             }
             std::lock_guard<std::mutex> lock(callback_context->latest_mutex);
-            callback_context->latest_face = copied;
-            callback_context->latest_face_error = error;
             callback_context->latest_face_timestamp_ms = timestamp_ms;
             callback_context->face_callback_count += 1;
             push_bounded(callback_context->queued_face, QueuedFaceResult{copied, error, timestamp_ms});
-            callback_context->latest_face_ready = true;
           };
     }
 
@@ -930,12 +909,9 @@ void* un_motion_mediapipe_create_with_options(const UnMotionMediaPipeOptions* ra
               error = copy_gesture_result(*result, &copied);
             }
             std::lock_guard<std::mutex> lock(callback_context->latest_mutex);
-            callback_context->latest_gestures = copied;
-            callback_context->latest_gestures_error = error;
             callback_context->latest_gestures_timestamp_ms = timestamp_ms;
             callback_context->gestures_callback_count += 1;
             push_bounded(callback_context->queued_gestures, QueuedGesturesResult{copied, error, timestamp_ms});
-            callback_context->latest_gestures_ready = true;
           };
     }
 
@@ -989,12 +965,9 @@ void* un_motion_mediapipe_create_with_options(const UnMotionMediaPipeOptions* ra
               error = copy_holistic_result(*result, &copied);
             }
             std::lock_guard<std::mutex> lock(callback_context->latest_mutex);
-            callback_context->latest_holistic = copied;
-            callback_context->latest_holistic_error = error;
             callback_context->latest_holistic_timestamp_ms = timestamp_ms;
             callback_context->holistic_callback_count += 1;
             push_bounded(callback_context->queued_holistic, QueuedHolisticResult{copied, error, timestamp_ms});
-            callback_context->latest_holistic_ready = true;
           };
     }
 
@@ -1033,12 +1006,9 @@ void* un_motion_mediapipe_create_with_options(const UnMotionMediaPipeOptions* ra
               error = copy_hands_result(*result, &copied);
             }
             std::lock_guard<std::mutex> lock(callback_context->latest_mutex);
-            callback_context->latest_hands = copied;
-            callback_context->latest_hands_error = error;
             callback_context->latest_hands_timestamp_ms = timestamp_ms;
             callback_context->hands_callback_count += 1;
             push_bounded(callback_context->queued_hands, QueuedHandsResult{copied, error, timestamp_ms});
-            callback_context->latest_hands_ready = true;
           };
     }
 
