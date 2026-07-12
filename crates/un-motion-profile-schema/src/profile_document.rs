@@ -239,25 +239,26 @@ impl CoreProfileDocumentStore {
 	pub fn load(&self) -> anyhow::Result<CoreProfileDocument> {
 		let _store_lock = self.acquire_store_lock()?;
 		self.recover_profile_transaction()?;
-		Ok(self.load_unlocked())
+		self.load_unlocked()
 	}
 
-	fn load_unlocked(&self) -> CoreProfileDocument {
+	fn load_unlocked(&self) -> anyhow::Result<CoreProfileDocument> {
 		let mut profiles = Vec::new();
 		let mut profile_sources = Vec::new();
-		let profile_manifest = load_profile_manifest(&self.conf_path);
-		if let Ok(entries) = fs::read_dir(&self.profiles_dir) {
-			for entry in entries.flatten() {
+		let conf = load_conf_document(&self.conf_path)?;
+		let profile_manifest = conf.as_ref().and_then(profile_manifest_from_document);
+		if self.profiles_dir.exists() {
+			let entries = fs::read_dir(&self.profiles_dir)
+				.with_context(|| format!("failed to read profiles directory {}", self.profiles_dir.display()))?;
+			for entry in entries {
+				let entry = entry.with_context(|| format!("failed to read entry in {}", self.profiles_dir.display()))?;
 				let path = entry.path();
 				if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
 					continue;
 				}
-				let Ok(raw) = fs::read_to_string(&path) else {
-					continue;
-				};
-				let Ok(profile) = toml::from_str::<CoreProfileFile>(&raw) else {
-					continue;
-				};
+				let raw = fs::read_to_string(&path).with_context(|| format!("failed to read profile {}", path.display()))?;
+				let profile =
+					toml::from_str::<CoreProfileFile>(&raw).with_context(|| format!("failed to parse profile {}", path.display()))?;
 				if profile_manifest.as_ref().is_some_and(|manifest| !manifest.contains(&profile.id)) {
 					continue;
 				}
@@ -288,17 +289,21 @@ impl CoreProfileDocumentStore {
 				});
 			}
 		}
-		sort_profiles_by_saved_order(&mut profiles, &load_profile_order(&self.conf_path));
+		let profile_order = conf.as_ref().map(profile_order_from_document).unwrap_or_default();
+		sort_profiles_by_saved_order(&mut profiles, &profile_order);
 		if profiles.is_empty() && !self.conf_path.exists() {
 			profiles = default_profiles();
 		}
-		normalize_profile_document(CoreProfileDocument {
+		Ok(normalize_profile_document(CoreProfileDocument {
 			next_profile_index: (profiles.len() as u32).saturating_add(1).max(default_next_profile_index()),
 			next_source_index: (profile_sources.len() as u32).saturating_add(2).max(default_next_source_index()),
-			selected_profile_id: load_active_profile_id(&self.conf_path).unwrap_or_else(default_selected_profile_id),
+			selected_profile_id: conf
+				.as_ref()
+				.and_then(active_profile_id_from_document)
+				.unwrap_or_else(default_selected_profile_id),
 			profiles,
 			profile_sources,
-		})
+		}))
 	}
 
 	pub fn save(&self, document: CoreProfileDocument) -> anyhow::Result<CoreProfileDocument> {
@@ -833,19 +838,11 @@ pub fn resolve_workspace_conf_path() -> PathBuf {
 	cwd.join(CONF_FILE_NAME)
 }
 
-fn load_active_profile_id(path: &Path) -> Option<String> {
-	let raw = fs::read_to_string(path).ok()?;
-	let doc = raw.parse::<toml::Value>().ok()?;
+fn active_profile_id_from_document(doc: &toml::Value) -> Option<String> {
 	doc.get("desktop")?.get("active_profile_id")?.as_str().map(ToString::to_string)
 }
 
-fn load_profile_order(path: &Path) -> Vec<String> {
-	let Ok(raw) = fs::read_to_string(path) else {
-		return Vec::new();
-	};
-	let Ok(doc) = raw.parse::<toml::Value>() else {
-		return Vec::new();
-	};
+fn profile_order_from_document(doc: &toml::Value) -> Vec<String> {
 	doc.get("desktop")
 		.and_then(|desktop| desktop.get("profile_order"))
 		.and_then(toml::Value::as_array)
@@ -859,11 +856,20 @@ fn load_profile_order(path: &Path) -> Vec<String> {
 		.unwrap_or_default()
 }
 
-fn load_profile_manifest(path: &Path) -> Option<HashSet<String>> {
-	let raw = fs::read_to_string(path).ok()?;
-	let doc = raw.parse::<toml::Value>().ok()?;
+fn profile_manifest_from_document(doc: &toml::Value) -> Option<HashSet<String>> {
 	let ids = doc.get("desktop")?.get("profile_ids")?.as_array()?;
 	Some(ids.iter().filter_map(toml::Value::as_str).map(ToString::to_string).collect())
+}
+
+fn load_conf_document(path: &Path) -> anyhow::Result<Option<toml::Value>> {
+	match fs::read_to_string(path) {
+		Ok(raw) => raw
+			.parse::<toml::Value>()
+			.with_context(|| format!("failed to parse {}", path.display()))
+			.map(Some),
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+		Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+	}
 }
 
 fn sort_profiles_by_saved_order(profiles: &mut [CoreProfileDocumentProfile], order: &[String]) {
@@ -886,8 +892,9 @@ fn format_profile_metadata(path: &Path, active_profile_id: &str, profile_order: 
 	let mut doc = match fs::read_to_string(path) {
 		Ok(raw) => raw
 			.parse::<toml::Value>()
-			.unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new())),
-		Err(_) => toml::Value::Table(toml::map::Map::new()),
+			.with_context(|| format!("failed to parse {}", path.display()))?,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => toml::Value::Table(toml::map::Map::new()),
+		Err(error) => return Err(error).with_context(|| format!("failed to read {}", path.display())),
 	};
 	if !doc.is_table() {
 		doc = toml::Value::Table(toml::map::Map::new());
@@ -1123,6 +1130,23 @@ mirrorCorrectionEnabled = true
 	}
 
 	#[test]
+	fn store_load_rejects_malformed_profile_and_conf_files() {
+		let profile_root = temp_root("malformed-profile");
+		fs::write(profile_root.join("profiles/broken.toml"), "id = [").expect("broken profile");
+		let profile_error = CoreProfileDocumentStore::from_root(&profile_root)
+			.load()
+			.expect_err("malformed profile must fail");
+		assert!(profile_error.to_string().contains("failed to parse profile"));
+
+		let conf_root = temp_root("malformed-conf");
+		fs::write(conf_root.join("conf.toml"), "[desktop").expect("broken conf");
+		let conf_error = CoreProfileDocumentStore::from_root(&conf_root)
+			.load()
+			.expect_err("malformed conf must fail");
+		assert!(conf_error.to_string().contains("failed to parse"));
+	}
+
+	#[test]
 	fn normalize_allows_empty_profile_document() {
 		let normalized = normalize_profile_document(CoreProfileDocument {
 			selected_profile_id: "missing".to_string(),
@@ -1245,7 +1269,7 @@ mirrorCorrectionEnabled = true
 			.parse::<toml::Value>()
 			.expect("conf toml");
 		assert_eq!(
-			load_profile_order(root.join("conf.toml").as_path()),
+			profile_order_from_document(&conf),
 			vec!["third".to_string(), "first".to_string(), "second".to_string()]
 		);
 		assert!(conf.get("desktop").and_then(|desktop| desktop.get("profile_order")).is_some());
