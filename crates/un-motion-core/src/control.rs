@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, broadcast};
 use un_motion_frame::UNMotionFrame;
 use un_motion_runtime::RuntimeSnapshot;
 
@@ -210,6 +210,7 @@ struct CoreMutableState {
 #[derive(Debug)]
 struct CoreControlInner {
 	state: RwLock<CoreMutableState>,
+	mutation: AsyncMutex<()>,
 	profile_store: Option<CoreProfileDocumentStore>,
 	runtime_host: Mutex<Option<CoreRuntimeHost>>,
 	events: broadcast::Sender<CoreEvent>,
@@ -254,6 +255,7 @@ impl CoreControlState {
 					profile_document,
 					runtime_snapshot: None,
 				}),
+				mutation: AsyncMutex::new(()),
 				profile_store,
 				runtime_host: Mutex::new(None),
 				events,
@@ -284,6 +286,7 @@ impl CoreControlState {
 	}
 
 	pub async fn set_profile_document(&self, profile_document: CoreProfileDocument) -> anyhow::Result<CoreProfileDocument> {
+		let _mutation = self.inner.mutation.lock().await;
 		let normalized = if let Some(store) = &self.inner.profile_store {
 			store.save(profile_document)?
 		} else {
@@ -315,6 +318,7 @@ impl CoreControlState {
 		&self,
 		profile_document: CoreProfileDocument,
 	) -> anyhow::Result<CoreProfileDocument> {
+		let _mutation = self.inner.mutation.lock().await;
 		let (current_active_profile_id, old_active_profile) = {
 			let state = self.inner.state.read().await;
 			let active_profile_id = state.status.active_profile_id.clone();
@@ -363,6 +367,7 @@ impl CoreControlState {
 	}
 
 	pub async fn start_runtime(&self) -> RuntimeStatus {
+		let _mutation = self.inner.mutation.lock().await;
 		if self.runtime_host_is_running() {
 			return self.status().await;
 		}
@@ -428,6 +433,7 @@ impl CoreControlState {
 	}
 
 	pub async fn stop_runtime(&self) -> RuntimeStatus {
+		let _mutation = self.inner.mutation.lock().await;
 		self.stop_runtime_host();
 		let status = {
 			let mut state = self.inner.state.write().await;
@@ -536,6 +542,7 @@ impl CoreControlState {
 	}
 
 	pub async fn set_active_profile(&self, profile_id: &str) -> anyhow::Result<RuntimeStatus> {
+		let _mutation = self.inner.mutation.lock().await;
 		// Idempotency: 既に同じ profile が active で runtime が running なら
 		// 何もせず現在の status を返す。これは Supervisor が `launch_capturer` の
 		// healthz 後に unconditional で `PUT /api/profiles/active` を呼ぶ運用
@@ -653,6 +660,19 @@ fn now_unix_ms() -> u64 {
 mod tests {
 	use super::*;
 	use un_motion_profile_schema::CoreProfileDocumentProfile;
+
+	#[tokio::test]
+	async fn profile_mutations_wait_for_the_shared_operation_gate() {
+		let state = CoreControlState::default();
+		let document = state.profile_document().await;
+		let gate = state.inner.mutation.lock().await;
+		let task_state = state.clone();
+		let mut task = tokio::spawn(async move { task_state.set_profile_document(document).await });
+
+		assert!(tokio::time::timeout(std::time::Duration::from_millis(20), &mut task).await.is_err());
+		drop(gate);
+		task.await.expect("mutation task").expect("profile mutation");
+	}
 
 	#[tokio::test]
 	async fn start_stop_updates_status_and_emits_events() {
