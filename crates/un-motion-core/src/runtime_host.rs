@@ -1030,7 +1030,7 @@ fn run_core_runtime(
 			}
 			sent = true;
 		}
-		if (received_unmotion || sent) && runtime_snapshot_due(&mut last_runtime_snapshot_at, now) {
+		if runtime_snapshot_due(&mut last_runtime_snapshot_at, now) {
 			workers.refresh_source_telemetry(&mut output_telemetry);
 			status_callback(CoreRuntimeStatusUpdate {
 				active_profile_id: active_profile_id.clone(),
@@ -2912,6 +2912,25 @@ mod tests {
 		assert_eq!(last, start + Duration::from_millis(100));
 		assert!(!runtime_snapshot_due(&mut last, start + Duration::from_millis(150)));
 		assert!(runtime_snapshot_due(&mut last, start + Duration::from_millis(200)));
+	}
+
+	#[test]
+	fn runtime_snapshot_reclassifies_silent_stream_as_stale() {
+		let config = CoreRuntimeConfig {
+			active_profile_id: "unmotion-profile".to_string(),
+			fps: 60,
+			vmc_output: None,
+			vrc_osc_output: None,
+			zenoh_output: None,
+			frame_streams: vec![test_frame_stream_config("mediapipe-main")],
+		};
+		let mut latest_states = initial_stream_states(&config);
+		let stream_id = StreamId::new("unmotion:mediapipe-main");
+		let state = Arc::make_mut(latest_states.get_mut(&stream_id).expect("stream state"));
+		state.last_event_at_ns = Some(1_000);
+		let snapshot = runtime_snapshot(&config, &latest_states, RuntimeState::Running, &OutputTelemetry::default());
+		let health = &snapshot.streams[0].health;
+		assert!(matches!(health, StreamHealth::Stale { .. }));
 	}
 
 	#[test]
