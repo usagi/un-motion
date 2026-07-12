@@ -295,6 +295,8 @@ struct ActiveDirectShowCapture {
 	actual_pixel_format: Option<String>,
 	last_delivered_width: Option<u32>,
 	last_delivered_height: Option<u32>,
+	resize_x_map_source_width: Option<u32>,
+	resize_x_map: Vec<usize>,
 }
 
 #[cfg(windows)]
@@ -431,6 +433,8 @@ impl ActiveDirectShowCapture {
 			actual_pixel_format,
 			last_delivered_width: None,
 			last_delivered_height: None,
+			resize_x_map_source_width: None,
+			resize_x_map: Vec::new(),
 		})
 	}
 
@@ -450,7 +454,8 @@ impl ActiveDirectShowCapture {
 			if requested_width > 0 && requested_height > 0 && (requested_width != width || requested_height != height) {
 				width = requested_width;
 				height = requested_height;
-				resize_ccap_frame_to_rgb8(&pending, requested_width, requested_height)?
+				self.prepare_resize_x_map(pending.width, requested_width);
+				resize_ccap_frame_to_rgb8(&pending, requested_width, requested_height, &self.resize_x_map)?
 			} else {
 				convert_ccap_frame_to_rgb8(&pending)?
 			}
@@ -582,6 +587,16 @@ impl ActiveDirectShowCapture {
 				);
 			}
 		}
+	}
+
+	fn prepare_resize_x_map(&mut self, source_width: u32, destination_width: u32) {
+		if self.resize_x_map_source_width == Some(source_width) && self.resize_x_map.len() == destination_width as usize {
+			return;
+		}
+		self.resize_x_map.clear();
+		self.resize_x_map
+			.extend((0..destination_width).map(|x| (x as u64 * source_width as u64 / destination_width as u64) as usize));
+		self.resize_x_map_source_width = Some(source_width);
 	}
 
 	fn format_label(&self) -> String {
@@ -899,7 +914,12 @@ fn log_capture_negotiation(
 }
 
 #[cfg(windows)]
-fn resize_ccap_frame_to_rgb8(frame: &PendingDirectShowFrame<'_>, dst_width: u32, dst_height: u32) -> anyhow::Result<Vec<u8>> {
+fn resize_ccap_frame_to_rgb8(
+	frame: &PendingDirectShowFrame<'_>,
+	dst_width: u32,
+	dst_height: u32,
+	x_map: &[usize],
+) -> anyhow::Result<Vec<u8>> {
 	if frame.width == 0 || frame.height == 0 || dst_width == 0 || dst_height == 0 {
 		anyhow::bail!("invalid RGB resize dimensions");
 	}
@@ -912,6 +932,9 @@ fn resize_ccap_frame_to_rgb8(frame: &PendingDirectShowFrame<'_>, dst_width: u32,
 	let src_height = frame.height as usize;
 	let dst_width_usize = dst_width as usize;
 	let dst_height_usize = dst_height as usize;
+	if x_map.len() != dst_width_usize {
+		anyhow::bail!("RGB resize x-map length does not match destination width");
+	}
 	let src: &[u8] = frame.data.as_ref();
 	let stride = frame.stride as usize;
 	let row_bytes = ccap_pixel_row_bytes(frame.pixel_format, src_width)?;
@@ -924,9 +947,6 @@ fn resize_ccap_frame_to_rgb8(frame: &PendingDirectShowFrame<'_>, dst_width: u32,
 	if src.len() < required {
 		anyhow::bail!("DirectShow frame data is shorter than stride * height");
 	}
-	let x_map = (0..dst_width)
-		.map(|x| (x as u64 * frame.width as u64 / dst_width as u64) as usize)
-		.collect::<Vec<_>>();
 	let mut dst = vec![0_u8; dst_len];
 	for y in 0..dst_height_usize {
 		let mapped_y = y * src_height / dst_height_usize;
