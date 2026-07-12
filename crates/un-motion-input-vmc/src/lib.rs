@@ -8,6 +8,7 @@ use rosc::{OscMessage, OscPacket, OscType, decoder};
 const MAX_DATAGRAMS_PER_POLL: usize = 64;
 pub const MAX_VMC_BLENDSHAPES: usize = 1_024;
 pub const MAX_VMC_NAME_BYTES: usize = 256;
+const MAX_OSC_BUNDLE_DEPTH: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VmcInputConfig {
@@ -131,7 +132,7 @@ impl VmcPacketDecoder {
 
 	pub fn decode_packet(&mut self, packet: &OscPacket, received_timestamp_ns: u64) -> Option<VmcInputFrame> {
 		let mut frame = VmcInputFrame::empty(self.source_id.clone(), received_timestamp_ns);
-		self.visit_packet(packet, &mut frame);
+		self.visit_packet(packet, &mut frame, 0);
 		if frame.is_empty() { None } else { Some(frame) }
 	}
 
@@ -146,12 +147,15 @@ impl VmcPacketDecoder {
 		}))
 	}
 
-	fn visit_packet(&mut self, packet: &OscPacket, frame: &mut VmcInputFrame) {
+	fn visit_packet(&mut self, packet: &OscPacket, frame: &mut VmcInputFrame, depth: usize) {
+		if depth > MAX_OSC_BUNDLE_DEPTH {
+			return;
+		}
 		match packet {
 			OscPacket::Message(message) => self.visit_message(message, frame),
 			OscPacket::Bundle(bundle) => {
 				for packet in &bundle.content {
-					self.visit_packet(packet, frame);
+					self.visit_packet(packet, frame, depth + 1);
 				}
 			}
 		}
@@ -402,6 +406,25 @@ mod tests {
 			timetag: OscTime { seconds: 0, fractional: 1 },
 			content,
 		})
+	}
+
+	fn nested_bundle(depth: usize, mut packet: OscPacket) -> OscPacket {
+		for _ in 0..depth {
+			packet = bundle(vec![packet]);
+		}
+		packet
+	}
+
+	#[test]
+	fn nested_bundle_depth_is_bounded() {
+		let message = || packet_message("/VMC/Ext/OK", vec![OscType::Int(1)]);
+		let mut decoder = VmcPacketDecoder::new("depth");
+		assert!(decoder.decode_packet(&nested_bundle(MAX_OSC_BUNDLE_DEPTH, message()), 1).is_some());
+		assert!(
+			decoder
+				.decode_packet(&nested_bundle(MAX_OSC_BUNDLE_DEPTH + 1, message()), 2)
+				.is_none()
+		);
 	}
 
 	#[test]
