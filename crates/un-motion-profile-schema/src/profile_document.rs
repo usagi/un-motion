@@ -267,10 +267,11 @@ impl CoreProfileDocumentStore {
 		let normalized = normalize_profile_document(document);
 		fs::create_dir_all(&self.profiles_dir)
 			.with_context(|| format!("failed to create profiles directory {}", self.profiles_dir.display()))?;
-		let expected_files = normalized.profiles.iter().map(profile_file_name).collect::<HashSet<_>>();
+		let profile_file_names = unique_profile_file_names(&normalized.profiles);
+		let expected_files = profile_file_names.iter().cloned().collect::<HashSet<_>>();
 
 		let mut profile_files = Vec::with_capacity(normalized.profiles.len());
-		for profile in &normalized.profiles {
+		for (profile, file_name) in normalized.profiles.iter().zip(profile_file_names) {
 			let sources = normalized
 				.profile_sources
 				.iter()
@@ -299,7 +300,7 @@ impl CoreProfileDocumentStore {
 				pipeline_components: profile.pipeline_components.clone(),
 			};
 			let raw = toml::to_string_pretty(&file).context("failed to format profile TOML")?;
-			let path = self.profiles_dir.join(profile_file_name(profile));
+			let path = self.profiles_dir.join(file_name);
 			profile_files.push((path, raw));
 		}
 		for (path, raw) in profile_files {
@@ -579,6 +580,27 @@ fn profile_file_name(profile: &CoreProfileDocumentProfile) -> String {
 	)
 }
 
+fn unique_profile_file_names(profiles: &[CoreProfileDocumentProfile]) -> Vec<String> {
+	let mut used = HashSet::with_capacity(profiles.len());
+	profiles
+		.iter()
+		.map(|profile| {
+			let base = profile_file_name(profile);
+			if used.insert(base.clone()) {
+				return base;
+			}
+			let stem = base.strip_suffix(".toml").unwrap_or(&base);
+			for suffix in 2_u32.. {
+				let candidate = format!("{stem}-{suffix}.toml");
+				if used.insert(candidate.clone()) {
+					return candidate;
+				}
+			}
+			unreachable!("u32 profile filename suffixes exhausted")
+		})
+		.collect()
+}
+
 fn normalize_created_at(value: &str, path: &Path) -> String {
 	let trimmed = value.trim();
 	if is_compact_timestamp(trimmed) {
@@ -783,6 +805,36 @@ mod tests {
 
 		assert_eq!(fs::read(&path).expect("replacement"), b"new");
 		assert_eq!(fs::read_dir(&root).expect("root entries").count(), 2);
+	}
+
+	#[test]
+	fn store_keeps_profiles_with_colliding_timestamp_and_name() {
+		let root = temp_root("profile-filename-collision");
+		let store = CoreProfileDocumentStore::from_root(&root);
+		let mut profiles = default_profiles();
+		let mut duplicate = profiles[0].clone();
+		profiles[0].id = "profile-a".to_string();
+		profiles[0].name = "Same Name".to_string();
+		profiles[0].created_at = "20260712T120000Z".to_string();
+		duplicate.id = "profile-b".to_string();
+		duplicate.name = profiles[0].name.clone();
+		duplicate.created_at = profiles[0].created_at.clone();
+		profiles = vec![profiles.remove(0), duplicate];
+
+		store
+			.save(CoreProfileDocument {
+				selected_profile_id: "profile-a".to_string(),
+				profiles,
+				..CoreProfileDocument::default()
+			})
+			.expect("save colliding profiles");
+
+		let loaded = store.load();
+		assert_eq!(loaded.profiles.len(), 2);
+		assert!(loaded.profiles.iter().any(|profile| profile.id == "profile-a"));
+		assert!(loaded.profiles.iter().any(|profile| profile.id == "profile-b"));
+		assert_eq!(fs::read_dir(root.join("profiles")).expect("profiles").count(), 2);
+		let _ = fs::remove_dir_all(root);
 	}
 
 	fn temp_root(label: &str) -> PathBuf {
