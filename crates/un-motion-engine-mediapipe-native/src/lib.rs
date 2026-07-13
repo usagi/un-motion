@@ -41,18 +41,18 @@ impl NativeMediaPipeImageEngine {
 		&self.config
 	}
 
-	pub fn process_rgb_frame(&mut self, frame: &ImageFrame) -> anyhow::Result<NativeMediaPipeOutput> {
+	pub fn process_rgb_frame(&mut self, frame: &ImageFrame) -> anyhow::Result<Box<NativeMediaPipeOutput>> {
 		let rgb = image_frame_rgb_ref(frame)?;
 		let timestamp_ms = frame.metadata.capture_timestamp_ns.saturating_div(1_000_000).min(i64::MAX as u64) as i64;
 		if self.config.include_gestures {
-			self.runtime.process_rgb_everything_at(rgb, timestamp_ms)
+			self.runtime.process_rgb_everything_at_boxed(rgb, timestamp_ms)
 		} else {
-			self.runtime.process_rgb_at(rgb, timestamp_ms)
+			self.runtime.process_rgb_at_boxed(rgb, timestamp_ms)
 		}
 	}
 
-	pub fn poll_latest(&mut self) -> anyhow::Result<NativeMediaPipeOutput> {
-		self.runtime.poll_latest(self.config.include_gestures)
+	pub fn poll_latest(&mut self) -> anyhow::Result<Box<NativeMediaPipeOutput>> {
+		self.runtime.poll_latest_boxed(self.config.include_gestures)
 	}
 
 	pub fn live_stream_stats(&mut self) -> Option<NativeLiveStreamStats> {
@@ -116,7 +116,7 @@ mod tests {
 			height: 1,
 			stride_bytes: 4,
 			pixel_format: PixelFormat::Rgba8,
-			data: vec![0, 0, 0, 255],
+			data: vec![0, 0, 0, 255].into(),
 		};
 		let err = image_frame_rgb_ref(&frame).expect_err("rgba must be rejected");
 		assert!(err.to_string().contains("Rgb8"));
@@ -136,7 +136,7 @@ mod tests {
 			height: 2,
 			stride_bytes: 6,
 			pixel_format: PixelFormat::Rgb8,
-			data: vec![0; 11],
+			data: vec![0; 11].into(),
 		};
 		let err = image_frame_rgb_ref(&frame).expect_err("short buffer must be rejected");
 		assert!(err.to_string().contains("stride * height"));

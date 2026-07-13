@@ -7,6 +7,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context;
 use std::sync::atomic::Ordering;
@@ -109,7 +110,7 @@ fn open_vmc_receive_source(config: &CoreMotionFrameStreamConfig) -> anyhow::Resu
 	let source_id = format!("vmc-receive:{}", config.profile_stream_id);
 	let source = un_motion_runtime::VmcUnmotionSource::bind(source_id, listen_addr)
 		.with_context(|| format!("VMC receive engine bind failed at {listen_addr}"))?;
-	Ok(CoreMotionFrameSource::VmcReceive(source))
+	Ok(CoreMotionFrameSource::VmcReceive(Box::new(source)))
 }
 
 /// iFacialMocap 受信エンジン (UDP listen) の組み立て。
@@ -135,18 +136,18 @@ fn open_ifacialmocap_receive_source(config: &CoreMotionFrameStreamConfig) -> any
 	let source_id = format!("ifacialmocap-receive:{}", config.profile_stream_id);
 	let source = un_motion_runtime::IfacialMocapUnmotionSource::bind(source_id, listen_addr)
 		.with_context(|| format!("iFacialMocap receive engine bind failed at {listen_addr}"))?;
-	Ok(CoreMotionFrameSource::IfacialMocapReceive(source))
+	Ok(CoreMotionFrameSource::IfacialMocapReceive(Box::new(source)))
 }
 
 pub(crate) enum CoreMotionFrameSource {
-	FileImage(CoreImageMotionFrameSource<FileImageInputSource>),
-	FileVideo(CoreImageMotionFrameSource<FileVideoInputSource>),
-	DirectShow(CoreImageMotionFrameSource<DirectShowWebcamImageInputSource<DirectShowWebcamBackend>>),
+	FileImage(Box<CoreImageMotionFrameSource<FileImageInputSource>>),
+	FileVideo(Box<CoreImageMotionFrameSource<FileVideoInputSource>>),
+	DirectShow(Box<CoreImageMotionFrameSource<DirectShowWebcamImageInputSource<DirectShowWebcamBackend>>>),
 	/// VMC/UDP 受信エンジン (`UNMotionFrame` を直接生成し Modifier →
 	/// [UNMF/Z, VMC/UDP] に流すコンバータ用)。
-	VmcReceive(un_motion_runtime::VmcUnmotionSource),
+	VmcReceive(Box<un_motion_runtime::VmcUnmotionSource>),
 	/// iFacialMocap UDP 受信エンジン (face / eye / blendshape を `UNMotionFrame` に直接変換)。
-	IfacialMocapReceive(un_motion_runtime::IfacialMocapUnmotionSource),
+	IfacialMocapReceive(Box<un_motion_runtime::IfacialMocapUnmotionSource>),
 }
 
 impl MotionFrameSource for CoreMotionFrameSource {
@@ -166,11 +167,11 @@ impl MotionFrameSource for CoreMotionFrameSource {
 		// FPS 表示に使う。VMC / iFacialMocap の受信エンジンに加えて、MediaPipe Native
 		// 系 (FileImage / FileVideo / DirectShow) もハンドルを露出する。
 		match self {
-			Self::FileImage(source) => MotionFrameSource::telemetry_handle(source),
-			Self::FileVideo(source) => MotionFrameSource::telemetry_handle(source),
-			Self::DirectShow(source) => MotionFrameSource::telemetry_handle(source),
-			Self::VmcReceive(source) => MotionFrameSource::telemetry_handle(source),
-			Self::IfacialMocapReceive(source) => MotionFrameSource::telemetry_handle(source),
+			Self::FileImage(source) => MotionFrameSource::telemetry_handle(source.as_ref()),
+			Self::FileVideo(source) => MotionFrameSource::telemetry_handle(source.as_ref()),
+			Self::DirectShow(source) => MotionFrameSource::telemetry_handle(source.as_ref()),
+			Self::VmcReceive(source) => MotionFrameSource::telemetry_handle(source.as_ref()),
+			Self::IfacialMocapReceive(source) => MotionFrameSource::telemetry_handle(source.as_ref()),
 		}
 	}
 }
@@ -248,13 +249,9 @@ where
 		let debug_input_image_path = self.write_debug_input_image_if_active(&image);
 		let submitted = SubmittedImageFrame::from_image(&image, debug_input_image_path);
 		if self.live_stream_mode {
-			self.pending_live_stream_inputs.push_back(submitted.clone());
-			while self.pending_live_stream_inputs.len() > LIVE_STREAM_PENDING_INPUT_CAPACITY {
-				self.pending_live_stream_inputs.pop_front();
-			}
 			let native = self.engine.process_rgb_frame(&image)?;
 			self.update_native_live_stream_stats();
-			if native.return_code != 0 && native.return_code != 30 {
+			if !record_live_submission_if_accepted(&mut self.pending_live_stream_inputs, submitted, native.return_code) {
 				self.telemetry.atomics.decode_errors.fetch_add(1, Ordering::Relaxed);
 			}
 			return Ok(None);
@@ -266,6 +263,21 @@ where
 	fn telemetry_handle(&self) -> Option<SourceTelemetryHandle> {
 		Some(self.telemetry.clone())
 	}
+}
+
+fn record_live_submission_if_accepted(
+	pending: &mut VecDeque<SubmittedImageFrame>,
+	submitted: SubmittedImageFrame,
+	return_code: i32,
+) -> bool {
+	if return_code != 0 {
+		return false;
+	}
+	pending.push_back(submitted);
+	while pending.len() > LIVE_STREAM_PENDING_INPUT_CAPACITY {
+		pending.pop_front();
+	}
+	true
 }
 
 impl<I> CoreImageMotionFrameSource<I>
@@ -286,40 +298,19 @@ where
 	}
 
 	fn take_submitted_image_for_native(&mut self, native: &NativeMediaPipeOutput) -> Option<SubmittedImageFrame> {
-		let Some(result_timestamp_ms) = native.result_timestamp_ms else {
-			return self.pending_live_stream_inputs.pop_front();
-		};
-		let mut selected = None;
-		while let Some(candidate) = self.pending_live_stream_inputs.pop_front() {
-			let is_match = candidate.timestamp_ms >= result_timestamp_ms;
-			selected = Some(candidate);
-			if is_match {
-				break;
-			}
-		}
-		selected
+		take_submitted_image_for_timestamp(&mut self.pending_live_stream_inputs, native.result_timestamp_ms)
 	}
 
 	fn process_native_output_for_submitted(&mut self, submitted: SubmittedImageFrame, native: &NativeMediaPipeOutput) -> UNMotionFrame {
 		self.post_processor.config.input_width = submitted.width;
 		self.post_processor.config.input_height = submitted.height;
-		let mut frame = if self.post_process_component == "none" {
+		let frame = if self.post_process_component == "none" {
 			self.post_processor
 				.native_raw_passthrough_frame(submitted.sequence, submitted.capture_timestamp_ns, native)
 		} else {
-			let mut frame =
-				self.post_processor
-					.process_native_output_with_sequence(submitted.sequence, submitted.capture_timestamp_ns, native);
-			frame.metadata.notes.push(format!("post_process={}", self.post_process_component));
-			frame
+			self.post_processor
+				.process_native_output_with_sequence(submitted.sequence, submitted.capture_timestamp_ns, native)
 		};
-		frame.metadata.notes.push(format!(
-			"core_unmotion input={} engine={} native_return_code={} image={}x{}",
-			self.input_component, self.runtime_engine, native.return_code, submitted.width, submitted.height
-		));
-		if let Some(source_label) = submitted.source_label.as_deref() {
-			frame.metadata.notes.push(format!("input_source={source_label}"));
-		}
 		self.telemetry.atomics.frames_emitted.fetch_add(1, Ordering::Relaxed);
 		self.push_debug_analysis_sample(&submitted, native, &frame);
 		frame
@@ -397,6 +388,29 @@ where
 	}
 }
 
+fn take_submitted_image_for_timestamp(
+	pending: &mut VecDeque<SubmittedImageFrame>,
+	result_timestamp_ms: Option<i64>,
+) -> Option<SubmittedImageFrame> {
+	let Some(result_timestamp_ms) = result_timestamp_ms else {
+		return pending.pop_front();
+	};
+	while pending
+		.front()
+		.is_some_and(|candidate| candidate.timestamp_ms < result_timestamp_ms)
+	{
+		pending.pop_front();
+	}
+	if pending
+		.front()
+		.is_some_and(|candidate| candidate.timestamp_ms == result_timestamp_ms)
+	{
+		pending.pop_front()
+	} else {
+		None
+	}
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct NativeLiveStreamFrameCounters {
 	submissions: u64,
@@ -412,33 +426,34 @@ fn native_live_stream_frame_counters(options: NativeMediaPipeOptions, stats: Nat
 			callbacks: stats.holistic_callback_count,
 		};
 	}
-	let mut submissions = Vec::new();
-	let mut submission_errors = Vec::new();
-	let mut callbacks = Vec::new();
+	let mut submissions = None;
+	let mut submission_errors = 0;
+	let mut callbacks = None;
+	let mut include = |submitted: u64, errors: u64, completed: u64| {
+		submissions = Some(submissions.map_or(submitted, |current: u64| current.min(submitted)));
+		submission_errors = submission_errors.max(errors);
+		callbacks = Some(callbacks.map_or(completed, |current: u64| current.min(completed)));
+	};
 	if options.enable_pose != 0 {
-		submissions.push(stats.pose_submit_count);
-		submission_errors.push(stats.pose_submit_error_count);
-		callbacks.push(stats.pose_callback_count);
+		include(stats.pose_submit_count, stats.pose_submit_error_count, stats.pose_callback_count);
 	}
 	if options.enable_hands != 0 {
-		submissions.push(stats.hands_submit_count);
-		submission_errors.push(stats.hands_submit_error_count);
-		callbacks.push(stats.hands_callback_count);
+		include(stats.hands_submit_count, stats.hands_submit_error_count, stats.hands_callback_count);
 	}
 	if options.enable_face != 0 {
-		submissions.push(stats.face_submit_count);
-		submission_errors.push(stats.face_submit_error_count);
-		callbacks.push(stats.face_callback_count);
+		include(stats.face_submit_count, stats.face_submit_error_count, stats.face_callback_count);
 	}
 	if options.enable_gestures != 0 {
-		submissions.push(stats.gestures_submit_count);
-		submission_errors.push(stats.gestures_submit_error_count);
-		callbacks.push(stats.gestures_callback_count);
+		include(
+			stats.gestures_submit_count,
+			stats.gestures_submit_error_count,
+			stats.gestures_callback_count,
+		);
 	}
 	NativeLiveStreamFrameCounters {
-		submissions: submissions.into_iter().min().unwrap_or(0),
-		submission_errors: submission_errors.into_iter().max().unwrap_or(0),
-		callbacks: callbacks.into_iter().min().unwrap_or(0),
+		submissions: submissions.unwrap_or(0),
+		submission_errors,
+		callbacks: callbacks.unwrap_or(0),
 	}
 }
 
@@ -470,7 +485,7 @@ struct TemporalIirFrame {
 	height: u32,
 	stride_bytes: u32,
 	capture_timestamp_ns: u64,
-	data: Vec<u8>,
+	data: Arc<[u8]>,
 }
 
 fn denoise_rgb8_image(
@@ -505,13 +520,13 @@ fn apply_temporal_iir_denoise(input: &ImageFrame, state: &mut InputDenoiseState,
 			&& input.metadata.capture_timestamp_ns > previous.capture_timestamp_ns
 	});
 	if compatible_previous.is_none() {
-		let data = source.clone();
+		let data = Arc::<[u8]>::from(source.to_vec());
 		state.previous_temporal = Some(TemporalIirFrame {
 			width: input.width,
 			height: input.height,
 			stride_bytes: input.stride_bytes,
 			capture_timestamp_ns: input.metadata.capture_timestamp_ns,
-			data: data.clone(),
+			data: Arc::clone(&data),
 		});
 		return image_frame_with_data(input, data);
 	};
@@ -522,16 +537,17 @@ fn apply_temporal_iir_denoise(input: &ImageFrame, state: &mut InputDenoiseState,
 	let rc = 1.0 / (2.0 * std::f64::consts::PI * cutoff_hz.max(0.1));
 	let alpha = ((dt_seconds / (rc + dt_seconds)).clamp(0.0, 1.0) * 256.0).round() as i32;
 	let inverse_alpha = 256 - alpha;
+	let filtered_data = Arc::make_mut(&mut previous.data);
 	for (index, current) in source.iter().copied().enumerate() {
-		let filtered = (previous.data[index] as i32 * inverse_alpha + current as i32 * alpha + 128) >> 8;
-		previous.data[index] = filtered.clamp(0, 255) as u8;
+		let filtered = (filtered_data[index] as i32 * inverse_alpha + current as i32 * alpha + 128) >> 8;
+		filtered_data[index] = filtered.clamp(0, 255) as u8;
 	}
 	previous.capture_timestamp_ns = input.metadata.capture_timestamp_ns;
-	let data = previous.data.clone();
+	let data = Arc::clone(&previous.data);
 	image_frame_with_data(input, data)
 }
 
-fn image_frame_with_data(input: &ImageFrame, data: Vec<u8>) -> ImageFrame {
+fn image_frame_with_data(input: &ImageFrame, data: Arc<[u8]>) -> ImageFrame {
 	ImageFrame {
 		metadata: input.metadata.clone(),
 		width: input.width,
@@ -549,12 +565,12 @@ fn open_file_image_source(config: &CoreMotionFrameStreamConfig) -> anyhow::Resul
 		.context("file-image Motion frame stream requires inputPath")?;
 	let input = FileImageInputSource::open(file_image_input_config(config, PathBuf::from(path))?)
 		.with_context(|| format!("failed to open file-image input {path}"))?;
-	Ok(Some(CoreMotionFrameSource::FileImage(open_image_source(
+	Ok(Some(CoreMotionFrameSource::FileImage(Box::new(open_image_source(
 		config,
 		input,
 		format!("file-image:{}", config.profile_stream_id),
 		"MediaPipe Native File Image",
-	)?)))
+	)?))))
 }
 
 fn open_file_video_source(config: &CoreMotionFrameStreamConfig) -> anyhow::Result<Option<CoreMotionFrameSource>> {
@@ -564,12 +580,12 @@ fn open_file_video_source(config: &CoreMotionFrameStreamConfig) -> anyhow::Resul
 		.context("file-video Motion frame stream requires inputPath")?;
 	let input = FileVideoInputSource::open(file_video_input_config(config, PathBuf::from(path))?)
 		.with_context(|| format!("failed to open file-video input {path}"))?;
-	Ok(Some(CoreMotionFrameSource::FileVideo(open_image_source(
+	Ok(Some(CoreMotionFrameSource::FileVideo(Box::new(open_image_source(
 		config,
 		input,
 		format!("file-video:{}", config.profile_stream_id),
 		"MediaPipe Native File Video",
-	)?)))
+	)?))))
 }
 
 fn open_directshow_source(config: &CoreMotionFrameStreamConfig) -> anyhow::Result<Option<CoreMotionFrameSource>> {
@@ -587,12 +603,12 @@ fn open_directshow_source(config: &CoreMotionFrameStreamConfig) -> anyhow::Resul
 	let capture_config = DirectShowCaptureConfig::new(width, height, config.input_fps).with_pixel_format(config.input_pixel_format.clone());
 	let backend = DirectShowWebcamBackend::with_capture_config(capture_config);
 	let input = DirectShowWebcamImageInputSource::new(backend, config.device_id.clone());
-	Ok(Some(CoreMotionFrameSource::DirectShow(open_image_source(
+	Ok(Some(CoreMotionFrameSource::DirectShow(Box::new(open_image_source(
 		config,
 		input,
 		format!("webcam-directshow:{}", config.profile_stream_id),
 		"MediaPipe Native DirectShow",
-	)?)))
+	)?))))
 }
 
 fn open_image_source<I>(
@@ -934,7 +950,7 @@ fn write_debug_rgb_png(image: &ImageFrame, path: &Path) -> anyhow::Result<()> {
 	let stride = image.stride_bytes as usize;
 	let height = image.height as usize;
 	let bytes = if stride == row_bytes {
-		image.data.as_slice()
+		image.data.as_ref()
 	} else {
 		let mut packed = Vec::with_capacity(row_bytes.saturating_mul(height));
 		for y in 0..height {
@@ -1066,5 +1082,101 @@ mod tests {
 		assert_eq!(first_out.data[12], 0);
 		assert!(second_out.data[12] > 0);
 		assert!(second_out.data[12] < 100);
+	}
+
+	#[test]
+	fn temporal_iir_reuses_unshared_history_buffer() {
+		let first = ImageFrame::new_rgb8(1, 1, "test", 3, 3, vec![0; 27]).expect("frame");
+		let mut second = ImageFrame::new_rgb8(2, 33_333_333, "test", 3, 3, vec![100; 27]).expect("frame");
+		second.metadata.capture_timestamp_ns = 33_333_333;
+		let mut state = InputDenoiseState::default();
+		let first_out = denoise_rgb8_image(&first, InputDenoiseMode::TemporalIir, 10.0, &mut state).expect("first denoise");
+		let history_ptr = first_out.data.as_ptr();
+		assert!(Arc::ptr_eq(
+			&first_out.data,
+			&state.previous_temporal.as_ref().expect("history").data
+		));
+		drop(first_out);
+
+		let second_out = denoise_rgb8_image(&second, InputDenoiseMode::TemporalIir, 10.0, &mut state).expect("second denoise");
+
+		assert_eq!(second_out.data.as_ptr(), history_ptr);
+	}
+
+	#[test]
+	fn live_submission_tracking_keeps_only_successful_bounded_inputs() {
+		let mut pending = VecDeque::new();
+		for sequence in 0..=LIVE_STREAM_PENDING_INPUT_CAPACITY as u64 {
+			assert!(record_live_submission_if_accepted(
+				&mut pending,
+				SubmittedImageFrame {
+					timestamp_ms: sequence as i64,
+					sequence,
+					capture_timestamp_ns: sequence * 1_000_000,
+					width: 1,
+					height: 1,
+					source_label: None,
+					debug_input_image_path: None,
+				},
+				0,
+			));
+		}
+		let rejected = pending.back().cloned().expect("tracked frame");
+		assert!(!record_live_submission_if_accepted(&mut pending, rejected, 52));
+
+		assert_eq!(pending.len(), LIVE_STREAM_PENDING_INPUT_CAPACITY);
+		assert_eq!(pending.front().map(|frame| frame.sequence), Some(1));
+		assert_eq!(
+			pending.back().map(|frame| frame.sequence),
+			Some(LIVE_STREAM_PENDING_INPUT_CAPACITY as u64)
+		);
+	}
+
+	#[test]
+	fn live_result_requires_exact_input_timestamp() {
+		let submitted = |timestamp_ms| SubmittedImageFrame {
+			timestamp_ms,
+			sequence: timestamp_ms as u64,
+			capture_timestamp_ns: timestamp_ms as u64 * 1_000_000,
+			width: 1,
+			height: 1,
+			source_label: None,
+			debug_input_image_path: None,
+		};
+		let mut pending = VecDeque::from([submitted(10), submitted(12)]);
+
+		assert!(take_submitted_image_for_timestamp(&mut pending, Some(11)).is_none());
+		assert_eq!(pending.front().map(|frame| frame.timestamp_ms), Some(12));
+		assert_eq!(
+			take_submitted_image_for_timestamp(&mut pending, Some(12)).map(|frame| frame.sequence),
+			Some(12)
+		);
+	}
+
+	#[test]
+	fn native_live_stream_counters_aggregate_enabled_tasks_without_allocating_lists() {
+		let options = NativeMediaPipeOptions {
+			enable_holistic: 0,
+			enable_pose: 1,
+			enable_hands: 1,
+			enable_face: 0,
+			enable_gestures: 0,
+			..Default::default()
+		};
+		let stats = NativeLiveStreamStats {
+			pose_submit_count: 12,
+			pose_submit_error_count: 1,
+			pose_callback_count: 10,
+			hands_submit_count: 11,
+			hands_submit_error_count: 3,
+			hands_callback_count: 9,
+			..Default::default()
+		};
+
+		let counters = native_live_stream_frame_counters(options, stats);
+
+		assert_eq!(counters.submissions, 11);
+		assert_eq!(counters.submission_errors, 3);
+		assert_eq!(counters.callbacks, 9);
 	}
 }

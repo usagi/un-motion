@@ -23,9 +23,9 @@ pub use modifier::{
 };
 pub use output::{
 	FileOutputCommand, FileOutputConfig, FileOutputEvent, FileOutputFormat, FileOutputStats, FileOutputWorker, FileOutputWorkerHandle,
-	VmcOutputCommand, VmcOutputConfig, VmcOutputEvent, VmcOutputFrame, VmcOutputStats, VmcOutputWorker, VmcOutputWorkerHandle,
-	VrcOscOutputCommand, VrcOscOutputConfig, VrcOscOutputEvent, VrcOscOutputFrame, VrcOscOutputStats, VrcOscOutputWorker,
-	VrcOscOutputWorkerHandle, spawn_file_output_worker, spawn_vmc_output_worker, spawn_vrc_osc_output_worker,
+	OutputDisconnected, VmcOutputCommand, VmcOutputConfig, VmcOutputEvent, VmcOutputFrame, VmcOutputStats, VmcOutputWorker,
+	VmcOutputWorkerHandle, VrcOscOutputCommand, VrcOscOutputConfig, VrcOscOutputEvent, VrcOscOutputFrame, VrcOscOutputStats,
+	VrcOscOutputWorker, VrcOscOutputWorkerHandle, spawn_file_output_worker, spawn_vmc_output_worker, spawn_vrc_osc_output_worker,
 };
 pub use unmotion::{
 	LatestMotionFrame, LatestMotionFrameSlot, LatestMotionFrameStreamWorkerHandle, MotionFrameSource, MotionFrameStreamConfig,

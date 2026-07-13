@@ -173,10 +173,10 @@ fn resolve_camera_index(device_id_or_name: &str) -> anyhow::Result<CameraIndex> 
 	if let Some(rest) = trimmed.strip_prefix("cam:") {
 		return Ok(CameraIndex::String(rest.to_string()));
 	}
-	if let Some(rest) = trimmed.strip_prefix("cam") {
-		if let Ok(index) = rest.parse::<u32>() {
-			return Ok(CameraIndex::Index(index));
-		}
+	if let Some(rest) = trimmed.strip_prefix("cam")
+		&& let Ok(index) = rest.parse::<u32>()
+	{
+		return Ok(CameraIndex::Index(index));
 	}
 	// name based fuzzy match (case-insensitive substring match).
 	let lower = trimmed.to_ascii_lowercase();

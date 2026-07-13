@@ -2,12 +2,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::{SocketAddr, UdpSocket};
 
 use anyhow::Context;
-use rosc::{OscBundle, OscMessage, OscPacket, OscTime, OscType, encoder};
+use rosc::{OscMessage, OscPacket, OscType, encoder};
 use serde::{Deserialize, Serialize};
 use un_motion_frame::{MotionSignalValue, SampleState, UNMotionFrame};
 
 const AVATAR_PARAMETER_PREFIX: &str = "/avatar/parameters/";
 const MAX_OSC_DATAGRAM_BYTES: usize = 4096;
+const MAX_VRC_PARAMETER_NAME_BYTES: usize = 256;
+const MAX_VRC_PARAMETER_STATES: usize = 1_024;
+pub const MAX_VRC_AVATAR_PARAMETER_STATES: usize = 1_024;
 const BINARY_PARAMETER_DEADZONE: f32 = 0.15;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,45 +44,105 @@ impl VrcOscAvatarParameters {
 		Self::default()
 	}
 
-	pub fn insert_float(&mut self, parameter: impl Into<String>) {
-		self.float_parameters.insert(normalize_avatar_parameter_key(parameter.into()));
+	pub fn insert_float(&mut self, parameter: impl Into<String>) -> bool {
+		self.insert(parameter.into(), true)
 	}
 
-	pub fn insert_bool(&mut self, parameter: impl Into<String>) {
-		self.bool_parameters.insert(normalize_avatar_parameter_key(parameter.into()));
+	pub fn insert_bool(&mut self, parameter: impl Into<String>) -> bool {
+		self.insert(parameter.into(), false)
+	}
+
+	pub fn len(&self) -> usize {
+		self.float_parameters.len() + self.bool_parameters.len()
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.float_parameters.is_empty() && self.bool_parameters.is_empty()
+	}
+
+	fn insert(&mut self, parameter: String, is_float: bool) -> bool {
+		let parameter = normalize_avatar_parameter_key_owned(parameter);
+		if !valid_vrc_parameter_name(&parameter) {
+			return false;
+		}
+		let already_present = if is_float {
+			self.float_parameters.contains(&parameter)
+		} else {
+			self.bool_parameters.contains(&parameter)
+		};
+		if already_present {
+			return false;
+		}
+		if self.float_parameters.len() + self.bool_parameters.len() >= MAX_VRC_AVATAR_PARAMETER_STATES {
+			return false;
+		}
+		if is_float {
+			self.float_parameters.insert(parameter)
+		} else {
+			self.bool_parameters.insert(parameter)
+		}
 	}
 
 	pub fn supports_float(&self, parameter: &str) -> bool {
-		self.float_parameters.contains(&normalize_avatar_parameter_key(parameter))
+		self.float_parameters.contains(normalized_avatar_parameter_key(parameter))
 	}
 
 	pub fn supports_bool(&self, parameter: &str) -> bool {
-		self.bool_parameters.contains(&normalize_avatar_parameter_key(parameter))
+		self.bool_parameters.contains(normalized_avatar_parameter_key(parameter))
 	}
 
 	fn binary_spec(&self, parameter: &str) -> Option<BinaryParameterSpec> {
-		let parameter = normalize_avatar_parameter_key(parameter);
+		let parameter = normalized_avatar_parameter_key(parameter);
 		let bits = [1_u8, 2, 4, 8]
 			.into_iter()
-			.filter(|bit| self.bool_parameters.contains(&format!("{parameter}{bit}")))
+			.filter(|bit| {
+				contains_parameter_suffix(
+					&self.bool_parameters,
+					parameter,
+					match bit {
+						1 => "1",
+						2 => "2",
+						4 => "4",
+						8 => "8",
+						_ => unreachable!(),
+					},
+				)
+			})
 			.count() as u8;
 		if bits == 0 {
 			return None;
 		}
 		Some(BinaryParameterSpec {
 			bits,
-			negative: self.bool_parameters.contains(&format!("{parameter}Negative")),
+			negative: contains_parameter_suffix(&self.bool_parameters, parameter, "Negative"),
 		})
 	}
 }
 
-fn normalize_avatar_parameter_key(parameter: impl AsRef<str>) -> String {
-	parameter
-		.as_ref()
-		.trim()
-		.trim_start_matches(AVATAR_PARAMETER_PREFIX)
-		.trim_start_matches('/')
-		.to_string()
+fn contains_parameter_suffix(parameters: &BTreeSet<String>, parameter: &str, suffix: &str) -> bool {
+	let mut key = [0_u8; MAX_VRC_PARAMETER_NAME_BYTES + 8];
+	let Some(total_len) = parameter.len().checked_add(suffix.len()).filter(|length| *length <= key.len()) else {
+		return false;
+	};
+	key[..parameter.len()].copy_from_slice(parameter.as_bytes());
+	key[parameter.len()..total_len].copy_from_slice(suffix.as_bytes());
+	let Ok(key) = std::str::from_utf8(&key[..total_len]) else {
+		return false;
+	};
+	parameters.contains(key)
+}
+
+fn normalized_avatar_parameter_key(parameter: &str) -> &str {
+	parameter.trim().trim_start_matches(AVATAR_PARAMETER_PREFIX).trim_start_matches('/')
+}
+
+fn normalize_avatar_parameter_key_owned(parameter: String) -> String {
+	let normalized = normalized_avatar_parameter_key(&parameter);
+	if normalized.len() == parameter.len() {
+		parameter
+	} else {
+		normalized.to_string()
+	}
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -126,11 +189,12 @@ impl VrcOscOutputSink {
 	}
 
 	pub fn send(&mut self, frame: &UNMotionFrame) -> anyhow::Result<(u64, u64)> {
-		let packets = self.changed_packets_for_frame(frame);
-		if packets.is_empty() {
+		let changed = self.changed_parameters_for_frame(frame);
+		if changed.is_empty() {
 			return Ok((0, 0));
 		}
-		let packet_count = packets.len() as u64;
+		let packet_count = changed.len() as u64;
+		let packets = changed.iter().cloned().map(vrc_osc_packet_for_parameter).collect();
 		let datagrams = encode_packet_chunks(packets)?;
 		let datagram_count = datagrams.len() as u64;
 		for encoded in datagrams {
@@ -138,22 +202,37 @@ impl VrcOscOutputSink {
 				.send_to(&encoded, self.target)
 				.with_context(|| format!("VRC OSC UDP send failed: {}", self.target))?;
 		}
+		self.commit_parameters(changed);
 		Ok((datagram_count, packet_count))
 	}
 
-	fn changed_packets_for_frame(&mut self, frame: &UNMotionFrame) -> Vec<OscPacket> {
+	fn changed_parameters_for_frame(&self, frame: &UNMotionFrame) -> Vec<VrcOscParameter> {
 		let parameters = vrc_osc_parameters_for_frame(frame, &self.options);
-		let mut packets = Vec::new();
-		for parameter in parameters {
-			let old = self.last_values.get(&parameter.name).copied();
-			if old.is_some_and(|old| parameter_value_unchanged(old, parameter.value)) {
-				continue;
-			}
-			self.last_values.insert(parameter.name.clone(), parameter.value);
-			packets.push(vrc_osc_packet_for_parameter(parameter));
-		}
-		packets
+		parameters
+			.into_iter()
+			.filter(|parameter| valid_vrc_parameter_name(&parameter.name))
+			.filter(|parameter| {
+				!self
+					.last_values
+					.get(&parameter.name)
+					.is_some_and(|old| parameter_value_unchanged(*old, parameter.value))
+			})
+			.take(MAX_VRC_PARAMETER_STATES)
+			.collect()
 	}
+
+	fn commit_parameters(&mut self, parameters: Vec<VrcOscParameter>) {
+		for parameter in parameters {
+			if !self.last_values.contains_key(&parameter.name) && self.last_values.len() >= MAX_VRC_PARAMETER_STATES {
+				self.last_values.pop_first();
+			}
+			self.last_values.insert(parameter.name, parameter.value);
+		}
+	}
+}
+
+fn valid_vrc_parameter_name(name: &str) -> bool {
+	!name.is_empty() && name.len() <= MAX_VRC_PARAMETER_NAME_BYTES
 }
 
 fn parameter_value_unchanged(old: VrcOscParameterValue, new: VrcOscParameterValue) -> bool {
@@ -166,29 +245,38 @@ fn parameter_value_unchanged(old: VrcOscParameterValue, new: VrcOscParameterValu
 
 fn encode_packet_chunks(packets: Vec<OscPacket>) -> anyhow::Result<Vec<Vec<u8>>> {
 	let mut datagrams = Vec::new();
-	let mut chunk = Vec::<OscPacket>::new();
+	let mut chunk = Vec::new();
+	let mut chunk_len = 16usize;
 	for packet in packets {
-		let mut candidate = chunk.clone();
-		candidate.push(packet.clone());
-		let encoded = encode_bundle(candidate).context("VRC OSC encode failed")?;
-		if encoded.len() <= MAX_OSC_DATAGRAM_BYTES || chunk.is_empty() {
-			chunk.push(packet);
-			continue;
+		let encoded = encoder::encode(&packet).context("VRC OSC packet encode failed")?;
+		let bundled_len = 4usize.saturating_add(encoded.len());
+		if 16usize.saturating_add(bundled_len) > MAX_OSC_DATAGRAM_BYTES {
+			anyhow::bail!("VRC OSC packet exceeds {MAX_OSC_DATAGRAM_BYTES} byte datagram limit");
 		}
-		datagrams.push(encode_bundle(std::mem::take(&mut chunk)).context("VRC OSC encode failed")?);
-		chunk.push(packet);
+		if chunk_len.saturating_add(bundled_len) > MAX_OSC_DATAGRAM_BYTES {
+			datagrams.push(encode_bundle_elements(&chunk, chunk_len));
+			chunk.clear();
+			chunk_len = 16;
+		}
+		chunk_len += bundled_len;
+		chunk.push(encoded);
 	}
 	if !chunk.is_empty() {
-		datagrams.push(encode_bundle(chunk).context("VRC OSC encode failed")?);
+		datagrams.push(encode_bundle_elements(&chunk, chunk_len));
 	}
 	Ok(datagrams)
 }
 
-fn encode_bundle(content: Vec<OscPacket>) -> Result<Vec<u8>, rosc::OscError> {
-	encoder::encode(&OscPacket::Bundle(OscBundle {
-		timetag: OscTime { seconds: 0, fractional: 1 },
-		content,
-	}))
+fn encode_bundle_elements(elements: &[Vec<u8>], encoded_len: usize) -> Vec<u8> {
+	let mut bundle = Vec::with_capacity(encoded_len);
+	bundle.extend_from_slice(b"#bundle\0");
+	bundle.extend_from_slice(&0u32.to_be_bytes());
+	bundle.extend_from_slice(&1u32.to_be_bytes());
+	for element in elements {
+		bundle.extend_from_slice(&(element.len() as u32).to_be_bytes());
+		bundle.extend_from_slice(element);
+	}
+	bundle
 }
 
 pub fn vrc_osc_packets_for_frame(frame: &UNMotionFrame, options: &VrcOscOutputOptions) -> Vec<OscPacket> {
@@ -212,13 +300,13 @@ fn vrc_osc_packet_for_parameter(parameter: VrcOscParameter) -> OscPacket {
 pub fn vrc_osc_parameters_for_frame(frame: &UNMotionFrame, options: &VrcOscOutputOptions) -> Vec<VrcOscParameter> {
 	let mut parameters = BTreeMap::<String, f32>::new();
 	let mut face_is_live = false;
-	if let Some(face) = &frame.face {
-		if face.tracking_state != un_motion_frame::TrackingState::Lost {
-			face_is_live = true;
-			for expression in &face.expressions {
-				if sample_state_is_usable(expression.state) {
-					merge_expression_parameters(&mut parameters, &expression.name, expression.value, options);
-				}
+	if let Some(face) = &frame.face
+		&& face.tracking_state != un_motion_frame::TrackingState::Lost
+	{
+		face_is_live = true;
+		for expression in &face.expressions {
+			if sample_state_is_usable(expression.state) {
+				merge_expression_parameters(&mut parameters, &expression.name, expression.value, options);
 			}
 		}
 	}
@@ -242,13 +330,13 @@ pub fn vrc_osc_parameters_for_frame(frame: &UNMotionFrame, options: &VrcOscOutpu
 	let has_parameters = !parameters.is_empty();
 	let mut output = Vec::new();
 	for (name, value) in &parameters {
-		if options.avatar_parameters.as_ref().is_none_or(|avatar| avatar.supports_float(&name)) {
+		if options.avatar_parameters.as_ref().is_none_or(|avatar| avatar.supports_float(name)) {
 			output.push(VrcOscParameter {
 				name: name.clone(),
 				value: VrcOscParameterValue::Float(*value),
 			});
 		}
-		if options.avatar_parameters.as_ref().is_some_and(|avatar| avatar.supports_bool(&name)) {
+		if options.avatar_parameters.as_ref().is_some_and(|avatar| avatar.supports_bool(name)) {
 			output.push(VrcOscParameter {
 				name: name.clone(),
 				value: VrcOscParameterValue::Bool(base_bool_value_for_parameter(name, *value)),
@@ -256,7 +344,7 @@ pub fn vrc_osc_parameters_for_frame(frame: &UNMotionFrame, options: &VrcOscOutpu
 		}
 		if options.emit_binary_parameters {
 			output.extend(binary_parameters_for(
-				&binary_parameter_name_for(&name),
+				&binary_parameter_name_for(name),
 				*value,
 				options.avatar_parameters.as_ref(),
 			));
@@ -331,7 +419,7 @@ fn append_binary_value_if_avatar_supports(
 	parameter: &str,
 	value: f32,
 ) {
-	let Some(spec) = avatar_parameters.binary_spec(&parameter) else {
+	let Some(spec) = avatar_parameters.binary_spec(parameter) else {
 		return;
 	};
 	let magnitude = value.abs().clamp(0.0, 1.0);
@@ -691,7 +779,7 @@ fn parameter_supports_negative(parameter: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-	use rosc::OscPacket;
+	use rosc::{OscBundle, OscPacket, OscTime};
 	use un_motion_frame::{ExpressionSample, FaceMotion, MotionSignal, SampleState, TrackingState, UNMotionFrame};
 
 	use super::*;
@@ -734,6 +822,75 @@ mod tests {
 			panic!("arg should be bool");
 		};
 		(&message.addr, value)
+	}
+
+	#[test]
+	fn changed_parameter_cache_commits_only_after_success() {
+		let mut sink = VrcOscOutputSink::new("127.0.0.1:9000".parse().expect("target")).expect("sink");
+		let mut frame = UNMotionFrame::new(1);
+		frame.signals.push(scalar("face.jawOpen", 0.4));
+
+		let changed = sink.changed_parameters_for_frame(&frame);
+
+		assert!(!changed.is_empty());
+		assert!(sink.last_values.is_empty());
+		sink.commit_parameters(changed);
+		assert!(sink.changed_parameters_for_frame(&frame).is_empty());
+	}
+
+	#[test]
+	fn avatar_parameter_capabilities_enforce_name_and_count_limits() {
+		let mut parameters = VrcOscAvatarParameters::new();
+		assert!(!parameters.insert_float("x".repeat(MAX_VRC_PARAMETER_NAME_BYTES + 1)));
+		for index in 0..MAX_VRC_AVATAR_PARAMETER_STATES {
+			assert!(parameters.insert_float(format!("parameter-{index}")));
+		}
+		assert!(!parameters.insert_bool("overflow"));
+		assert_eq!(parameters.len(), MAX_VRC_AVATAR_PARAMETER_STATES);
+	}
+
+	#[test]
+	fn oversized_vrc_parameter_names_are_ignored() {
+		let sink = VrcOscOutputSink::new("127.0.0.1:9000".parse().expect("target")).expect("sink");
+		let mut frame = UNMotionFrame::new(1);
+		frame.signals.push(scalar(&"x".repeat(MAX_VRC_PARAMETER_NAME_BYTES + 1), 0.4));
+
+		assert!(sink.changed_parameters_for_frame(&frame).is_empty());
+	}
+
+	#[test]
+	fn parameter_cache_evicts_old_entries_at_capacity() {
+		let mut sink = VrcOscOutputSink::new("127.0.0.1:9000".parse().expect("target")).expect("sink");
+		let parameters = (0..MAX_VRC_PARAMETER_STATES + 10)
+			.map(|index| VrcOscParameter {
+				name: format!("parameter-{index}"),
+				value: VrcOscParameterValue::Float(index as f32),
+			})
+			.collect();
+
+		sink.commit_parameters(parameters);
+
+		assert_eq!(sink.last_values.len(), MAX_VRC_PARAMETER_STATES);
+		assert!(!sink.last_values.contains_key("parameter-0"));
+		assert!(
+			sink.last_values
+				.contains_key(&format!("parameter-{}", MAX_VRC_PARAMETER_STATES + 9))
+		);
+	}
+
+	#[test]
+	fn optimized_vrc_bundle_encoding_matches_rosc() {
+		let packets = vec![vrc_osc_packet_for_parameter(VrcOscParameter {
+			name: "FT/v2/JawOpen".to_string(),
+			value: VrcOscParameterValue::Float(0.5),
+		})];
+		let expected = encoder::encode(&OscPacket::Bundle(OscBundle {
+			timetag: OscTime { seconds: 0, fractional: 1 },
+			content: packets.clone(),
+		}))
+		.expect("reference bundle");
+
+		assert_eq!(encode_packet_chunks(packets).expect("optimized bundle"), vec![expected]);
 	}
 
 	fn try_packet_value(packet: &OscPacket) -> Option<(&str, f32)> {
@@ -1158,6 +1315,18 @@ mod tests {
 
 		assert!(datagrams.len() > 1);
 		assert!(datagrams.iter().all(|datagram| datagram.len() <= MAX_OSC_DATAGRAM_BYTES));
+	}
+
+	#[test]
+	fn rejects_single_vrc_packet_over_datagram_limit() {
+		let packet = OscPacket::Message(OscMessage {
+			addr: format!("{AVATAR_PARAMETER_PREFIX}{}", "x".repeat(MAX_OSC_DATAGRAM_BYTES)),
+			args: vec![OscType::Float(0.5)],
+		});
+
+		let error = encode_packet_chunks(vec![packet]).expect_err("oversized packet must fail");
+
+		assert!(error.to_string().contains("packet exceeds"));
 	}
 
 	#[test]

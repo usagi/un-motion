@@ -15,7 +15,7 @@
 //! * Svelte UI 骨組み (D4-c) も次の commit で UN Avatar から移植。
 
 use std::backtrace::Backtrace;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::io::{BufRead, BufReader};
@@ -81,6 +81,11 @@ fn command_without_console(command: &mut Command) -> &mut Command {
 /// 1 行平均 200 byte でも total 160KB/Capturer 程度なのでメモリ影響は軽微。
 const MAX_CAPTURER_LOG_LINES: usize = 800;
 const MAX_STOPPED_CAPTURER_HISTORY: usize = 20;
+static PROFILE_STORE_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_profile_store() -> Result<std::sync::MutexGuard<'static, ()>, String> {
+	PROFILE_STORE_LOCK.lock().map_err(|_| "profile store lock poisoned".to_string())
+}
 
 /// Capturer 起動後に `/healthz` が ok を返すまで待つ最大時間。
 const HEALTHZ_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
@@ -97,6 +102,7 @@ const HTTP_RUNTIME_ACTION_TIMEOUT: Duration = Duration::from_secs(15);
 struct SupervisorState {
 	next_id: u32,
 	capturers: BTreeMap<u32, ManagedCapturer>,
+	launching_profiles: BTreeSet<Option<String>>,
 	http_client: reqwest::blocking::Client,
 }
 
@@ -109,7 +115,21 @@ impl SupervisorState {
 		Self {
 			next_id: 0,
 			capturers: BTreeMap::new(),
+			launching_profiles: BTreeSet::new(),
 			http_client,
+		}
+	}
+}
+
+struct CapturerLaunchReservation<'a> {
+	state: &'a Mutex<SupervisorState>,
+	profile_id: Option<String>,
+}
+
+impl Drop for CapturerLaunchReservation<'_> {
+	fn drop(&mut self) {
+		if let Ok(mut state) = self.state.lock() {
+			state.launching_profiles.remove(&self.profile_id);
 		}
 	}
 }
@@ -348,6 +368,10 @@ fn user_profile_store() -> CoreProfileDocumentStore {
 	store
 }
 
+fn load_profile_document(store: &CoreProfileDocumentStore) -> Result<CoreProfileDocument, String> {
+	store.load().map_err(|error| format!("load profile document: {error}"))
+}
+
 fn profile_path_for_id(id: &str) -> PathBuf {
 	let profiles_dir = user_profile_store().profiles_dir().to_path_buf();
 	if let Ok(entries) = fs::read_dir(&profiles_dir) {
@@ -390,7 +414,7 @@ fn write_app_settings(settings: &AppRuntimeSettings) -> Result<(), String> {
 		fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
 	}
 	let text = toml::to_string_pretty(settings).map_err(|e| format!("serialize settings.toml: {e}"))?;
-	fs::write(&path, text).map_err(|e| format!("write {}: {e}", path.display()))
+	un_motion_profile_schema::profile_document::atomic_write(&path, text.as_bytes()).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 /// 起動中の Capturer プロセス本体。`un-motion-capturer` を spawn して `Child` を保持し、
@@ -400,11 +424,18 @@ struct ManagedCapturer {
 	child: Child,
 	bind_addr: SocketAddr,
 	started_at: Instant,
-	stderr_tail: Arc<Mutex<Vec<String>>>,
+	stderr_tail: Arc<Mutex<CapturerLogTail>>,
+	stderr_join: Option<std::thread::JoinHandle<()>>,
 	/// Phase E telemetry: 前回 `capturer_runtime_status` で観測した累積カウンタ。
 	/// 次回観測時に Δcount / Δt で FPS を算出する。値が無い間は FPS = 0 を返す
 	/// (まだ「2 サンプル目が無い」状態)。Supervisor の 1.5s poll cadence で更新される。
 	prev_telemetry: Option<TelemetrySample>,
+}
+
+#[derive(Default)]
+struct CapturerLogTail {
+	base_index: u64,
+	lines: Vec<String>,
 }
 
 /// Capturer の `output_telemetry` を時刻と一緒に切り取った 1 サンプル。
@@ -444,6 +475,15 @@ pub struct CapturerInstance {
 	pub last_stderr: Option<String>,
 	pub stderr_tail: Vec<String>,
 	pub exit_code: Option<i32>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CapturerLogChunk {
+	id: u32,
+	base_index: u64,
+	next_index: u64,
+	lines: Vec<String>,
 }
 
 #[derive(Clone, Serialize, PartialEq, Eq)]
@@ -522,6 +562,32 @@ fn list_capturers(state: State<'_, Mutex<SupervisorState>>) -> Result<Vec<Captur
 	Ok(state.capturers.values().map(|capturer| capturer.info.clone()).collect())
 }
 
+fn capturer_log_chunk(id: u32, after_index: u64, tail: &CapturerLogTail) -> CapturerLogChunk {
+	let next_index = tail.base_index.saturating_add(tail.lines.len() as u64);
+	let start_index = after_index.max(tail.base_index).min(next_index);
+	let offset = (start_index - tail.base_index) as usize;
+	CapturerLogChunk {
+		id,
+		base_index: tail.base_index,
+		next_index,
+		lines: tail.lines[offset..].to_vec(),
+	}
+}
+
+/// `after_index` 以降に追加された stderr 行だけを返す。
+#[tauri::command]
+fn capturer_logs(id: u32, after_index: Option<u64>, state: State<'_, Mutex<SupervisorState>>) -> Result<CapturerLogChunk, String> {
+	let stderr_tail = state
+		.lock()
+		.map_err(|_| "supervisor state poisoned".to_string())?
+		.capturers
+		.get(&id)
+		.map(|capturer| Arc::clone(&capturer.stderr_tail))
+		.ok_or_else(|| format!("capturer {id} not found"))?;
+	let tail = stderr_tail.lock().map_err(|_| "capturer stderr tail poisoned".to_string())?;
+	Ok(capturer_log_chunk(id, after_index.unwrap_or(0), &tail))
+}
+
 /// Capturer プロセスを spawn して HTTP API の起動を待ち、インスタンス情報を返す。
 ///
 /// Capturer は `--active-profile <id>` を受け取って起動と同時に指定 profile の
@@ -538,6 +604,7 @@ fn launch_capturer(
 	state: State<'_, Mutex<SupervisorState>>,
 	app_settings: State<'_, Mutex<AppRuntimeSettings>>,
 ) -> Result<CapturerInstance, String> {
+	let state_handle: &Mutex<SupervisorState> = &state;
 	let api_worker_threads = app_settings
 		.lock()
 		.map(|settings| normalize_api_worker_threads(settings.api_worker_threads))
@@ -568,55 +635,120 @@ fn launch_capturer(
 	} else if let Some(existing) = state.capturers.values().find(|c| is_live(c) && c.info.profile_id.is_none()) {
 		return Ok(existing.info.clone());
 	}
-
-	let bind_addr = reserve_loopback_address()?;
-	let mut command = capturer_command(
-		bind_addr,
-		allow_non_loopback.unwrap_or(false),
-		resolved_profile_id.as_deref(),
-		api_worker_threads,
-	)?;
-	configure_hidden_child(&mut command);
-	let mut child = command
-		.stdin(Stdio::null())
-		.stdout(Stdio::null())
-		.stderr(Stdio::piped())
-		.spawn()
-		.map_err(|e| format!("launch capturer: {e}"))?;
-	let stderr_tail = spawn_stderr_tail(child.stderr.take());
-	let pid = child.id();
+	if state.launching_profiles.contains(&resolved_profile_id) {
+		return Err(match &resolved_profile_id {
+			Some(profile_id) => format!("capturer launch already in progress for profile: {profile_id}"),
+			None => "capturer launch already in progress for default profile".to_string(),
+		});
+	}
+	state.launching_profiles.insert(resolved_profile_id.clone());
 	state.next_id = state.next_id.saturating_add(1);
 	let id = state.next_id;
-	let started_at = Instant::now();
-	// healthz を待つ前にプロセスが死ぬケースを早期検出する。
-	if let Err(e) = wait_for_healthz(&state.http_client, bind_addr, &mut child, &stderr_tail) {
-		let _ = force_stop_capturer_child(&mut child, "launch_capturer: healthz failed, abort spawn");
-		let tail = stderr_tail.lock().map(|tail| tail.clone()).unwrap_or_default();
-		let exit_code = child.try_wait().ok().flatten().and_then(|status| status.code());
-		state.capturers.insert(
-			id,
-			ManagedCapturer {
-				info: CapturerInstance {
-					id,
-					name: format!("Capturer #{id}"),
-					state: CapturerState::Crashed,
-					pid: None,
-					bind_addr: Some(bind_addr.to_string()),
-					profile_id: resolved_profile_id,
-					uptime_secs: started_at.elapsed().as_secs(),
-					last_stderr: tail.last().cloned(),
-					stderr_tail: tail,
-					exit_code,
-				},
-				child,
+	let http_client = state.http_client.clone();
+	drop(state);
+	let _launch_reservation = CapturerLaunchReservation {
+		state: state_handle,
+		profile_id: resolved_profile_id.clone(),
+	};
+
+	let (child, bind_addr, stderr_tail, stderr_join, started_at) = {
+		let mut attempt = 0;
+		loop {
+			attempt += 1;
+			let bind_addr = reserve_loopback_address()?;
+			let mut command = capturer_command(
 				bind_addr,
-				started_at,
-				stderr_tail,
-				prev_telemetry: None,
-			},
-		);
-		return Err(e);
-	}
+				allow_non_loopback.unwrap_or(false),
+				resolved_profile_id.as_deref(),
+				api_worker_threads,
+			)?;
+			configure_hidden_child(&mut command);
+			let mut child = command
+				.stdin(Stdio::null())
+				.stdout(Stdio::null())
+				.stderr(Stdio::piped())
+				.spawn()
+				.map_err(|e| format!("launch capturer: {e}"))?;
+			let (stderr_tail, mut stderr_join) = spawn_stderr_tail(child.stderr.take());
+			let started_at = Instant::now();
+			match wait_for_healthz(&http_client, bind_addr, &mut child, &stderr_tail) {
+				Ok(()) => break (child, bind_addr, stderr_tail, stderr_join, started_at),
+				Err(error) => {
+					if let Err(stop_error) =
+						force_stop_capturer_child_if_running(&mut child, "launch_capturer: healthz failed, abort spawn")
+					{
+						let tail = stderr_tail.lock().map(|tail| tail.lines.clone()).unwrap_or_default();
+						let pid = child.id();
+						state_handle
+							.lock()
+							.map_err(|_| "supervisor state poisoned".to_string())?
+							.capturers
+							.insert(
+								id,
+								ManagedCapturer {
+									info: CapturerInstance {
+										id,
+										name: format!("Capturer #{id}"),
+										state: CapturerState::Stopping,
+										pid: Some(pid),
+										bind_addr: Some(bind_addr.to_string()),
+										profile_id: resolved_profile_id.clone(),
+										uptime_secs: started_at.elapsed().as_secs(),
+										last_stderr: tail.last().cloned(),
+										stderr_tail: tail,
+										exit_code: None,
+									},
+									child,
+									bind_addr,
+									started_at,
+									stderr_tail,
+									stderr_join,
+									prev_telemetry: None,
+								},
+							);
+						return Err(format!("{error}; Capturer cleanup failed: {stop_error}"));
+					}
+					if let Some(join) = stderr_join.take() {
+						let _ = join.join();
+					}
+					let tail = stderr_tail.lock().map(|tail| tail.lines.clone()).unwrap_or_default();
+					if attempt < 3 && capturer_bind_conflict(&error, &tail) {
+						continue;
+					}
+					let exit_code = child.try_wait().ok().flatten().and_then(|status| status.code());
+					state_handle
+						.lock()
+						.map_err(|_| "supervisor state poisoned".to_string())?
+						.capturers
+						.insert(
+							id,
+							ManagedCapturer {
+								info: CapturerInstance {
+									id,
+									name: format!("Capturer #{id}"),
+									state: CapturerState::Crashed,
+									pid: None,
+									bind_addr: Some(bind_addr.to_string()),
+									profile_id: resolved_profile_id.clone(),
+									uptime_secs: started_at.elapsed().as_secs(),
+									last_stderr: tail.last().cloned(),
+									stderr_tail: tail,
+									exit_code,
+								},
+								child,
+								bind_addr,
+								started_at,
+								stderr_tail,
+								stderr_join: None,
+								prev_telemetry: None,
+							},
+						);
+					return Err(error);
+				}
+			}
+		}
+	};
+	let pid = child.id();
 	let info = CapturerInstance {
 		id,
 		name: format!("Capturer #{id}"),
@@ -630,17 +762,22 @@ fn launch_capturer(
 		exit_code: None,
 	};
 	let info_for_return = info.clone();
-	state.capturers.insert(
-		id,
-		ManagedCapturer {
-			info,
-			child,
-			bind_addr,
-			started_at,
-			stderr_tail,
-			prev_telemetry: None,
-		},
-	);
+	state_handle
+		.lock()
+		.map_err(|_| "supervisor state poisoned".to_string())?
+		.capturers
+		.insert(
+			id,
+			ManagedCapturer {
+				info,
+				child,
+				bind_addr,
+				started_at,
+				stderr_tail,
+				stderr_join,
+				prev_telemetry: None,
+			},
+		);
 	Ok(info_for_return)
 }
 
@@ -648,25 +785,40 @@ fn launch_capturer(
 /// 一定時間内に終わらなければ kill する。
 #[tauri::command]
 fn stop_capturer(id: u32, state: State<'_, Mutex<SupervisorState>>) -> Result<(), String> {
-	let mut state = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
-	let http_client = state.http_client.clone();
-	if let Some(capturer) = state.capturers.get_mut(&id) {
-		stop_managed_capturer(id, capturer, &http_client)?;
+	let (http_client, mut capturer) = {
+		let mut guard = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
+		(guard.http_client.clone(), guard.capturers.remove(&id))
+	};
+	let result = if let Some(capturer) = capturer.as_mut() {
+		stop_managed_capturer(id, capturer, &http_client)
+	} else {
+		Ok(())
+	};
+	if let Some(capturer) = capturer {
+		state
+			.lock()
+			.map_err(|_| "supervisor state poisoned".to_string())?
+			.capturers
+			.insert(id, capturer);
 	}
-	Ok(())
+	result
 }
 
 /// Capturer の `/api/runtime/snapshot` を取得して GUI 用 DTO に詰め直す。
 #[tauri::command]
 fn capturer_runtime_status(id: u32, state: State<'_, Mutex<SupervisorState>>) -> Result<CapturerRuntimeStatus, String> {
-	let mut state = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
-	refresh_capturers(&mut state);
-	let http_client = state.http_client.clone();
-	let capturer = state.capturers.get_mut(&id).ok_or_else(|| format!("capturer not found: {id}"))?;
-	let bind_addr = capturer.bind_addr;
-	let info_state = capturer.info.state.clone();
-	let pid = capturer.info.pid;
-	let uptime_secs = capturer.info.uptime_secs;
+	let (http_client, bind_addr, info_state, pid, uptime_secs) = {
+		let mut guard = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
+		refresh_capturers(&mut guard);
+		let capturer = guard.capturers.get(&id).ok_or_else(|| format!("capturer not found: {id}"))?;
+		(
+			guard.http_client.clone(),
+			capturer.bind_addr,
+			capturer.info.state.clone(),
+			capturer.info.pid,
+			capturer.info.uptime_secs,
+		)
+	};
 
 	let (healthy, note, snapshot) = if matches!(info_state, CapturerState::Running | CapturerState::Starting) {
 		match fetch_runtime_snapshot(&http_client, bind_addr) {
@@ -680,9 +832,10 @@ fn capturer_runtime_status(id: u32, state: State<'_, Mutex<SupervisorState>>) ->
 	// Phase E telemetry: snapshot から累積カウンタを抜き出し、前回サンプルと
 	// 差分を取って FPS を算出する。初回観測 (`prev_telemetry` が None) では
 	// `fps = None` を返し、サンプルだけ保存する。
-	let fps = if let Some(snapshot_value) = snapshot.as_ref()
-		&& let Some(cur_sample) = extract_telemetry_sample(snapshot_value)
-	{
+	let current_sample = snapshot.as_ref().and_then(extract_telemetry_sample);
+	let fps = if let Some(cur_sample) = current_sample {
+		let mut guard = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
+		let capturer = guard.capturers.get_mut(&id).ok_or_else(|| format!("capturer not found: {id}"))?;
 		let computed = capturer
 			.prev_telemetry
 			.as_ref()
@@ -706,6 +859,18 @@ fn capturer_runtime_status(id: u32, state: State<'_, Mutex<SupervisorState>>) ->
 	})
 }
 
+fn capturer_action_context(
+	state: &Mutex<SupervisorState>,
+	id: u32,
+) -> Result<(reqwest::blocking::Client, SocketAddr, Option<String>), String> {
+	let guard = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
+	let capturer = guard.capturers.get(&id).ok_or_else(|| format!("capturer not found: {id}"))?;
+	if !matches!(capturer.info.state, CapturerState::Running | CapturerState::Starting) {
+		return Err(format!("capturer is not running: {id}"));
+	}
+	Ok((guard.http_client.clone(), capturer.bind_addr, capturer.info.profile_id.clone()))
+}
+
 #[tauri::command]
 fn calibrate_capturer_neutral(
 	id: u32,
@@ -713,24 +878,16 @@ fn calibrate_capturer_neutral(
 	valid_sample_count: Option<usize>,
 	state: State<'_, Mutex<SupervisorState>>,
 ) -> Result<ProfileDetail, String> {
-	let state = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
-	let capturer = state.capturers.get(&id).ok_or_else(|| format!("capturer not found: {id}"))?;
-	if !matches!(capturer.info.state, CapturerState::Running | CapturerState::Starting) {
-		return Err(format!("capturer is not running: {id}"));
-	}
-	let profile_id = capturer
-		.info
-		.profile_id
-		.clone()
-		.or_else(|| fetch_capturer_active_profile_id(&state.http_client, capturer.bind_addr))
+	let (http_client, bind_addr, configured_profile_id) = capturer_action_context(&state, id)?;
+	let profile_id = configured_profile_id
+		.or_else(|| fetch_capturer_active_profile_id(&http_client, bind_addr))
 		.ok_or_else(|| "active profile is unknown".to_string())?;
-	let url = format!("http://{}/api/runtime/calibration/neutral", capturer.bind_addr);
+	let url = format!("http://{bind_addr}/api/runtime/calibration/neutral");
 	let body = serde_json::json!({
 		"pose": pose.as_deref().unwrap_or("U"),
 		"validSampleCount": valid_sample_count.unwrap_or(45).clamp(1, 240),
 	});
-	let response = state
-		.http_client
+	let response = http_client
 		.post(&url)
 		.timeout(HTTP_RUNTIME_ACTION_TIMEOUT)
 		.json(&body)
@@ -753,20 +910,12 @@ fn calibrate_capturer_neutral(
 
 #[tauri::command]
 fn clear_capturer_neutral_calibration(id: u32, state: State<'_, Mutex<SupervisorState>>) -> Result<ProfileDetail, String> {
-	let state = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
-	let capturer = state.capturers.get(&id).ok_or_else(|| format!("capturer not found: {id}"))?;
-	if !matches!(capturer.info.state, CapturerState::Running | CapturerState::Starting) {
-		return Err(format!("capturer is not running: {id}"));
-	}
-	let profile_id = capturer
-		.info
-		.profile_id
-		.clone()
-		.or_else(|| fetch_capturer_active_profile_id(&state.http_client, capturer.bind_addr))
+	let (http_client, bind_addr, configured_profile_id) = capturer_action_context(&state, id)?;
+	let profile_id = configured_profile_id
+		.or_else(|| fetch_capturer_active_profile_id(&http_client, bind_addr))
 		.ok_or_else(|| "active profile is unknown".to_string())?;
-	let url = format!("http://{}/api/runtime/calibration/neutral/clear", capturer.bind_addr);
-	let response = state
-		.http_client
+	let url = format!("http://{bind_addr}/api/runtime/calibration/neutral/clear");
+	let response = http_client
 		.post(&url)
 		.send()
 		.map_err(|error| format!("POST {url} failed: {error}"))?;
@@ -793,23 +942,15 @@ fn build_capturer_face_pose_model(
 	valid_sample_count: Option<usize>,
 	state: State<'_, Mutex<SupervisorState>>,
 ) -> Result<ProfileDetail, String> {
-	let state = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
-	let capturer = state.capturers.get(&id).ok_or_else(|| format!("capturer not found: {id}"))?;
-	if !matches!(capturer.info.state, CapturerState::Running | CapturerState::Starting) {
-		return Err(format!("capturer is not running: {id}"));
-	}
-	let profile_id = capturer
-		.info
-		.profile_id
-		.clone()
-		.or_else(|| fetch_capturer_active_profile_id(&state.http_client, capturer.bind_addr))
+	let (http_client, bind_addr, configured_profile_id) = capturer_action_context(&state, id)?;
+	let profile_id = configured_profile_id
+		.or_else(|| fetch_capturer_active_profile_id(&http_client, bind_addr))
 		.ok_or_else(|| "active profile is unknown".to_string())?;
-	let url = format!("http://{}/api/runtime/face-pose-model/build", capturer.bind_addr);
+	let url = format!("http://{bind_addr}/api/runtime/face-pose-model/build");
 	let body = serde_json::json!({
 		"validSampleCount": valid_sample_count.unwrap_or(90).clamp(1, 240),
 	});
-	let response = state
-		.http_client
+	let response = http_client
 		.post(&url)
 		.timeout(HTTP_RUNTIME_ACTION_TIMEOUT)
 		.json(&body)
@@ -833,8 +974,9 @@ fn build_capturer_face_pose_model(
 }
 
 fn save_profile_from_capturer_selection(profile_id: &str, capturer_document: CoreProfileDocument) -> Result<CoreProfileDocument, String> {
+	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
-	let user_document = merge_profile_from_capturer_selection(profile_id, store.load(), capturer_document)?;
+	let user_document = merge_profile_from_capturer_selection(profile_id, load_profile_document(&store)?, capturer_document)?;
 	store.save(user_document).map_err(|error| error.to_string())
 }
 
@@ -1016,10 +1158,11 @@ fn capture_unmf_frames_from_capturer(
 		SnapshotDuration::OneSecond | SnapshotDuration::ThreeSeconds => {
 			let started = Instant::now();
 			let mut frames = Vec::new();
+			let mut last_sequence = None;
 			while started.elapsed() < Duration::from_millis(duration.capture_duration_ms()) {
 				let frame = capture_unmf_pose_from_capturer(http_client, bind_addr)?;
-				frames.push(frame);
-				std::thread::sleep(Duration::from_millis(10));
+				let inserted = push_snapshot_if_new(&mut frames, frame, &mut last_sequence);
+				std::thread::sleep(Duration::from_millis(if inserted { 10 } else { 20 }));
 			}
 			if frames.is_empty() {
 				frames.push(capture_unmf_pose_from_capturer(http_client, bind_addr)?);
@@ -1027,6 +1170,21 @@ fn capture_unmf_frames_from_capturer(
 			Ok(frames)
 		}
 	}
+}
+
+fn push_snapshot_if_new(frames: &mut Vec<serde_json::Value>, frame: serde_json::Value, last_sequence: &mut Option<u64>) -> bool {
+	let sequence = frame
+		.get("header")
+		.and_then(|header| header.get("sequence"))
+		.and_then(serde_json::Value::as_u64);
+	if sequence.is_some() && sequence == *last_sequence {
+		return false;
+	}
+	if sequence.is_some() {
+		*last_sequence = sequence;
+	}
+	frames.push(frame);
+	true
 }
 
 fn response_error(method: &str, url: &str, response: reqwest::blocking::Response) -> String {
@@ -1338,14 +1496,13 @@ impl SnapshotAnalysisStats {
 		let mut items = self
 			.channels
 			.iter()
-			.filter_map(|(name, stats)| {
-				(stats.max_abs_delta > 0.0).then(|| {
-					serde_json::json!({
-						"name": name,
-						"maxAbsDelta": stats.max_abs_delta,
-						"meanAbsDelta": stats.mean_abs_delta(),
-						"stddev": stats.stddev(),
-					})
+			.filter(|&(_name, stats)| stats.max_abs_delta > 0.0)
+			.map(|(name, stats)| {
+				serde_json::json!({
+					"name": name,
+					"maxAbsDelta": stats.max_abs_delta,
+					"meanAbsDelta": stats.mean_abs_delta(),
+					"stddev": stats.stddev(),
 				})
 			})
 			.collect::<Vec<_>>();
@@ -1358,15 +1515,14 @@ impl SnapshotAnalysisStats {
 		let mut items = self
 			.rotations
 			.iter()
-			.filter_map(|(name, stats)| {
-				(stats.max_delta_rad > 0.0).then(|| {
-					serde_json::json!({
-						"name": name,
-						"maxDeltaRad": stats.max_delta_rad,
-						"meanDeltaRad": stats.mean_delta_rad(),
-						"maxDeltaDeg": stats.max_delta_rad.to_degrees(),
-						"meanDeltaDeg": stats.mean_delta_rad().to_degrees(),
-					})
+			.filter(|&(_name, stats)| stats.max_delta_rad > 0.0)
+			.map(|(name, stats)| {
+				serde_json::json!({
+					"name": name,
+					"maxDeltaRad": stats.max_delta_rad,
+					"meanDeltaRad": stats.mean_delta_rad(),
+					"maxDeltaDeg": stats.max_delta_rad.to_degrees(),
+					"meanDeltaDeg": stats.mean_delta_rad().to_degrees(),
 				})
 			})
 			.collect::<Vec<_>>();
@@ -1752,7 +1908,8 @@ struct ProfileDocumentEnvelope {
 /// 瞬間に古い順序を返すことがあるため、ここでは UI の表示順に使わない。
 #[tauri::command]
 fn list_profiles(_state: State<'_, Mutex<SupervisorState>>) -> Result<Vec<ProfileSummary>, String> {
-	Ok(user_profile_store().load().profiles_summary())
+	let store = user_profile_store();
+	Ok(load_profile_document(&store)?.profiles_summary())
 }
 
 /// Supervisor Console の前回選択 profile id を返す。
@@ -1760,7 +1917,8 @@ fn list_profiles(_state: State<'_, Mutex<SupervisorState>>) -> Result<Vec<Profil
 /// これは Launch UI の復元用であり、稼働中 Capturer の runtime state ではない。
 #[tauri::command]
 fn selected_profile_id(_state: State<'_, Mutex<SupervisorState>>) -> Result<String, String> {
-	Ok(user_profile_store().load().selected_profile_id)
+	let store = user_profile_store();
+	Ok(load_profile_document(&store)?.selected_profile_id)
 }
 
 /// Supervisor Console の前回選択 profile id を保存する。
@@ -1769,8 +1927,9 @@ fn selected_profile_id(_state: State<'_, Mutex<SupervisorState>>) -> Result<Stri
 /// プロセス単位で決める。
 #[tauri::command]
 fn set_selected_profile_id(profile_id: Option<String>, _state: State<'_, Mutex<SupervisorState>>) -> Result<(), String> {
+	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
-	let mut doc = store.load();
+	let mut doc = load_profile_document(&store)?;
 	let normalized = profile_id
 		.map(|value| value.trim().to_string())
 		.filter(|value| !value.is_empty())
@@ -1791,6 +1950,7 @@ fn set_selected_profile_id(profile_id: Option<String>, _state: State<'_, Mutex<S
 /// を OFF で開始する。
 #[tauri::command]
 fn create_profile(name: String, _state: State<'_, Mutex<SupervisorState>>) -> Result<ProfileDetail, String> {
+	let _profile_guard = lock_profile_store()?;
 	let trimmed = name.trim();
 	let name = if trimmed.is_empty() {
 		"New Profile".to_string()
@@ -1798,7 +1958,7 @@ fn create_profile(name: String, _state: State<'_, Mutex<SupervisorState>>) -> Re
 		trimmed.to_string()
 	};
 	let store = user_profile_store();
-	let mut doc = store.load();
+	let mut doc = load_profile_document(&store)?;
 	let id = next_profile_id(&doc, &name);
 	let new_profile = CoreProfileDocumentProfile {
 		id: id.clone(),
@@ -1867,24 +2027,30 @@ fn new_profile_runtime_defaults() -> ProfileRuntimeSettings {
 /// Profile を削除する。最後の 1 件も削除できる。空になったら launch default は空文字にする。
 #[tauri::command]
 fn delete_profile(profile_id: String, state: State<'_, Mutex<SupervisorState>>) -> Result<(), String> {
-	let state = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
+	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
-	let mut doc = store.load();
+	let mut doc = load_profile_document(&store)?;
 	if !doc.profiles.iter().any(|profile| profile.id == profile_id) {
 		return Err(format!("profile not found: {profile_id}"));
+	}
+	let profile_in_use = state
+		.lock()
+		.map_err(|_| "supervisor state poisoned".to_string())?
+		.capturers
+		.values()
+		.any(|capturer| {
+			matches!(
+				capturer.info.state,
+				CapturerState::Starting | CapturerState::Running | CapturerState::Stopping
+			) && capturer.info.profile_id.as_deref() == Some(profile_id.as_str())
+		});
+	if profile_in_use {
+		return Err(format!("profile is in use by a running capturer: {profile_id}"));
 	}
 	doc.profiles.retain(|profile| profile.id != profile_id);
 	doc.profile_sources.retain(|source| source.profile_id != profile_id);
 	if doc.selected_profile_id == profile_id {
 		doc.selected_profile_id = doc.profiles.first().map(|profile| profile.id.clone()).unwrap_or_default();
-	}
-	if state.capturers.values().any(|capturer| {
-		matches!(
-			capturer.info.state,
-			CapturerState::Starting | CapturerState::Running | CapturerState::Stopping
-		) && capturer.info.profile_id.as_deref() == Some(profile_id.as_str())
-	}) {
-		return Err(format!("profile is in use by a running capturer: {profile_id}"));
 	}
 	store.save(doc).map_err(|e| format!("save profile document: {e}"))?;
 	Ok(())
@@ -1893,8 +2059,9 @@ fn delete_profile(profile_id: String, state: State<'_, Mutex<SupervisorState>>) 
 /// Profile を複製する。新しい id / 表示名は元のものから ` copy` を付けて自動採番する。
 #[tauri::command]
 fn duplicate_profile(profile_id: String, _state: State<'_, Mutex<SupervisorState>>) -> Result<ProfileDetail, String> {
+	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
-	let mut doc = store.load();
+	let mut doc = load_profile_document(&store)?;
 	let original = doc
 		.profiles
 		.iter()
@@ -1922,8 +2089,9 @@ fn duplicate_profile(profile_id: String, _state: State<'_, Mutex<SupervisorState
 
 #[tauri::command]
 fn reorder_profiles(profile_ids: Vec<String>, _state: State<'_, Mutex<SupervisorState>>) -> Result<Vec<ProfileSummary>, String> {
+	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
-	let mut doc = store.load();
+	let mut doc = load_profile_document(&store)?;
 	let mut ordered = Vec::with_capacity(doc.profiles.len());
 	for id in &profile_ids {
 		if let Some(index) = doc.profiles.iter().position(|profile| &profile.id == id) {
@@ -1939,7 +2107,8 @@ fn reorder_profiles(profile_ids: Vec<String>, _state: State<'_, Mutex<Supervisor
 /// Profile の詳細フィールドを GUI 用 DTO で返す。
 #[tauri::command]
 fn get_profile_detail(profile_id: String) -> Result<ProfileDetail, String> {
-	let doc = user_profile_store().load();
+	let store = user_profile_store();
+	let doc = load_profile_document(&store)?;
 	doc.profiles
 		.iter()
 		.find(|profile| profile.id == profile_id)
@@ -1957,9 +2126,9 @@ fn update_profile_field(
 	value: serde_json::Value,
 	state: State<'_, Mutex<SupervisorState>>,
 ) -> Result<ProfileDetail, String> {
-	let state = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
+	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
-	let mut doc = store.load();
+	let mut doc = load_profile_document(&store)?;
 	{
 		let profile = doc
 			.profiles
@@ -2088,20 +2257,20 @@ fn enumerate_webcam_formats(backend: String, device_id_or_name: String) -> Resul
 /// 動作中の Capturer をすべて停止する。CloseRequested ハンドラと Tauri command の両方
 /// から呼ばれるので、`SupervisorState` への lock 取得とエラーハンドリングをここに集約。
 fn stop_all_in_state(state: &Mutex<SupervisorState>) {
-	let Ok(mut state) = state.lock() else {
-		return;
+	let (http_client, mut capturers) = {
+		let Ok(mut guard) = state.lock() else { return };
+		(guard.http_client.clone(), std::mem::take(&mut guard.capturers))
 	};
-	let http_client = state.http_client.clone();
-	let ids: Vec<u32> = state.capturers.keys().copied().collect();
-	for id in ids {
-		if let Some(capturer) = state.capturers.get_mut(&id) {
-			if matches!(capturer.info.state, CapturerState::Exited | CapturerState::Crashed) {
-				continue;
-			}
-			if let Err(e) = stop_managed_capturer(id, capturer, &http_client) {
-				tracing::warn!(target: "un_motion_supervisor", capturer_id = id, error = %e, "stop_all: stop_managed_capturer failed");
-			}
+	for (id, capturer) in &mut capturers {
+		if matches!(capturer.info.state, CapturerState::Exited | CapturerState::Crashed) {
+			continue;
 		}
+		if let Err(e) = stop_managed_capturer(*id, capturer, &http_client) {
+			tracing::warn!(target: "un_motion_supervisor", capturer_id = *id, error = %e, "stop_all: stop_managed_capturer failed");
+		}
+	}
+	if let Ok(mut guard) = state.lock() {
+		guard.capturers.append(&mut capturers);
 	}
 }
 
@@ -2275,10 +2444,8 @@ fn resolve_ffprobe(ffmpeg_path: Option<&Path>) -> Option<PathBuf> {
 			.and_then(|name| name.to_str())
 			.unwrap_or_default()
 			.to_ascii_lowercase();
-		if name == exe || (!cfg!(windows) && name == "ffprobe") {
-			if path.is_file() {
-				return Some(path.to_path_buf());
-			}
+		if (name == exe || (!cfg!(windows) && name == "ffprobe")) && path.is_file() {
+			return Some(path.to_path_buf());
 		}
 		if let Some(parent) = path.parent() {
 			let sibling = parent.join(exe);
@@ -2524,9 +2691,9 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 	if app.tray_by_id(TRAY_ICON_ID).is_some() {
 		return Ok(());
 	}
-	let open = MenuItem::with_id(app, "open", t!("tray.open").to_string(), true, None::<&str>)?;
-	let stop_all = MenuItem::with_id(app, "stop_all", t!("tray.stop_all").to_string(), true, None::<&str>)?;
-	let quit = MenuItem::with_id(app, "quit", t!("tray.quit").to_string(), true, None::<&str>)?;
+	let open = MenuItem::with_id(app, "open", &t!("tray.open"), true, None::<&str>)?;
+	let stop_all = MenuItem::with_id(app, "stop_all", &t!("tray.stop_all"), true, None::<&str>)?;
+	let quit = MenuItem::with_id(app, "quit", &t!("tray.quit"), true, None::<&str>)?;
 	let menu = Menu::new(app)?;
 	menu.append(&open)?;
 	menu.append(&stop_all)?;
@@ -2591,6 +2758,7 @@ pub fn run() {
 		.manage(Mutex::new(load_app_settings()))
 		.invoke_handler(tauri::generate_handler![
 			list_capturers,
+			capturer_logs,
 			launch_capturer,
 			stop_capturer,
 			stop_all_capturers,
@@ -3277,10 +3445,12 @@ fn opt_f32(value: &serde_json::Value, field: &str) -> Result<Option<f32>, String
 	if value.is_null() {
 		return Ok(None);
 	}
-	if let Some(n) = value.as_f64() {
-		if n.is_finite() && n >= 0.0 && n <= f32::MAX as f64 {
-			return Ok(Some(n as f32));
-		}
+	if let Some(n) = value.as_f64()
+		&& n.is_finite()
+		&& n >= 0.0
+		&& n <= f32::MAX as f64
+	{
+		return Ok(Some(n as f32));
 	}
 	Err(format!("field `{field}` must be a non-negative number or null"))
 }
@@ -3292,18 +3462,24 @@ fn opt_f32(value: &serde_json::Value, field: &str) -> Result<Option<f32>, String
 /// 編集された profile を実行しているプロセスだけに同期する。
 ///
 /// 失敗は警告のみで握りつぶす (再起動すれば user profile store から復元できるため致命的でない)。
-fn push_document_to_matching_capturers(state: &SupervisorState, doc: &CoreProfileDocument, profile_id: &str) {
+fn push_document_to_matching_capturers(state: &Mutex<SupervisorState>, doc: &CoreProfileDocument, profile_id: &str) {
+	let (http_client, targets) = {
+		let Ok(state) = state.lock() else { return };
+		let targets = state
+			.capturers
+			.values()
+			.filter(|capturer| {
+				matches!(capturer.info.state, CapturerState::Running) && capturer.info.profile_id.as_deref() == Some(profile_id)
+			})
+			.map(|capturer| (capturer.info.id, capturer.bind_addr))
+			.collect::<Vec<_>>();
+		(state.http_client.clone(), targets)
+	};
 	let body = serde_json::json!({ "selection": doc });
-	for capturer in state.capturers.values() {
-		if !matches!(capturer.info.state, CapturerState::Running) {
-			continue;
-		}
-		if capturer.info.profile_id.as_deref() != Some(profile_id) {
-			continue;
-		}
-		let url = format!("http://{}/api/profiles/document/sync", capturer.bind_addr);
-		if let Err(error) = state.http_client.put(&url).json(&body).send() {
-			tracing::warn!(id = capturer.info.id, %error, "sync profile document via capturer failed");
+	for (id, bind_addr) in targets {
+		let url = format!("http://{bind_addr}/api/profiles/document/sync");
+		if let Err(error) = http_client.put(&url).json(&body).send() {
+			tracing::warn!(id, %error, "sync profile document via capturer failed");
 		}
 	}
 }
@@ -3373,9 +3549,8 @@ fn refresh_capturers(state: &mut SupervisorState) {
 			}
 		};
 		if let Some(status) = exit_status {
-			capturer.info.state = if matches!(capturer.info.state, CapturerState::Stopping) {
-				CapturerState::Exited
-			} else if status.success() {
+			join_capturer_stderr(capturer);
+			capturer.info.state = if matches!(capturer.info.state, CapturerState::Stopping) || status.success() {
 				CapturerState::Exited
 			} else {
 				CapturerState::Crashed
@@ -3387,8 +3562,8 @@ fn refresh_capturers(state: &mut SupervisorState) {
 		}
 		capturer.info.uptime_secs = capturer.started_at.elapsed().as_secs();
 		if let Ok(tail) = capturer.stderr_tail.lock() {
-			capturer.info.stderr_tail = tail.clone();
-			capturer.info.last_stderr = tail.last().cloned();
+			capturer.info.stderr_tail.clear();
+			capturer.info.last_stderr = tail.lines.last().cloned();
 		}
 	}
 	prune_stopped_capturer_history(state);
@@ -3444,6 +3619,17 @@ fn wait_capturer_exit(child: &mut Child, timeout: Duration) -> Result<bool, Stri
 	}
 }
 
+fn force_stop_capturer_child_if_running(child: &mut Child, context: &str) -> Result<bool, String> {
+	match child.try_wait() {
+		Ok(Some(_)) => Ok(false),
+		Ok(None) => {
+			force_stop_capturer_child(child, context)?;
+			Ok(true)
+		}
+		Err(error) => Err(format!("{context}: failed to query child status: {error}")),
+	}
+}
+
 /// UN Avatar の `stop_managed_renderer` の HTTP 版。`POST /api/core/exit` で
 /// graceful 終了を試み、`wait_capturer_exit` で待つ。失敗時は `force_stop_capturer_child`
 /// でプロセス木ごと強制終了する。
@@ -3465,11 +3651,18 @@ fn stop_managed_capturer(id: u32, capturer: &mut ManagedCapturer, http_client: &
 }
 
 fn refresh_capturer_stderr(capturer: &mut ManagedCapturer) {
+	join_capturer_stderr(capturer);
 	let Ok(tail) = capturer.stderr_tail.lock() else {
 		return;
 	};
-	capturer.info.stderr_tail = tail.clone();
-	capturer.info.last_stderr = tail.last().cloned();
+	capturer.info.stderr_tail.clear();
+	capturer.info.last_stderr = tail.lines.last().cloned();
+}
+
+fn join_capturer_stderr(capturer: &mut ManagedCapturer) {
+	if let Some(join) = capturer.stderr_join.take() {
+		let _ = join.join();
+	}
 }
 
 /// `runtime_snapshot.output_telemetry` JSON から `TelemetrySample` を切り出す。
@@ -3579,18 +3772,14 @@ fn wait_for_healthz(
 	http_client: &reqwest::blocking::Client,
 	bind_addr: SocketAddr,
 	child: &mut Child,
-	stderr_tail: &Arc<Mutex<Vec<String>>>,
+	stderr_tail: &Arc<Mutex<CapturerLogTail>>,
 ) -> Result<(), String> {
 	let url = format!("http://{}/healthz", bind_addr);
 	let started = Instant::now();
 	loop {
 		match child.try_wait() {
 			Ok(Some(status)) => {
-				let tail_text = stderr_tail
-					.lock()
-					.ok()
-					.map(|tail| tail.iter().cloned().collect::<Vec<_>>().join("\n"))
-					.unwrap_or_default();
+				let tail_text = stderr_tail.lock().ok().map(|tail| tail.lines.join("\n")).unwrap_or_default();
 				return Err(format!(
 					"capturer exited before healthz (exit={:?})\n--- stderr tail ---\n{tail_text}",
 					status.code()
@@ -3608,11 +3797,7 @@ fn wait_for_healthz(
 			return Ok(());
 		}
 		if started.elapsed() >= HEALTHZ_WAIT_TIMEOUT {
-			let tail_text = stderr_tail
-				.lock()
-				.ok()
-				.map(|tail| tail.iter().cloned().collect::<Vec<_>>().join("\n"))
-				.unwrap_or_default();
+			let tail_text = stderr_tail.lock().ok().map(|tail| tail.lines.join("\n")).unwrap_or_default();
 			return Err(format!(
 				"capturer healthz timeout after {:.1}s\n--- stderr tail ---\n{tail_text}",
 				started.elapsed().as_secs_f32()
@@ -3628,25 +3813,34 @@ fn reserve_loopback_address() -> Result<SocketAddr, String> {
 	listener.local_addr().map_err(|e| format!("loopback local addr: {e}"))
 }
 
-fn spawn_stderr_tail(stderr: Option<ChildStderr>) -> Arc<Mutex<Vec<String>>> {
-	let tail = Arc::new(Mutex::new(Vec::new()));
+fn capturer_bind_conflict(error: &str, stderr_lines: &[String]) -> bool {
+	let error = error.to_ascii_lowercase();
+	let stderr = stderr_lines.join("\n").to_ascii_lowercase();
+	["address already in use", "os error 10048", "only one usage of each socket address"]
+		.iter()
+		.any(|needle| error.contains(needle) || stderr.contains(needle))
+}
+
+fn spawn_stderr_tail(stderr: Option<ChildStderr>) -> (Arc<Mutex<CapturerLogTail>>, Option<std::thread::JoinHandle<()>>) {
+	let tail = Arc::new(Mutex::new(CapturerLogTail::default()));
 	let Some(stderr) = stderr else {
-		return tail;
+		return (tail, None);
 	};
 	let thread_tail = Arc::clone(&tail);
-	std::thread::spawn(move || {
+	let join = std::thread::spawn(move || {
 		for line in BufReader::new(stderr).lines().map_while(Result::ok) {
 			let Ok(mut tail) = thread_tail.lock() else {
 				return;
 			};
-			tail.push(line);
-			let overflow = tail.len().saturating_sub(MAX_CAPTURER_LOG_LINES);
+			tail.lines.push(line);
+			let overflow = tail.lines.len().saturating_sub(MAX_CAPTURER_LOG_LINES);
 			if overflow > 0 {
-				tail.drain(0..overflow);
+				tail.lines.drain(0..overflow);
+				tail.base_index = tail.base_index.saturating_add(overflow as u64);
 			}
 		}
 	});
-	tail
+	(tail, Some(join))
 }
 
 fn configure_hidden_child(_command: &mut Command) {
@@ -3726,10 +3920,10 @@ fn capturer_command(
 /// 隣接 exe の親ディレクトリに `models/` があればそれ (release zip 配布レイアウト)、
 /// なければ `repo_root()` (cargo run 開発レイアウト) を返す。
 fn capturer_working_directory(capturer_exe: &Path) -> PathBuf {
-	if let Some(dir) = capturer_exe.parent() {
-		if dir.join("models").is_dir() {
-			return dir.to_path_buf();
-		}
+	if let Some(dir) = capturer_exe.parent()
+		&& dir.join("models").is_dir()
+	{
+		return dir.to_path_buf();
 	}
 	repo_root()
 }
@@ -3886,7 +4080,7 @@ fn open_path_in_file_manager(path: &Path) -> Result<(), String> {
 			command.arg(path);
 		}
 		command.spawn().map_err(|e| format!("open explorer: {e}"))?;
-		return Ok(());
+		Ok(())
 	}
 
 	#[cfg(target_os = "macos")]
@@ -3930,6 +4124,118 @@ mod tests {
 	use super::*;
 	use serde_json::json;
 
+	#[test]
+	fn capturer_bind_conflicts_are_retryable() {
+		assert!(capturer_bind_conflict(
+			"capturer exited",
+			&["Address already in use (os error 10048)".to_string()]
+		));
+		assert!(!capturer_bind_conflict("profile parse failed", &["invalid profile".to_string()]));
+	}
+
+	#[test]
+	fn exited_capturer_is_not_force_stopped() {
+		#[cfg(windows)]
+		let mut child = Command::new("cmd").args(["/C", "exit", "0"]).spawn().expect("spawn exited child");
+		#[cfg(not(windows))]
+		let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn().expect("spawn exited child");
+		child.wait().expect("wait child");
+
+		assert!(!force_stop_capturer_child_if_running(&mut child, "test").expect("query exited child"));
+	}
+
+	#[test]
+	fn stderr_tail_join_observes_all_child_output() {
+		#[cfg(windows)]
+		let mut child = Command::new("cmd")
+			.args(["/C", "echo first 1>&2 & echo second 1>&2"])
+			.stderr(Stdio::piped())
+			.spawn()
+			.expect("spawn stderr child");
+		#[cfg(not(windows))]
+		let mut child = Command::new("sh")
+			.args(["-c", "printf 'first\\nsecond\\n' >&2"])
+			.stderr(Stdio::piped())
+			.spawn()
+			.expect("spawn stderr child");
+		let (tail, join) = spawn_stderr_tail(child.stderr.take());
+		child.wait().expect("wait child");
+		join.expect("stderr join").join().expect("join stderr reader");
+
+		let lines = tail
+			.lock()
+			.expect("tail")
+			.lines
+			.iter()
+			.map(|line| line.trim().to_string())
+			.collect::<Vec<_>>();
+		assert_eq!(lines, ["first", "second"]);
+	}
+
+	#[test]
+	fn snapshot_capture_deduplicates_sequences() {
+		let mut frames = Vec::new();
+		let mut last_sequence = None;
+
+		assert!(push_snapshot_if_new(
+			&mut frames,
+			json!({ "header": { "sequence": 7 } }),
+			&mut last_sequence
+		));
+		assert!(!push_snapshot_if_new(
+			&mut frames,
+			json!({ "header": { "sequence": 7 } }),
+			&mut last_sequence
+		));
+		assert!(push_snapshot_if_new(
+			&mut frames,
+			json!({ "header": { "sequence": 8 } }),
+			&mut last_sequence
+		));
+
+		assert_eq!(frames.len(), 2);
+	}
+
+	#[test]
+	fn capturer_log_chunk_returns_only_unread_lines() {
+		let tail = CapturerLogTail {
+			base_index: 10,
+			lines: vec!["a".into(), "b".into(), "c".into()],
+		};
+		let chunk = capturer_log_chunk(7, 11, &tail);
+		assert_eq!(chunk.id, 7);
+		assert_eq!(chunk.base_index, 10);
+		assert_eq!(chunk.next_index, 13);
+		assert_eq!(chunk.lines, ["b", "c"]);
+	}
+
+	#[test]
+	fn capturer_log_chunk_resets_reader_behind_truncated_tail() {
+		let tail = CapturerLogTail {
+			base_index: 20,
+			lines: vec!["new-a".into(), "new-b".into()],
+		};
+		let chunk = capturer_log_chunk(3, 5, &tail);
+		assert_eq!(chunk.base_index, 20);
+		assert_eq!(chunk.next_index, 22);
+		assert_eq!(chunk.lines, ["new-a", "new-b"]);
+	}
+
+	#[test]
+	fn capturer_launch_reservation_is_released_on_scope_exit() {
+		let state = Mutex::new(SupervisorState::new());
+		let profile_id = Some("profile-a".to_string());
+		state.lock().expect("state").launching_profiles.insert(profile_id.clone());
+		{
+			let _reservation = CapturerLaunchReservation {
+				state: &state,
+				profile_id: profile_id.clone(),
+			};
+			assert!(state.lock().expect("state").launching_profiles.contains(&profile_id));
+		}
+		assert!(!state.lock().expect("state").launching_profiles.contains(&profile_id));
+	}
+
 	fn make_profile(id: &str, name: &str) -> CoreProfileDocumentProfile {
 		CoreProfileDocumentProfile {
 			id: id.to_string(),
@@ -3947,16 +4253,20 @@ mod tests {
 
 	#[test]
 	fn next_profile_id_slugifies_and_avoids_duplicates() {
-		let mut doc = CoreProfileDocument::default();
-		doc.profiles = vec![make_profile("alpha", "Alpha"), make_profile("alpha-2", "Alpha 2")];
+		let doc = CoreProfileDocument {
+			profiles: vec![make_profile("alpha", "Alpha"), make_profile("alpha-2", "Alpha 2")],
+			..Default::default()
+		};
 		let id = next_profile_id(&doc, "Alpha");
 		assert_eq!(id, "alpha-3");
 	}
 
 	#[test]
 	fn next_profile_id_falls_back_when_name_lacks_ascii() {
-		let mut doc = CoreProfileDocument::default();
-		doc.profiles = vec![make_profile("profile", "_")];
+		let doc = CoreProfileDocument {
+			profiles: vec![make_profile("profile", "_")],
+			..Default::default()
+		};
 		let id = next_profile_id(&doc, "！？");
 		assert_eq!(id, "profile-2");
 	}

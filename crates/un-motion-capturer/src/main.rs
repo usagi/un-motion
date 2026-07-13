@@ -161,7 +161,7 @@ fn main() -> anyhow::Result<()> {
 	let state = if let Some(root) = cli.profile_root.as_ref() {
 		// CLI 明示指定 (テスト / ポータブル運用) は seeding せずそのまま使う。
 		let store = CoreProfileDocumentStore::from_root(root);
-		let mut document = store.load();
+		let mut document = store.load()?;
 		apply_cli_active_profile(&mut document, cli.active_profile.as_deref());
 		if cli.experimental_flicker_test {
 			run_experimental_flicker_test(&document)?;
@@ -183,7 +183,7 @@ fn main() -> anyhow::Result<()> {
 				"failed to seed user profile dir from bundled templates (continuing with whatever is on disk)",
 			);
 		}
-		let mut document = store.load();
+		let mut document = store.load()?;
 		apply_cli_active_profile(&mut document, cli.active_profile.as_deref());
 		if cli.experimental_flicker_test {
 			run_experimental_flicker_test(&document)?;

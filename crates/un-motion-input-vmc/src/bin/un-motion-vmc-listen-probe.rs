@@ -47,13 +47,13 @@ fn main() -> anyhow::Result<()> {
 				return Ok(());
 			}
 		}
-		if let Some(duration) = args.duration {
-			if started.elapsed() >= duration {
-				eprintln!(
-					"summary frames={total_frames} vmc_frames={total_vmc_frames} bones={total_bones} blendshapes={total_blendshapes} decode_errors={total_decode_errors}"
-				);
-				return Ok(());
-			}
+		if let Some(duration) = args.duration
+			&& started.elapsed() >= duration
+		{
+			eprintln!(
+				"summary frames={total_frames} vmc_frames={total_vmc_frames} bones={total_bones} blendshapes={total_blendshapes} decode_errors={total_decode_errors}"
+			);
+			return Ok(());
 		}
 		thread::sleep(Duration::from_millis(5));
 	}

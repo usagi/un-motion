@@ -1,5 +1,6 @@
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,6 +11,14 @@ use crate::CoreProfile;
 use crate::profile_settings::{ProfilePipelineComponents, ProfileRuntimeSettings};
 
 const CONF_FILE_NAME: &str = "conf.toml";
+const PROFILE_TRANSACTION_MARKER: &str = ".profiles-transaction";
+const NEXT_PROFILES_DIR: &str = ".profiles-next";
+const PREVIOUS_PROFILES_DIR: &str = ".profiles-previous";
+const NEXT_CONF_FILE: &str = ".conf.toml.next";
+const PROFILE_STORE_LOCK_FILE: &str = ".profiles.lock";
+const MAX_PROFILE_STORE_FILE_BYTES: u64 = 1_048_576;
+const MAX_PROFILE_FILES: usize = 256;
+const MAX_PROFILE_SOURCES: usize = 4_096;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -178,47 +187,122 @@ impl CoreProfileDocumentStore {
 		if !template_dir.is_dir() {
 			return Ok(false);
 		}
+		let _store_lock = self.acquire_store_lock()?;
+		self.recover_profile_transaction()?;
 		if self.conf_path.exists() {
 			return Ok(false);
 		}
 		if has_any_toml(&self.profiles_dir) {
 			return Ok(false);
 		}
-		fs::create_dir_all(&self.profiles_dir)
-			.with_context(|| format!("failed to create user profiles dir {}", self.profiles_dir.display()))?;
-		let mut copied = false;
-		for entry in fs::read_dir(template_dir)
-			.with_context(|| format!("failed to read template dir {}", template_dir.display()))?
-			.flatten()
-		{
+		let root = self.store_root();
+		let next_profiles = root.join(NEXT_PROFILES_DIR);
+		let previous_profiles = root.join(PREVIOUS_PROFILES_DIR);
+		let marker = root.join(PROFILE_TRANSACTION_MARKER);
+		let mut templates = Vec::new();
+		let mut profile_ids = HashSet::new();
+		let mut source_ids = HashSet::new();
+		for entry in fs::read_dir(template_dir).with_context(|| format!("failed to read template dir {}", template_dir.display()))? {
+			let entry = entry.with_context(|| format!("failed to read entry in template dir {}", template_dir.display()))?;
 			let path = entry.path();
 			if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
 				continue;
 			}
-			let Some(file_name) = path.file_name() else { continue };
-			let dest = self.profiles_dir.join(file_name);
-			fs::copy(&path, &dest).with_context(|| format!("failed to copy {} -> {}", path.display(), dest.display()))?;
-			copied = true;
+			if templates.len() >= MAX_PROFILE_FILES {
+				bail!("template directory contains more than {MAX_PROFILE_FILES} profile files");
+			}
+			let raw = read_bounded_utf8(&path)?;
+			let profile =
+				toml::from_str::<CoreProfileFile>(&raw).with_context(|| format!("failed to parse profile template {}", path.display()))?;
+			let profile_id = profile.id.trim();
+			if profile_id.is_empty() {
+				bail!("profile template {} has an empty profile id", path.display());
+			}
+			if !profile_ids.insert(profile_id.to_string()) {
+				bail!("profile template {} has duplicate profile id '{profile_id}'", path.display());
+			}
+			for source in &profile.sources {
+				if source_ids.len() >= MAX_PROFILE_SOURCES {
+					bail!("profile templates contain more than {MAX_PROFILE_SOURCES} sources");
+				}
+				let source_id = source.id.trim();
+				if source_id.is_empty() {
+					bail!("profile template {} has an empty source id", path.display());
+				}
+				if !source_ids.insert(source_id.to_string()) {
+					bail!("profile template {} has duplicate source id '{source_id}'", path.display());
+				}
+			}
+			let file_name = path
+				.file_name()
+				.ok_or_else(|| anyhow::anyhow!("profile template has no file name: {}", path.display()))?
+				.to_owned();
+			templates.push((path, file_name, raw));
 		}
-		Ok(copied)
+		if templates.is_empty() {
+			return Ok(false);
+		}
+		remove_path_if_exists(&next_profiles)?;
+		remove_path_if_exists(&previous_profiles)?;
+		fs::create_dir(&next_profiles)
+			.with_context(|| format!("failed to create staged profiles directory {}", next_profiles.display()))?;
+		for (path, file_name, raw) in templates {
+			let dest = next_profiles.join(file_name);
+			atomic_write(&dest, raw.as_bytes())
+				.with_context(|| format!("failed to stage template {} -> {}", path.display(), dest.display()))?;
+		}
+		atomic_write(&marker, b"prepared\n")?;
+		if self.profiles_dir.exists() {
+			fs::rename(&self.profiles_dir, &previous_profiles).with_context(|| {
+				format!(
+					"failed to preserve profiles {} -> {}",
+					self.profiles_dir.display(),
+					previous_profiles.display()
+				)
+			})?;
+		}
+		fs::rename(&next_profiles, &self.profiles_dir)
+			.with_context(|| format!("failed to install seeded profiles {}", self.profiles_dir.display()))?;
+		remove_path_if_exists(&previous_profiles)?;
+		remove_path_if_exists(&marker)?;
+		Ok(true)
 	}
 
-	pub fn load(&self) -> CoreProfileDocument {
+	pub fn load(&self) -> anyhow::Result<CoreProfileDocument> {
+		let _store_lock = self.acquire_store_lock()?;
+		self.recover_profile_transaction()?;
+		self.load_unlocked()
+	}
+
+	fn load_unlocked(&self) -> anyhow::Result<CoreProfileDocument> {
 		let mut profiles = Vec::new();
 		let mut profile_sources = Vec::new();
-		if let Ok(entries) = fs::read_dir(&self.profiles_dir) {
-			for entry in entries.flatten() {
+		let mut profile_file_count = 0;
+		let conf = load_conf_document(&self.conf_path)?;
+		let profile_manifest = conf.as_ref().and_then(profile_manifest_from_document);
+		if self.profiles_dir.exists() {
+			let entries = fs::read_dir(&self.profiles_dir)
+				.with_context(|| format!("failed to read profiles directory {}", self.profiles_dir.display()))?;
+			for entry in entries {
+				let entry = entry.with_context(|| format!("failed to read entry in {}", self.profiles_dir.display()))?;
 				let path = entry.path();
 				if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
 					continue;
 				}
-				let Ok(raw) = fs::read_to_string(&path) else {
+				profile_file_count += 1;
+				if profile_file_count > MAX_PROFILE_FILES {
+					bail!("profile store contains more than {MAX_PROFILE_FILES} profile files");
+				}
+				let raw = read_bounded_utf8(&path)?;
+				let profile =
+					toml::from_str::<CoreProfileFile>(&raw).with_context(|| format!("failed to parse profile {}", path.display()))?;
+				if profile_manifest.as_ref().is_some_and(|manifest| !manifest.contains(&profile.id)) {
 					continue;
-				};
-				let Ok(profile) = toml::from_str::<CoreProfileFile>(&raw) else {
-					continue;
-				};
+				}
 				for source in profile.sources {
+					if profile_sources.len() >= MAX_PROFILE_SOURCES {
+						bail!("profile store contains more than {MAX_PROFILE_SOURCES} sources");
+					}
 					let kind = normalize_source_kind(&source.kind);
 					profile_sources.push(CoreProfileDocumentSource {
 						id: source.id,
@@ -245,41 +329,43 @@ impl CoreProfileDocumentStore {
 				});
 			}
 		}
-		sort_profiles_by_saved_order(&mut profiles, &load_profile_order(&self.conf_path));
+		let profile_order = conf.as_ref().map(profile_order_from_document).unwrap_or_default();
+		sort_profiles_by_saved_order(&mut profiles, &profile_order);
 		if profiles.is_empty() && !self.conf_path.exists() {
 			profiles = default_profiles();
 		}
-		normalize_profile_document(CoreProfileDocument {
+		Ok(normalize_profile_document(CoreProfileDocument {
 			next_profile_index: (profiles.len() as u32).saturating_add(1).max(default_next_profile_index()),
 			next_source_index: (profile_sources.len() as u32).saturating_add(2).max(default_next_source_index()),
-			selected_profile_id: load_active_profile_id(&self.conf_path).unwrap_or_else(default_selected_profile_id),
+			selected_profile_id: conf
+				.as_ref()
+				.and_then(active_profile_id_from_document)
+				.unwrap_or_else(default_selected_profile_id),
 			profiles,
 			profile_sources,
-		})
+		}))
 	}
 
 	pub fn save(&self, document: CoreProfileDocument) -> anyhow::Result<CoreProfileDocument> {
+		let _store_lock = self.acquire_store_lock()?;
+		self.recover_profile_transaction()?;
+		validate_profile_document_limits(&document)?;
 		let normalized = normalize_profile_document(document);
-		fs::create_dir_all(&self.profiles_dir)
-			.with_context(|| format!("failed to create profiles directory {}", self.profiles_dir.display()))?;
-		let expected_files = normalized.profiles.iter().map(profile_file_name).collect::<HashSet<_>>();
+		let root = self.store_root();
+		fs::create_dir_all(root).with_context(|| format!("failed to create profile store {}", root.display()))?;
+		let next_profiles = root.join(NEXT_PROFILES_DIR);
+		let previous_profiles = root.join(PREVIOUS_PROFILES_DIR);
+		let next_conf = root.join(NEXT_CONF_FILE);
+		let marker = root.join(PROFILE_TRANSACTION_MARKER);
+		remove_path_if_exists(&next_profiles)?;
+		remove_path_if_exists(&previous_profiles)?;
+		remove_path_if_exists(&next_conf)?;
+		fs::create_dir(&next_profiles)
+			.with_context(|| format!("failed to create staged profiles directory {}", next_profiles.display()))?;
+		let profile_file_names = unique_profile_file_names(&normalized.profiles);
 
-		if let Ok(entries) = fs::read_dir(&self.profiles_dir) {
-			for entry in entries.flatten() {
-				let path = entry.path();
-				if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
-					continue;
-				}
-				let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-					continue;
-				};
-				if !expected_files.contains(file_name) {
-					fs::remove_file(&path).with_context(|| format!("failed to remove stale profile {}", path.display()))?;
-				}
-			}
-		}
-
-		for profile in &normalized.profiles {
+		let mut profile_files = Vec::with_capacity(normalized.profiles.len());
+		for (profile, file_name) in normalized.profiles.iter().zip(profile_file_names) {
 			let sources = normalized
 				.profile_sources
 				.iter()
@@ -308,25 +394,139 @@ impl CoreProfileDocumentStore {
 				pipeline_components: profile.pipeline_components.clone(),
 			};
 			let raw = toml::to_string_pretty(&file).context("failed to format profile TOML")?;
-			let path = self.profiles_dir.join(profile_file_name(profile));
-			fs::write(&path, raw).with_context(|| format!("failed to write profile {}", path.display()))?;
+			let path = next_profiles.join(file_name);
+			profile_files.push((path, raw));
+		}
+		for (path, raw) in profile_files {
+			atomic_write(&path, raw.as_bytes()).with_context(|| format!("failed to write profile {}", path.display()))?;
 		}
 
-		save_profile_metadata(
+		let conf_raw = format_profile_metadata(
 			&self.conf_path,
 			&normalized.selected_profile_id,
 			&normalized.profiles.iter().map(|profile| profile.id.clone()).collect::<Vec<_>>(),
 		)?;
+		atomic_write(&next_conf, conf_raw.as_bytes())?;
+		atomic_write(&marker, b"prepared\n")?;
+		if self.profiles_dir.exists() {
+			fs::rename(&self.profiles_dir, &previous_profiles).with_context(|| {
+				format!(
+					"failed to preserve profiles {} -> {}",
+					self.profiles_dir.display(),
+					previous_profiles.display()
+				)
+			})?;
+		}
+		fs::rename(&next_profiles, &self.profiles_dir)
+			.with_context(|| format!("failed to install profiles {}", self.profiles_dir.display()))?;
+		atomic_write(&self.conf_path, conf_raw.as_bytes())?;
+		remove_path_if_exists(&previous_profiles)?;
+		remove_path_if_exists(&next_conf)?;
+		remove_path_if_exists(&marker)?;
 		Ok(normalized)
+	}
+
+	fn store_root(&self) -> &Path {
+		self.conf_path
+			.parent()
+			.filter(|path| !path.as_os_str().is_empty())
+			.unwrap_or_else(|| Path::new("."))
+	}
+
+	fn acquire_store_lock(&self) -> anyhow::Result<File> {
+		let root = self.store_root();
+		fs::create_dir_all(root).with_context(|| format!("failed to create profile store {}", root.display()))?;
+		let lock_path = root.join(PROFILE_STORE_LOCK_FILE);
+		let lock = OpenOptions::new()
+			.read(true)
+			.write(true)
+			.create(true)
+			.truncate(false)
+			.open(&lock_path)
+			.with_context(|| format!("failed to open profile store lock {}", lock_path.display()))?;
+		lock.lock()
+			.with_context(|| format!("failed to lock profile store {}", lock_path.display()))?;
+		Ok(lock)
+	}
+
+	fn recover_profile_transaction(&self) -> anyhow::Result<()> {
+		let root = self.store_root();
+		let marker = root.join(PROFILE_TRANSACTION_MARKER);
+		if !marker.exists() {
+			return Ok(());
+		}
+		let next_profiles = root.join(NEXT_PROFILES_DIR);
+		let previous_profiles = root.join(PREVIOUS_PROFILES_DIR);
+		let next_conf = root.join(NEXT_CONF_FILE);
+		if !self.profiles_dir.exists() {
+			if next_profiles.exists() {
+				fs::rename(&next_profiles, &self.profiles_dir)
+					.with_context(|| format!("failed to recover profiles {}", self.profiles_dir.display()))?;
+			} else if previous_profiles.exists() {
+				fs::rename(&previous_profiles, &self.profiles_dir)
+					.with_context(|| format!("failed to restore profiles {}", self.profiles_dir.display()))?;
+			}
+		}
+		if self.profiles_dir.exists() && !next_profiles.exists() && next_conf.exists() {
+			let raw = fs::read(&next_conf).with_context(|| format!("failed to read staged conf {}", next_conf.display()))?;
+			atomic_write(&self.conf_path, &raw)?;
+		}
+		remove_path_if_exists(&next_profiles)?;
+		remove_path_if_exists(&previous_profiles)?;
+		remove_path_if_exists(&next_conf)?;
+		remove_path_if_exists(&marker)?;
+		Ok(())
 	}
 }
 
+fn remove_path_if_exists(path: &Path) -> anyhow::Result<()> {
+	if path.is_dir() {
+		fs::remove_dir_all(path).with_context(|| format!("failed to remove directory {}", path.display()))?;
+	} else if path.exists() {
+		fs::remove_file(path).with_context(|| format!("failed to remove file {}", path.display()))?;
+	}
+	Ok(())
+}
+
+pub fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+	let parent = path
+		.parent()
+		.filter(|parent| !parent.as_os_str().is_empty())
+		.unwrap_or_else(|| Path::new("."));
+	fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+	let mut temporary =
+		tempfile::NamedTempFile::new_in(parent).with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
+	temporary
+		.write_all(contents)
+		.with_context(|| format!("failed to write temporary file for {}", path.display()))?;
+	temporary
+		.as_file_mut()
+		.sync_all()
+		.with_context(|| format!("failed to sync temporary file for {}", path.display()))?;
+	temporary
+		.persist(path)
+		.map_err(|error| error.error)
+		.with_context(|| format!("failed to replace {}", path.display()))?;
+	Ok(())
+}
+
 pub fn normalize_profile_document(mut document: CoreProfileDocument) -> CoreProfileDocument {
-	document.profiles.retain(|profile| !profile.id.trim().is_empty());
+	for profile in &mut document.profiles {
+		profile.id = profile.id.trim().to_string();
+	}
+	let mut seen_profile_ids = HashSet::with_capacity(document.profiles.len());
+	document
+		.profiles
+		.retain(|profile| !profile.id.is_empty() && seen_profile_ids.insert(profile.id.clone()));
 	let profile_ids = document.profiles.iter().map(|profile| profile.id.clone()).collect::<HashSet<_>>();
+	for source in &mut document.profile_sources {
+		source.id = source.id.trim().to_string();
+		source.profile_id = source.profile_id.trim().to_string();
+	}
+	let mut seen_source_ids = HashSet::with_capacity(document.profile_sources.len());
 	document
 		.profile_sources
-		.retain(|source| !source.id.trim().is_empty() && profile_ids.contains(&source.profile_id));
+		.retain(|source| !source.id.is_empty() && profile_ids.contains(&source.profile_id) && seen_source_ids.insert(source.id.clone()));
 	for source in &mut document.profile_sources {
 		source.kind = normalize_source_kind(&source.kind);
 		source.protocol = normalize_source_protocol(source.protocol.as_deref(), &source.kind);
@@ -375,6 +575,7 @@ pub fn normalize_profile_document(mut document: CoreProfileDocument) -> CoreProf
 			});
 		}
 	}
+	document.selected_profile_id = document.selected_profile_id.trim().to_string();
 	if !profile_ids.contains(&document.selected_profile_id) {
 		document.selected_profile_id = document.profiles.first().map(|profile| profile.id.clone()).unwrap_or_default();
 	}
@@ -453,6 +654,31 @@ fn has_any_toml(dir: &Path) -> bool {
 		}
 	}
 	false
+}
+
+fn read_bounded_utf8(path: &Path) -> anyhow::Result<String> {
+	let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+	let mut bytes = Vec::new();
+	file.take(MAX_PROFILE_STORE_FILE_BYTES + 1)
+		.read_to_end(&mut bytes)
+		.with_context(|| format!("failed to read {}", path.display()))?;
+	if bytes.len() as u64 > MAX_PROFILE_STORE_FILE_BYTES {
+		bail!(
+			"{} exceeds the profile store file size limit of {MAX_PROFILE_STORE_FILE_BYTES} bytes",
+			path.display()
+		);
+	}
+	String::from_utf8(bytes).with_context(|| format!("{} is not valid UTF-8", path.display()))
+}
+
+fn validate_profile_document_limits(document: &CoreProfileDocument) -> anyhow::Result<()> {
+	if document.profiles.len() > MAX_PROFILE_FILES {
+		bail!("profile document contains more than {MAX_PROFILE_FILES} profiles");
+	}
+	if document.profile_sources.len() > MAX_PROFILE_SOURCES {
+		bail!("profile document contains more than {MAX_PROFILE_SOURCES} sources");
+	}
+	Ok(())
 }
 
 fn default_profiles() -> Vec<CoreProfileDocumentProfile> {
@@ -546,6 +772,27 @@ fn profile_file_name(profile: &CoreProfileDocumentProfile) -> String {
 		normalize_created_at(&profile.created_at, Path::new("")),
 		sanitize_profile_file_label(&profile.name)
 	)
+}
+
+fn unique_profile_file_names(profiles: &[CoreProfileDocumentProfile]) -> Vec<String> {
+	let mut used = HashSet::with_capacity(profiles.len());
+	profiles
+		.iter()
+		.map(|profile| {
+			let base = profile_file_name(profile);
+			if used.insert(base.clone()) {
+				return base;
+			}
+			let stem = base.strip_suffix(".toml").unwrap_or(&base);
+			for suffix in 2_u32.. {
+				let candidate = format!("{stem}-{suffix}.toml");
+				if used.insert(candidate.clone()) {
+					return candidate;
+				}
+			}
+			unreachable!("u32 profile filename suffixes exhausted")
+		})
+		.collect()
 }
 
 fn normalize_created_at(value: &str, path: &Path) -> String {
@@ -657,19 +904,11 @@ pub fn resolve_workspace_conf_path() -> PathBuf {
 	cwd.join(CONF_FILE_NAME)
 }
 
-fn load_active_profile_id(path: &Path) -> Option<String> {
-	let raw = fs::read_to_string(path).ok()?;
-	let doc = raw.parse::<toml::Value>().ok()?;
+fn active_profile_id_from_document(doc: &toml::Value) -> Option<String> {
 	doc.get("desktop")?.get("active_profile_id")?.as_str().map(ToString::to_string)
 }
 
-fn load_profile_order(path: &Path) -> Vec<String> {
-	let Ok(raw) = fs::read_to_string(path) else {
-		return Vec::new();
-	};
-	let Ok(doc) = raw.parse::<toml::Value>() else {
-		return Vec::new();
-	};
+fn profile_order_from_document(doc: &toml::Value) -> Vec<String> {
 	doc.get("desktop")
 		.and_then(|desktop| desktop.get("profile_order"))
 		.and_then(toml::Value::as_array)
@@ -681,6 +920,28 @@ fn load_profile_order(path: &Path) -> Vec<String> {
 				.collect::<Vec<_>>()
 		})
 		.unwrap_or_default()
+}
+
+fn profile_manifest_from_document(doc: &toml::Value) -> Option<HashSet<String>> {
+	let ids = doc.get("desktop")?.get("profile_ids")?.as_array()?;
+	Some(ids.iter().filter_map(toml::Value::as_str).map(ToString::to_string).collect())
+}
+
+fn load_conf_document(path: &Path) -> anyhow::Result<Option<toml::Value>> {
+	match read_bounded_utf8(path) {
+		Ok(raw) => raw
+			.parse::<toml::Value>()
+			.with_context(|| format!("failed to parse {}", path.display()))
+			.map(Some),
+		Err(error)
+			if error
+				.downcast_ref::<std::io::Error>()
+				.is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+		{
+			Ok(None)
+		}
+		Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+	}
 }
 
 fn sort_profiles_by_saved_order(profiles: &mut [CoreProfileDocumentProfile], order: &[String]) {
@@ -699,12 +960,19 @@ fn sort_profiles_by_saved_order(profiles: &mut [CoreProfileDocumentProfile], ord
 	);
 }
 
-fn save_profile_metadata(path: &Path, active_profile_id: &str, profile_order: &[String]) -> anyhow::Result<()> {
-	let mut doc = match fs::read_to_string(path) {
+fn format_profile_metadata(path: &Path, active_profile_id: &str, profile_order: &[String]) -> anyhow::Result<String> {
+	let mut doc = match read_bounded_utf8(path) {
 		Ok(raw) => raw
 			.parse::<toml::Value>()
-			.unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new())),
-		Err(_) => toml::Value::Table(toml::map::Map::new()),
+			.with_context(|| format!("failed to parse {}", path.display()))?,
+		Err(error)
+			if error
+				.downcast_ref::<std::io::Error>()
+				.is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+		{
+			toml::Value::Table(toml::map::Map::new())
+		}
+		Err(error) => return Err(error).with_context(|| format!("failed to read {}", path.display())),
 	};
 	if !doc.is_table() {
 		doc = toml::Value::Table(toml::map::Map::new());
@@ -723,13 +991,58 @@ fn save_profile_metadata(path: &Path, active_profile_id: &str, profile_order: &[
 		"profile_order".to_string(),
 		toml::Value::Array(profile_order.iter().map(|id| toml::Value::String(id.clone())).collect()),
 	);
-	let raw = toml::to_string_pretty(&doc).context("failed to format conf.toml")?;
-	fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))
+	desktop.insert(
+		"profile_ids".to_string(),
+		toml::Value::Array(profile_order.iter().map(|id| toml::Value::String(id.clone())).collect()),
+	);
+	toml::to_string_pretty(&doc).context("failed to format conf.toml")
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn atomic_write_replaces_existing_file_without_leaving_temporary_files() {
+		let root = temp_root("atomic-write");
+		let path = root.join("settings.toml");
+		fs::write(&path, b"old").expect("seed destination");
+
+		atomic_write(&path, b"new").expect("atomic replace");
+
+		assert_eq!(fs::read(&path).expect("replacement"), b"new");
+		assert_eq!(fs::read_dir(&root).expect("root entries").count(), 2);
+	}
+
+	#[test]
+	fn store_keeps_profiles_with_colliding_timestamp_and_name() {
+		let root = temp_root("profile-filename-collision");
+		let store = CoreProfileDocumentStore::from_root(&root);
+		let mut profiles = default_profiles();
+		let mut duplicate = profiles[0].clone();
+		profiles[0].id = "profile-a".to_string();
+		profiles[0].name = "Same Name".to_string();
+		profiles[0].created_at = "20260712T120000Z".to_string();
+		duplicate.id = "profile-b".to_string();
+		duplicate.name = profiles[0].name.clone();
+		duplicate.created_at = profiles[0].created_at.clone();
+		profiles = vec![profiles.remove(0), duplicate];
+
+		store
+			.save(CoreProfileDocument {
+				selected_profile_id: "profile-a".to_string(),
+				profiles,
+				..CoreProfileDocument::default()
+			})
+			.expect("save colliding profiles");
+
+		let loaded = store.load().expect("load profiles");
+		assert_eq!(loaded.profiles.len(), 2);
+		assert!(loaded.profiles.iter().any(|profile| profile.id == "profile-a"));
+		assert!(loaded.profiles.iter().any(|profile| profile.id == "profile-b"));
+		assert_eq!(fs::read_dir(root.join("profiles")).expect("profiles").count(), 2);
+		let _ = fs::remove_dir_all(root);
+	}
 
 	fn temp_root(label: &str) -> PathBuf {
 		let root = std::env::temp_dir().join(format!("un-motion-core-{label}-{}-{}", std::process::id(), now_millis()));
@@ -768,7 +1081,7 @@ mirrorCorrectionEnabled = true
 		)
 		.expect("profile");
 
-		let document = CoreProfileDocumentStore::from_root(&root).load();
+		let document = CoreProfileDocumentStore::from_root(&root).load().expect("load profile document");
 
 		assert_eq!(document.selected_profile_id, "waidayo");
 		assert_eq!(document.profiles[0].name, "Waidayo");
@@ -819,6 +1132,178 @@ mirrorCorrectionEnabled = true
 		);
 		let profile_text = fs::read_to_string(profile_file_for_id(&root, "p2")).expect("profile");
 		assert!(profile_text.contains("host = \"0.0.0.0\""));
+		let stale = profile_text
+			.replace("id = \"p2\"", "id = \"stale\"")
+			.replace("name = \"Profile 2\"", "name = \"Stale\"");
+		fs::write(root.join("profiles/stale.toml"), stale).expect("simulate stale profile after metadata commit");
+		let reloaded = store.load().expect("reload profile document");
+		assert_eq!(
+			reloaded.profiles.iter().map(|profile| profile.id.as_str()).collect::<Vec<_>>(),
+			vec!["p2"]
+		);
+	}
+
+	#[test]
+	fn store_recovers_interrupted_profile_directory_swap() {
+		let root = temp_root("recover-profile-transaction");
+		let store = CoreProfileDocumentStore::from_root(&root);
+		let previous = root.join(PREVIOUS_PROFILES_DIR);
+		let next = root.join(NEXT_PROFILES_DIR);
+		fs::remove_dir(root.join("profiles")).expect("simulate profiles moved aside");
+		fs::create_dir_all(&previous).expect("previous profiles");
+		fs::create_dir_all(&next).expect("next profiles");
+		fs::write(previous.join("old.toml"), "id = \"old\"\nname = \"Old\"\ncreated_at = \"1\"\n").expect("old profile");
+		fs::write(next.join("new.toml"), "id = \"new\"\nname = \"New\"\ncreated_at = \"2\"\n").expect("new profile");
+		fs::write(
+			root.join(NEXT_CONF_FILE),
+			"[desktop]\nactive_profile_id = \"new\"\nprofile_ids = [\"new\"]\n",
+		)
+		.expect("next conf");
+		fs::write(root.join(PROFILE_TRANSACTION_MARKER), "prepared\n").expect("marker");
+
+		let loaded = store.load().expect("recover profile document");
+
+		assert_eq!(loaded.selected_profile_id, "new");
+		assert_eq!(
+			loaded.profiles.iter().map(|profile| profile.id.as_str()).collect::<Vec<_>>(),
+			vec!["new"]
+		);
+		assert!(!previous.exists());
+		assert!(!next.exists());
+		assert!(!root.join(NEXT_CONF_FILE).exists());
+		assert!(!root.join(PROFILE_TRANSACTION_MARKER).exists());
+	}
+
+	#[test]
+	fn store_load_waits_for_process_wide_file_lock() {
+		let root = temp_root("profile-store-lock");
+		let store = CoreProfileDocumentStore::from_root(&root);
+		let held_lock = store.acquire_store_lock().expect("hold store lock");
+		let (tx, rx) = std::sync::mpsc::channel();
+		let load_root = root.clone();
+		let join = std::thread::spawn(move || {
+			let result = CoreProfileDocumentStore::from_root(load_root).load();
+			tx.send(result).expect("send load result");
+		});
+
+		assert!(rx.recv_timeout(std::time::Duration::from_millis(30)).is_err());
+		drop(held_lock);
+		assert!(
+			rx.recv_timeout(std::time::Duration::from_secs(1))
+				.expect("load after unlock")
+				.is_ok()
+		);
+		join.join().expect("load thread");
+	}
+
+	#[test]
+	fn store_load_propagates_recovery_errors() {
+		let root = temp_root("profile-recovery-error");
+		fs::write(root.join(PROFILE_TRANSACTION_MARKER), "prepared\n").expect("marker");
+		fs::create_dir(root.join(NEXT_CONF_FILE)).expect("invalid staged conf directory");
+
+		let error = CoreProfileDocumentStore::from_root(&root).load().expect_err("recovery must fail");
+
+		assert!(error.to_string().contains("failed to read staged conf"));
+	}
+
+	#[test]
+	fn store_load_rejects_malformed_profile_and_conf_files() {
+		let profile_root = temp_root("malformed-profile");
+		fs::write(profile_root.join("profiles/broken.toml"), "id = [").expect("broken profile");
+		let profile_error = CoreProfileDocumentStore::from_root(&profile_root)
+			.load()
+			.expect_err("malformed profile must fail");
+		assert!(profile_error.to_string().contains("failed to parse profile"));
+
+		let conf_root = temp_root("malformed-conf");
+		fs::write(conf_root.join("conf.toml"), "[desktop").expect("broken conf");
+		let conf_error = CoreProfileDocumentStore::from_root(&conf_root)
+			.load()
+			.expect_err("malformed conf must fail");
+		assert!(conf_error.to_string().contains("failed to parse"));
+	}
+
+	#[test]
+	fn store_rejects_oversized_profile_files() {
+		let root = temp_root("oversized-profile");
+		let path = root.join("profiles/oversized.toml");
+		File::create(&path)
+			.expect("create oversized profile")
+			.set_len(MAX_PROFILE_STORE_FILE_BYTES + 1)
+			.expect("extend oversized profile");
+
+		let error = CoreProfileDocumentStore::from_root(&root)
+			.load()
+			.expect_err("oversized profile must fail");
+
+		assert!(error.to_string().contains("file size limit"), "{error:#}");
+		let _ = fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn store_rejects_too_many_profile_files() {
+		let root = temp_root("too-many-profiles");
+		for index in 0..=MAX_PROFILE_FILES {
+			fs::write(
+				root.join("profiles").join(format!("profile-{index}.toml")),
+				format!("id = \"profile-{index}\"\nname = \"Profile {index}\"\n"),
+			)
+			.expect("write profile");
+		}
+
+		let error = CoreProfileDocumentStore::from_root(&root)
+			.load()
+			.expect_err("excess profile files must fail");
+
+		assert!(error.to_string().contains("more than 256 profile files"), "{error:#}");
+		let _ = fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn store_rejects_oversized_documents_before_save() {
+		let root = temp_root("oversized-document");
+		let store = CoreProfileDocumentStore::from_root(&root);
+		let profile = default_profiles().remove(0);
+		let too_many_profiles = CoreProfileDocument {
+			profiles: (0..=MAX_PROFILE_FILES)
+				.map(|index| CoreProfileDocumentProfile {
+					id: format!("profile-{index}"),
+					..profile.clone()
+				})
+				.collect(),
+			..CoreProfileDocument::default()
+		};
+		assert!(
+			store
+				.save(too_many_profiles)
+				.expect_err("profile limit")
+				.to_string()
+				.contains("more than 256 profiles")
+		);
+
+		let mut too_many_sources = CoreProfileDocument::default();
+		let profile_id = too_many_sources.profiles[0].id.clone();
+		too_many_sources.profile_sources = (0..=MAX_PROFILE_SOURCES)
+			.map(|index| CoreProfileDocumentSource {
+				id: format!("source-{index}"),
+				profile_id: profile_id.clone(),
+				kind: "vmc-osc".to_string(),
+				label: "Source".to_string(),
+				protocol: None,
+				host: None,
+				port: None,
+				mirror_correction_enabled: false,
+			})
+			.collect();
+		assert!(
+			store
+				.save(too_many_sources)
+				.expect_err("source limit")
+				.to_string()
+				.contains("more than 4096 sources")
+		);
+		let _ = fs::remove_dir_all(root);
 	}
 
 	#[test]
@@ -845,6 +1330,38 @@ mirrorCorrectionEnabled = true
 		assert_eq!(normalized.selected_profile_id, "");
 		assert_eq!(normalized.next_profile_index, default_next_profile_index());
 		assert_eq!(normalized.next_source_index, default_next_source_index());
+	}
+
+	#[test]
+	fn normalize_trims_and_deduplicates_profile_and_source_ids() {
+		let source = |id: &str, profile_id: &str| CoreProfileDocumentSource {
+			id: id.to_string(),
+			profile_id: profile_id.to_string(),
+			kind: "vmc-osc".to_string(),
+			label: id.to_string(),
+			protocol: None,
+			host: None,
+			port: None,
+			mirror_correction_enabled: false,
+		};
+		let normalized = normalize_profile_document(CoreProfileDocument {
+			selected_profile_id: " p1 ".to_string(),
+			profiles: vec![test_document_profile(" p1 ", "first"), test_document_profile("p1", "duplicate")],
+			profile_sources: vec![
+				source(" source-1 ", " p1 "),
+				source("source-1", "p1"),
+				source("source-2", "missing"),
+			],
+			..CoreProfileDocument::default()
+		});
+
+		assert_eq!(normalized.profiles.len(), 1);
+		assert_eq!(normalized.profiles[0].id, "p1");
+		assert_eq!(normalized.profiles[0].name, "first");
+		assert_eq!(normalized.profile_sources.len(), 1);
+		assert_eq!(normalized.profile_sources[0].id, "source-1");
+		assert_eq!(normalized.profile_sources[0].profile_id, "p1");
+		assert_eq!(normalized.selected_profile_id, "p1");
 	}
 
 	#[test]
@@ -880,7 +1397,7 @@ mirrorCorrectionEnabled = true
 				.expect("conf")
 				.contains("active_profile_id = \"\"")
 		);
-		let loaded = store.load();
+		let loaded = store.load().expect("load empty profile document");
 		assert!(loaded.profiles.is_empty());
 		assert_eq!(loaded.selected_profile_id, "");
 	}
@@ -901,7 +1418,7 @@ mirrorCorrectionEnabled = true
 			})
 			.expect("save");
 
-		let loaded = store.load();
+		let loaded = store.load().expect("load ordered profiles");
 
 		assert_eq!(
 			loaded.profiles.iter().map(|profile| profile.id.as_str()).collect::<Vec<_>>(),
@@ -912,7 +1429,7 @@ mirrorCorrectionEnabled = true
 			.parse::<toml::Value>()
 			.expect("conf toml");
 		assert_eq!(
-			load_profile_order(root.join("conf.toml").as_path()),
+			profile_order_from_document(&conf),
 			vec!["third".to_string(), "first".to_string(), "second".to_string()]
 		);
 		assert!(conf.get("desktop").and_then(|desktop| desktop.get("profile_order")).is_some());
@@ -938,7 +1455,7 @@ headEnabled = true
 		)
 		.expect("profile");
 		let store = CoreProfileDocumentStore::from_root(&root);
-		let document = store.load();
+		let document = store.load().expect("load nested runtime selection");
 
 		assert_eq!(
 			document.profiles[0].runtime_selection.as_ref().and_then(|settings| settings.fps),
@@ -1091,6 +1608,49 @@ note = "bundled"
 		assert!(!missing.exists());
 		let copied = store.seed_from_templates(&missing).expect("seed no-op");
 		assert!(!copied);
+	}
+
+	#[test]
+	fn seed_from_templates_rejects_invalid_templates_before_publish() {
+		let user_root = temp_root("seed-invalid-user");
+		let template_root = temp_root("seed-invalid-templates");
+		let template_dir = template_root.join("profiles");
+		fs::write(template_dir.join("valid.toml"), "id = \"valid\"\nname = \"Valid\"\n").expect("write valid template");
+		fs::write(template_dir.join("invalid.toml"), "id = [\n").expect("write invalid template");
+		let store = CoreProfileDocumentStore::from_user_dir(&user_root);
+
+		let error = store.seed_from_templates(&template_dir).expect_err("invalid template must fail");
+
+		assert!(error.to_string().contains("failed to parse profile template"));
+		assert_eq!(fs::read_dir(user_root.join("profiles")).expect("user profiles").count(), 0);
+		assert!(!user_root.join(PROFILE_TRANSACTION_MARKER).exists());
+	}
+
+	#[test]
+	fn seed_from_templates_rejects_duplicate_profile_and_source_ids() {
+		for (case, second) in [
+			("profile", "id = \"same\"\nname = \"Second\"\n"),
+			(
+				"source",
+				"id = \"second\"\nname = \"Second\"\n[[sources]]\nid = \"same-source\"\nkind = \"vmc-osc\"\nlabel = \"B\"\n",
+			),
+		] {
+			let user_root = temp_root(&format!("seed-duplicate-{case}-user"));
+			let template_root = temp_root(&format!("seed-duplicate-{case}-templates"));
+			let template_dir = template_root.join("profiles");
+			fs::write(
+				template_dir.join("first.toml"),
+				"id = \"same\"\nname = \"First\"\n[[sources]]\nid = \"same-source\"\nkind = \"vmc-osc\"\nlabel = \"A\"\n",
+			)
+			.expect("write first template");
+			fs::write(template_dir.join("second.toml"), second).expect("write second template");
+			let store = CoreProfileDocumentStore::from_user_dir(&user_root);
+
+			let error = store.seed_from_templates(&template_dir).expect_err("duplicate id must fail");
+
+			assert!(error.to_string().contains("duplicate"), "{error:#}");
+			assert_eq!(fs::read_dir(user_root.join("profiles")).expect("user profiles").count(), 0);
+		}
 	}
 
 	fn test_document_profile(id: &str, name: &str) -> CoreProfileDocumentProfile {

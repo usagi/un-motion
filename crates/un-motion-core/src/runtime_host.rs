@@ -5,7 +5,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{
 	Arc,
-	mpsc::{self, Receiver, Sender, TryRecvError},
+	atomic::{AtomicBool, Ordering},
+	mpsc::{self, Receiver, Sender, SyncSender, TryRecvError},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -36,6 +37,9 @@ const DEFAULT_VRC_OSC_PARAMETER_PREFIX: &str = "FT";
 const STALE_AFTER_NS: u64 = 500_000_000;
 const LOOP_MAX_SLEEP: Duration = Duration::from_millis(5);
 const FLOW_IDLE_SLEEP: Duration = Duration::from_millis(1);
+const RUNTIME_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(100);
+const RUNTIME_CONTROL_QUEUE_CAPACITY: usize = 64;
+const MAX_CONTROL_MESSAGES_PER_TICK: usize = 64;
 const BUILTIN_UNMOTION_FLOW_ID: &str = "mediapipe-main";
 
 type StatusCallback = Arc<dyn Fn(CoreRuntimeStatusUpdate) + Send + Sync + 'static>;
@@ -356,8 +360,13 @@ const FACE_POSE_MODEL_MAX_MEDIAN_ABS_ROLL: f32 = 0.20;
 const FACE_POSE_MODEL_MAX_NOSE_DROP_MAD: f32 = 0.055;
 
 pub(crate) struct CoreRuntimeHost {
-	control_tx: Sender<CoreRuntimeControl>,
+	control_tx: SyncSender<CoreRuntimeControl>,
 	join: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CoreRuntimeHandle {
+	control_tx: SyncSender<CoreRuntimeControl>,
 }
 
 impl std::fmt::Debug for CoreRuntimeHost {
@@ -368,20 +377,27 @@ impl std::fmt::Debug for CoreRuntimeHost {
 
 impl CoreRuntimeHost {
 	pub(crate) fn spawn(config: CoreRuntimeConfig, status_callback: StatusCallback) -> anyhow::Result<Self> {
-		let (control_tx, control_rx) = mpsc::channel();
+		let (control_tx, control_rx) = runtime_control_channel();
 		let (init_tx, init_rx) = mpsc::channel();
+		let (status_callback, status_enabled) = gated_status_callback(status_callback);
 		let join = thread::spawn(move || run_core_runtime(config, control_rx, init_tx, status_callback));
-		match init_rx
-			.recv_timeout(Duration::from_secs(5))
-			.context("core runtime did not finish startup")?
-		{
-			Ok(()) => Ok(Self {
+		match init_rx.recv_timeout(Duration::from_secs(5)) {
+			Ok(Ok(())) => Ok(Self {
 				control_tx,
 				join: Some(join),
 			}),
-			Err(error) => {
+			Ok(Err(error)) => {
+				status_enabled.store(false, Ordering::Release);
 				let _ = join.join();
 				Err(error)
+			}
+			Err(error) => {
+				status_enabled.store(false, Ordering::Release);
+				cancel_runtime_startup(&control_tx);
+				if join.is_finished() {
+					let _ = join.join();
+				}
+				Err(error).context("core runtime did not finish startup")
 			}
 		}
 	}
@@ -390,6 +406,34 @@ impl CoreRuntimeHost {
 		let _ = self.control_tx.send(CoreRuntimeControl::Stop);
 	}
 
+	pub(crate) fn handle(&self) -> CoreRuntimeHandle {
+		CoreRuntimeHandle {
+			control_tx: self.control_tx.clone(),
+		}
+	}
+
+	pub(crate) fn join(mut self) -> thread::Result<()> {
+		self.stop();
+		if let Some(join) = self.join.take() { join.join() } else { Ok(()) }
+	}
+}
+
+fn gated_status_callback(status_callback: StatusCallback) -> (StatusCallback, Arc<AtomicBool>) {
+	let enabled = Arc::new(AtomicBool::new(true));
+	let callback_enabled = Arc::clone(&enabled);
+	let callback = Arc::new(move |update| {
+		if callback_enabled.load(Ordering::Acquire) {
+			status_callback(update);
+		}
+	});
+	(callback, enabled)
+}
+
+fn cancel_runtime_startup(control_tx: &SyncSender<CoreRuntimeControl>) {
+	let _ = control_tx.try_send(CoreRuntimeControl::Stop);
+}
+
+impl CoreRuntimeHandle {
 	pub(crate) fn calibrate_neutral(
 		&self,
 		valid_sample_count: usize,
@@ -454,11 +498,10 @@ impl CoreRuntimeHost {
 			.recv_timeout(Duration::from_secs(10))
 			.context("face pose model build timed out")?
 	}
+}
 
-	pub(crate) fn join(mut self) -> thread::Result<()> {
-		self.stop();
-		if let Some(join) = self.join.take() { join.join() } else { Ok(()) }
-	}
+fn runtime_control_channel() -> (SyncSender<CoreRuntimeControl>, Receiver<CoreRuntimeControl>) {
+	mpsc::sync_channel(RUNTIME_CONTROL_QUEUE_CAPACITY)
 }
 
 fn analysis_extras_max_samples(duration: Duration) -> usize {
@@ -936,6 +979,7 @@ fn run_core_runtime(
 	let mut last_output_sequences: HashMap<StreamId, u64> = HashMap::new();
 	let mut neutral_calibration: Option<PendingNeutralCalibration> = None;
 	let mut face_pose_model: Option<PendingFacePoseModel> = None;
+	let mut last_runtime_snapshot_at = Instant::now();
 	tracing::info!(
 		frame_streams = config.frame_streams.len(),
 		vmc_output = workers.vmc_output.is_some(),
@@ -945,10 +989,6 @@ fn run_core_runtime(
 	);
 
 	loop {
-		// drain / cadence いずれが先に snapshot を発行しても `output_telemetry.sources` が
-		// 直近の値を反映するよう、ループ先頭で 1 回 atomic load する。worker 側は fetch_add のみで
-		// 競合せず、Supervisor 側はこれを 1.5s 周期で差分→FPS 計算する。
-		workers.refresh_source_telemetry(&mut output_telemetry);
 		let control = drain_control_messages(
 			&control_rx,
 			&workers,
@@ -962,6 +1002,8 @@ fn run_core_runtime(
 			break;
 		}
 		if apply_frame_stream_startup_errors(&workers.frame_stream_errors, &mut latest_states, &mut health) {
+			last_runtime_snapshot_at = Instant::now();
+			workers.refresh_source_telemetry(&mut output_telemetry);
 			status_callback(CoreRuntimeStatusUpdate {
 				active_profile_id: active_profile_id.clone(),
 				running: true,
@@ -978,11 +1020,6 @@ fn run_core_runtime(
 			&mut latest_unmotion_frame,
 			&mut packet_count,
 			&mut health,
-			&active_profile_id,
-			frame_count,
-			&config,
-			&output_telemetry,
-			&status_callback,
 		);
 		collect_pending_neutral_calibration(&mut neutral_calibration, &latest_states);
 		collect_pending_face_pose_model(&mut face_pose_model, &latest_unmotion_frame);
@@ -992,35 +1029,37 @@ fn run_core_runtime(
 
 		let now = Instant::now();
 		let mut sent = false;
-		if cadence.mark_due(now) {
-			if let Some(frame) = select_latest_unsent_frame(&workers.frame_streams, &mut last_output_sequences) {
-				frame_count = frame_count.saturating_add(1);
-				if let Some(vmc_output) = &workers.vmc_output
-					&& vmc_output.send(frame.clone()).is_err()
-				{
-					health = "output disconnected".to_string();
-				}
-				if let Some(vrc_osc_output) = &workers.vrc_osc_output
-					&& vrc_osc_output.send(frame.clone()).is_err()
-				{
-					health = "vrc osc output disconnected".to_string();
-				}
-				if let Some(zenoh_output) = &workers.zenoh_output
-					&& zenoh_output.send(frame).is_err()
-				{
-					health = "zenoh output disconnected".to_string();
-				}
-				sent = true;
-				workers.refresh_source_telemetry(&mut output_telemetry);
-				status_callback(CoreRuntimeStatusUpdate {
-					active_profile_id: active_profile_id.clone(),
-					running: true,
-					health: health.clone(),
-					frame_count,
-					packet_count,
-					runtime_snapshot: Some(runtime_snapshot(&config, &latest_states, RuntimeState::Running, &output_telemetry)),
-				});
+		if cadence.mark_due(now)
+			&& let Some(frame) = select_latest_unsent_frame(&workers.frame_streams, &mut last_output_sequences)
+		{
+			frame_count = frame_count.saturating_add(1);
+			if let Some(vmc_output) = &workers.vmc_output
+				&& vmc_output.send(frame.clone()).is_err()
+			{
+				health = "output disconnected".to_string();
 			}
+			if let Some(vrc_osc_output) = &workers.vrc_osc_output
+				&& vrc_osc_output.send(frame.clone()).is_err()
+			{
+				health = "vrc osc output disconnected".to_string();
+			}
+			if let Some(zenoh_output) = &workers.zenoh_output
+				&& zenoh_output.send(frame).is_err()
+			{
+				health = "zenoh output disconnected".to_string();
+			}
+			sent = true;
+		}
+		if runtime_snapshot_due(&mut last_runtime_snapshot_at, now) {
+			workers.refresh_source_telemetry(&mut output_telemetry);
+			status_callback(CoreRuntimeStatusUpdate {
+				active_profile_id: active_profile_id.clone(),
+				running: true,
+				health: health.clone(),
+				frame_count,
+				packet_count,
+				runtime_snapshot: Some(runtime_snapshot(&config, &latest_states, RuntimeState::Running, &output_telemetry)),
+			});
 		}
 
 		if !control.received && !received_unmotion && !sent {
@@ -1032,11 +1071,11 @@ fn run_core_runtime(
 	// `Arc<SourceStageAtomics>` への参照を 1 つしか残さないが、Capturer の最後の
 	// `runtime_snapshot` に「停止時点の最終値」が乗ったほうが UI で混乱が無い。
 	workers.refresh_source_telemetry(&mut output_telemetry);
-	workers.stop();
+	let shutdown_error = workers.stop(&mut health, &mut output_telemetry);
 	status_callback(CoreRuntimeStatusUpdate {
 		active_profile_id,
 		running: false,
-		health: "stopped".to_string(),
+		health: shutdown_error.map_or_else(|| "stopped".to_string(), |error| format!("failed: {error}")),
 		frame_count,
 		packet_count,
 		runtime_snapshot: Some(runtime_snapshot(&config, &latest_states, RuntimeState::Stopped, &output_telemetry)),
@@ -1088,7 +1127,7 @@ fn drain_control_messages(
 	latest_unmotion_frame: &Option<Arc<UNMotionFrame>>,
 ) -> ControlDrainResult {
 	let mut result = ControlDrainResult::default();
-	loop {
+	for _ in 0..MAX_CONTROL_MESSAGES_PER_TICK {
 		match control_rx.try_recv() {
 			Ok(CoreRuntimeControl::Stop) | Err(TryRecvError::Disconnected) => {
 				result.stop = true;
@@ -1152,6 +1191,7 @@ fn drain_control_messages(
 			Err(TryRecvError::Empty) => return result,
 		}
 	}
+	result
 }
 
 fn capture_unmotion_frame_modifier(config: &CoreRuntimeConfig) -> &ModifierConfig {
@@ -1380,7 +1420,7 @@ fn median_f32(values: &mut [f32]) -> Option<f32> {
 	}
 	values.sort_by(|a, b| a.total_cmp(b));
 	let mid = values.len() / 2;
-	if values.len() % 2 == 0 {
+	if values.len().is_multiple_of(2) {
 		Some((values[mid - 1] + values[mid]) * 0.5)
 	} else {
 		Some(values[mid])
@@ -1656,18 +1696,12 @@ fn quat_from_rotation_matrix(m: [[f32; 3]; 3]) -> [f32; 4] {
 	normalize_quat_array([(m[0][2] + m[2][0]) / s, (m[1][2] + m[2][1]) / s, 0.25 * s, (m[1][0] - m[0][1]) / s])
 }
 
-#[allow(clippy::too_many_arguments)]
 fn refresh_latest_motion_frames(
 	frame_streams: &[LatestMotionFrameStreamWorkerHandle],
 	latest_states: &mut HashMap<StreamId, Arc<StreamState>>,
 	latest_unmotion_frame: &mut Option<Arc<un_motion_frame::UNMotionFrame>>,
 	packet_count: &mut u64,
 	health: &mut String,
-	active_profile_id: &str,
-	frame_count: u64,
-	config: &CoreRuntimeConfig,
-	output_telemetry: &OutputTelemetry,
-	status_callback: &StatusCallback,
 ) -> bool {
 	refresh_latest_motion_frames_from_loaded(
 		frame_streams.iter().filter_map(|handle| handle.slot.load()),
@@ -1675,31 +1709,20 @@ fn refresh_latest_motion_frames(
 		latest_unmotion_frame,
 		packet_count,
 		health,
-		active_profile_id,
-		frame_count,
-		config,
-		output_telemetry,
-		status_callback,
 	)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn refresh_latest_motion_frames_from_loaded(
 	latest_frames: impl Iterator<Item = Arc<LatestMotionFrame>>,
 	latest_states: &mut HashMap<StreamId, Arc<StreamState>>,
 	latest_unmotion_frame: &mut Option<Arc<un_motion_frame::UNMotionFrame>>,
 	packet_count: &mut u64,
 	health: &mut String,
-	active_profile_id: &str,
-	frame_count: u64,
-	config: &CoreRuntimeConfig,
-	output_telemetry: &OutputTelemetry,
-	status_callback: &StatusCallback,
 ) -> bool {
 	let mut received = false;
 	for latest in latest_frames {
-		let previous = latest_states.get(&latest.stream_id).and_then(|state| state.last_event_at_ns);
-		if previous == latest.state.last_event_at_ns {
+		let previous_packet_count = latest_states.get(&latest.stream_id).map(|state| state.packet_count);
+		if previous_packet_count == Some(latest.state.packet_count) {
 			continue;
 		}
 		received = true;
@@ -1707,14 +1730,6 @@ fn refresh_latest_motion_frames_from_loaded(
 		*health = "streaming".to_string();
 		*latest_unmotion_frame = Some(latest.frame.clone());
 		latest_states.insert(latest.stream_id.clone(), latest.state.clone());
-		status_callback(CoreRuntimeStatusUpdate {
-			active_profile_id: active_profile_id.to_string(),
-			running: true,
-			health: health.clone(),
-			frame_count,
-			packet_count: *packet_count,
-			runtime_snapshot: Some(runtime_snapshot(config, latest_states, RuntimeState::Running, output_telemetry)),
-		});
 	}
 	received
 }
@@ -1754,6 +1769,14 @@ fn runtime_snapshot(
 			.collect(),
 		output_telemetry: output_telemetry.clone(),
 	}
+}
+
+fn runtime_snapshot_due(last_published_at: &mut Instant, now: Instant) -> bool {
+	if now.saturating_duration_since(*last_published_at) < RUNTIME_SNAPSHOT_INTERVAL {
+		return false;
+	}
+	*last_published_at = now;
+	true
 }
 
 fn drain_output_messages(output_rx: &Receiver<VmcOutputEvent>, health: &mut String, output_telemetry: &mut OutputTelemetry) {
@@ -1983,19 +2006,39 @@ impl CoreRuntimeWorkers {
 		})
 	}
 
-	fn stop(self) {
+	fn stop(self, health: &mut String, output_telemetry: &mut OutputTelemetry) -> Option<String> {
+		let mut join_error = None;
 		for stream in self.frame_streams {
-			let _ = stream.join();
+			let stream_id = stream.stream_id.0.clone();
+			record_worker_join_result(&format!("Motion frame stream {stream_id}"), stream.join(), &mut join_error);
 		}
 		if let Some(output) = self.vmc_output {
-			let _ = output.join();
+			record_worker_join_result("VMC output", output.join(), &mut join_error);
 		}
 		if let Some(output) = self.vrc_osc_output {
-			let _ = output.join();
+			record_worker_join_result("VRC OSC output", output.join(), &mut join_error);
 		}
 		if let Some(output) = self.zenoh_output {
-			let _ = output.join();
+			record_worker_join_result("Zenoh output", output.join(), &mut join_error);
 		}
+		drain_output_messages(&self.output_event_rx, health, output_telemetry);
+		drain_vrc_osc_output_messages(&self.vrc_osc_event_rx, health, output_telemetry);
+		drain_zenoh_output_messages(&self.zenoh_event_rx, health, output_telemetry);
+		join_error
+	}
+}
+
+fn record_worker_join_result(label: &str, result: thread::Result<()>, join_error: &mut Option<String>) {
+	if let Err(payload) = result {
+		let message = if let Some(message) = payload.downcast_ref::<String>() {
+			message.as_str()
+		} else if let Some(message) = payload.downcast_ref::<&'static str>() {
+			message
+		} else {
+			"non-string panic payload"
+		};
+		*join_error = Some(format!("{label} worker panicked: {message}"));
+		tracing::error!(worker = label, panic = message, "runtime worker failed during shutdown");
 	}
 }
 
@@ -2213,6 +2256,53 @@ mod tests {
 	use un_motion_frame::{ExpressionSample, FaceMotion, SampleState, TrackingState, UNMotionFrame};
 	use un_motion_profile_schema::{CoreProfileDocument, CoreProfileDocumentProfile};
 	use un_motion_runtime::{LatestMotionFrame, LatestMotionFrameSlot, StreamHealth, stream_state_from_unmotion_frame};
+
+	#[test]
+	fn runtime_control_channel_is_bounded() {
+		let (tx, _rx) = runtime_control_channel();
+		for _ in 0..RUNTIME_CONTROL_QUEUE_CAPACITY {
+			tx.try_send(CoreRuntimeControl::Stop).expect("queue slot");
+		}
+		assert!(matches!(
+			tx.try_send(CoreRuntimeControl::Stop),
+			Err(std::sync::mpsc::TrySendError::Full(CoreRuntimeControl::Stop))
+		));
+	}
+
+	#[test]
+	fn cancelled_runtime_startup_queues_stop_control() {
+		let (control_tx, control_rx) = runtime_control_channel();
+		cancel_runtime_startup(&control_tx);
+		assert!(matches!(control_rx.try_recv(), Ok(CoreRuntimeControl::Stop)));
+	}
+
+	#[test]
+	fn failed_runtime_startup_disables_status_callback() {
+		let (status_tx, status_rx) = mpsc::channel();
+		let callback: StatusCallback = Arc::new(move |update| {
+			let _ = status_tx.send(update);
+		});
+		let (callback, enabled) = gated_status_callback(callback);
+		enabled.store(false, Ordering::Release);
+		callback(CoreRuntimeStatusUpdate {
+			active_profile_id: "default".to_string(),
+			running: false,
+			health: "stopped".to_string(),
+			frame_count: 0,
+			packet_count: 0,
+			runtime_snapshot: None,
+		});
+		assert!(matches!(status_rx.try_recv(), Err(TryRecvError::Empty)));
+	}
+
+	#[test]
+	fn worker_join_panics_are_preserved_for_final_status() {
+		let mut error = None;
+		record_worker_join_result("VMC output", Ok(()), &mut error);
+		assert!(error.is_none());
+		record_worker_join_result("VMC output", Err(Box::new("send panic")), &mut error);
+		assert_eq!(error.as_deref(), Some("VMC output worker panicked: send panic"));
+	}
 
 	fn profile(runtime_selection: Option<ProfileRuntimeSettings>) -> CoreProfileDocumentProfile {
 		CoreProfileDocumentProfile {
@@ -2631,10 +2721,6 @@ mod tests {
 			frame_streams: vec![test_frame_stream_config("mediapipe-main")],
 		};
 		let mut latest_states = initial_stream_states(&config);
-		let (status_tx, status_rx) = mpsc::channel();
-		let status_callback: StatusCallback = Arc::new(move |update| {
-			let _ = status_tx.send(update);
-		});
 		let mut frame = UNMotionFrame::new(7);
 		frame.face = Some(FaceMotion {
 			tracking_state: TrackingState::Valid,
@@ -2654,13 +2740,11 @@ mod tests {
 		slot.store(LatestMotionFrame {
 			stream_id: StreamId::new("unmotion:mediapipe-main"),
 			frame: Arc::new(frame),
-			snapshot: state.snapshot_at(observed_at_ns, STALE_AFTER_NS),
 			state: Arc::new(state),
 		});
 		let mut packet_count = 0;
 		let mut health = String::new();
 
-		let output_telemetry = OutputTelemetry::default();
 		let mut latest_unmotion_frame = None;
 		let received = refresh_latest_motion_frames_from_loaded(
 			std::iter::once(slot.load().expect("latest frame")),
@@ -2668,25 +2752,55 @@ mod tests {
 			&mut latest_unmotion_frame,
 			&mut packet_count,
 			&mut health,
-			"unmotion-profile",
-			0,
-			&config,
-			&output_telemetry,
-			&status_callback,
 		);
 
 		assert!(received);
 		assert_eq!(packet_count, 1);
 		assert_eq!(health, "streaming");
 		assert_eq!(latest_states[&StreamId::new("unmotion:mediapipe-main")].blendshapes["jawOpen"], 0.7);
-		let update = status_rx.recv_timeout(Duration::from_secs(1)).expect("status");
-		let snapshot = update.runtime_snapshot.expect("snapshot");
+		let snapshot = runtime_snapshot(&config, &latest_states, RuntimeState::Running, &OutputTelemetry::default());
 		assert!(
 			snapshot
 				.streams
 				.iter()
 				.any(|stream| stream.stream_id == StreamId::new("unmotion:mediapipe-main") && stream.health == StreamHealth::Live)
 		);
+	}
+
+	#[test]
+	fn runtime_host_refreshes_frames_without_motion_events() {
+		let config = CoreRuntimeConfig {
+			active_profile_id: "unmotion-profile".to_string(),
+			fps: 60,
+			vmc_output: None,
+			vrc_osc_output: None,
+			zenoh_output: None,
+			frame_streams: vec![test_frame_stream_config("mediapipe-main")],
+		};
+		let mut latest_states = initial_stream_states(&config);
+		let stream_id = StreamId::new("unmotion:mediapipe-main");
+		let frame = UNMotionFrame::new(8);
+		let state = stream_state_from_unmotion_frame(stream_id.clone(), &frame, now_unix_ns());
+		assert_eq!(state.last_event_at_ns, None);
+		assert_eq!(state.packet_count, 1);
+		let latest = LatestMotionFrame {
+			stream_id: stream_id.clone(),
+			frame: Arc::new(frame),
+			state: Arc::new(state),
+		};
+		let mut latest_frame = None;
+		let mut packet_count = 0;
+		let mut health = String::new();
+
+		assert!(refresh_latest_motion_frames_from_loaded(
+			std::iter::once(Arc::new(latest)),
+			&mut latest_states,
+			&mut latest_frame,
+			&mut packet_count,
+			&mut health,
+		));
+		assert_eq!(latest_states[&stream_id].packet_count, 1);
+		assert_eq!(latest_frame.expect("latest frame").header.sequence, 8);
 	}
 
 	#[test]
@@ -2712,7 +2826,6 @@ mod tests {
 			slot.store(LatestMotionFrame {
 				stream_id: StreamId::new("unmotion:vmc-main"),
 				frame: Arc::new(frame),
-				snapshot: state.snapshot_at(observed_at_ns, STALE_AFTER_NS),
 				state: Arc::new(state),
 			});
 		}
@@ -2898,6 +3011,37 @@ mod tests {
 		assert_eq!(vrc_osc.sent_datagrams, 4);
 		assert_eq!(vrc_osc.sent_packets, 12);
 		assert_eq!(vrc_osc.target_addr.as_deref(), Some("127.0.0.1:9000"));
+	}
+
+	#[test]
+	fn runtime_snapshot_cadence_limits_high_frequency_updates() {
+		let start = Instant::now();
+		let mut last = start;
+		assert!(!runtime_snapshot_due(&mut last, start + Duration::from_millis(99)));
+		assert_eq!(last, start);
+		assert!(runtime_snapshot_due(&mut last, start + Duration::from_millis(100)));
+		assert_eq!(last, start + Duration::from_millis(100));
+		assert!(!runtime_snapshot_due(&mut last, start + Duration::from_millis(150)));
+		assert!(runtime_snapshot_due(&mut last, start + Duration::from_millis(200)));
+	}
+
+	#[test]
+	fn runtime_snapshot_reclassifies_silent_stream_as_stale() {
+		let config = CoreRuntimeConfig {
+			active_profile_id: "unmotion-profile".to_string(),
+			fps: 60,
+			vmc_output: None,
+			vrc_osc_output: None,
+			zenoh_output: None,
+			frame_streams: vec![test_frame_stream_config("mediapipe-main")],
+		};
+		let mut latest_states = initial_stream_states(&config);
+		let stream_id = StreamId::new("unmotion:mediapipe-main");
+		let state = Arc::make_mut(latest_states.get_mut(&stream_id).expect("stream state"));
+		state.last_event_at_ns = Some(1_000);
+		let snapshot = runtime_snapshot(&config, &latest_states, RuntimeState::Running, &OutputTelemetry::default());
+		let health = &snapshot.streams[0].health;
+		assert!(matches!(health, StreamHealth::Stale { .. }));
 	}
 
 	#[test]

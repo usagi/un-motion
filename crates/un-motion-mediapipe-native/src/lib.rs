@@ -258,6 +258,23 @@ pub struct RgbImageRef<'a> {
 	pub stride: u32,
 }
 
+fn validate_rgb_image(image: RgbImageRef<'_>) -> anyhow::Result<()> {
+	if image.bytes.is_empty() || image.width == 0 || image.height == 0 || image.stride == 0 {
+		anyhow::bail!("RGB image must have non-empty bytes and non-zero dimensions");
+	}
+	let minimum_stride = image.width.checked_mul(3).context("RGB image width overflows row size")?;
+	if image.stride < minimum_stride {
+		anyhow::bail!("RGB image stride is shorter than width * 3");
+	}
+	let minimum_len = (image.stride as usize)
+		.checked_mul(image.height as usize)
+		.context("RGB image stride * height overflows buffer size")?;
+	if image.bytes.len() < minimum_len {
+		anyhow::bail!("RGB image buffer is shorter than stride * height");
+	}
+	Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct NativeMediaPipeOutput {
 	pub return_code: i32,
@@ -336,7 +353,6 @@ pub struct NativeMediaPipeRuntime {
 	api: Arc<NativeMediaPipeApi>,
 	handle: NonNull<c_void>,
 	options: NativeMediaPipeOptions,
-	running_mode: u32,
 	last_timestamp_ms: i64,
 	last_live_stream_output_timestamp_ms: i64,
 }
@@ -454,59 +470,72 @@ impl NativeMediaPipeRuntime {
 			api,
 			handle,
 			options,
-			running_mode: options.running_mode,
 			last_timestamp_ms: -1,
 			last_live_stream_output_timestamp_ms: -1,
 		})
 	}
 
 	pub fn process_rgb(&mut self, image: RgbImageRef<'_>) -> anyhow::Result<NativeMediaPipeOutput> {
-		self.process_rgb_with_options(image, false)
+		self.process_rgb_boxed(image).map(|output| *output)
 	}
 
 	pub fn process_rgb_at(&mut self, image: RgbImageRef<'_>, timestamp_ms: i64) -> anyhow::Result<NativeMediaPipeOutput> {
-		self.process_rgb_at_with_options(image, timestamp_ms, false)
+		self.process_rgb_at_boxed(image, timestamp_ms).map(|output| *output)
 	}
 
 	pub fn process_rgb_everything(&mut self, image: RgbImageRef<'_>) -> anyhow::Result<NativeMediaPipeOutput> {
-		self.process_rgb_with_options(image, true)
+		self.process_rgb_everything_boxed(image).map(|output| *output)
 	}
 
 	pub fn process_rgb_everything_at(&mut self, image: RgbImageRef<'_>, timestamp_ms: i64) -> anyhow::Result<NativeMediaPipeOutput> {
-		self.process_rgb_at_with_options(image, timestamp_ms, true)
+		self.process_rgb_everything_at_boxed(image, timestamp_ms).map(|output| *output)
 	}
 
 	pub fn poll_latest(&mut self, include_gestures: bool) -> anyhow::Result<NativeMediaPipeOutput> {
-		let mut pose = NativePose::default();
-		let mut hands = NativeHands::default();
-		let mut face = NativeFace::default();
-		let mut gestures = NativeGestures::default();
-		let mut holistic = NativeHolistic::default();
+		self.poll_latest_boxed(include_gestures).map(|output| *output)
+	}
+
+	pub fn process_rgb_boxed(&mut self, image: RgbImageRef<'_>) -> anyhow::Result<Box<NativeMediaPipeOutput>> {
+		self.process_rgb_with_options_boxed(image, false)
+	}
+
+	pub fn process_rgb_at_boxed(&mut self, image: RgbImageRef<'_>, timestamp_ms: i64) -> anyhow::Result<Box<NativeMediaPipeOutput>> {
+		self.process_rgb_at_with_options_boxed(image, timestamp_ms, false)
+	}
+
+	pub fn process_rgb_everything_boxed(&mut self, image: RgbImageRef<'_>) -> anyhow::Result<Box<NativeMediaPipeOutput>> {
+		self.process_rgb_with_options_boxed(image, true)
+	}
+
+	pub fn process_rgb_everything_at_boxed(
+		&mut self,
+		image: RgbImageRef<'_>,
+		timestamp_ms: i64,
+	) -> anyhow::Result<Box<NativeMediaPipeOutput>> {
+		self.process_rgb_at_with_options_boxed(image, timestamp_ms, true)
+	}
+
+	pub fn poll_latest_boxed(&mut self, include_gestures: bool) -> anyhow::Result<Box<NativeMediaPipeOutput>> {
+		let mut output = Box::new(NativeMediaPipeOutput::default());
 		let min_result_timestamp_ms = self.last_live_stream_output_timestamp_ms.saturating_add(1);
 		let (return_code, result_timestamp_ms) = self.poll_latest_at(
 			min_result_timestamp_ms,
 			include_gestures,
 			0,
-			&mut pose,
-			&mut hands,
-			&mut face,
-			&mut gestures,
-			&mut holistic,
+			&mut output.pose,
+			&mut output.hands,
+			&mut output.face,
+			&mut output.gestures,
+			&mut output.holistic,
 		)?;
-		if return_code != 30 {
-			if let Some(latest_timestamp_ms) = result_timestamp_ms {
-				self.last_live_stream_output_timestamp_ms = latest_timestamp_ms;
-			}
+		if return_code != 30
+			&& let Some(latest_timestamp_ms) = result_timestamp_ms
+		{
+			self.last_live_stream_output_timestamp_ms = latest_timestamp_ms;
 		}
-		Ok(NativeMediaPipeOutput {
-			return_code,
-			result_timestamp_ms,
-			pose,
-			hands,
-			face,
-			gestures,
-			holistic,
-		})
+		output.return_code = return_code;
+		output.result_timestamp_ms = result_timestamp_ms;
+		Ok(output)
 	}
 
 	pub fn live_stream_stats(&mut self) -> Option<NativeLiveStreamStats> {
@@ -516,52 +545,50 @@ impl NativeMediaPipeRuntime {
 		(return_code == 0).then_some(stats)
 	}
 
-	fn process_rgb_with_options(&mut self, image: RgbImageRef<'_>, include_gestures: bool) -> anyhow::Result<NativeMediaPipeOutput> {
-		self.process_rgb_at_with_options(image, 0, include_gestures)
+	fn process_rgb_with_options_boxed(
+		&mut self,
+		image: RgbImageRef<'_>,
+		include_gestures: bool,
+	) -> anyhow::Result<Box<NativeMediaPipeOutput>> {
+		self.process_rgb_at_with_options_boxed(image, 0, include_gestures)
 	}
 
-	fn process_rgb_at_with_options(
+	fn process_rgb_at_with_options_boxed(
 		&mut self,
 		image: RgbImageRef<'_>,
 		mut timestamp_ms: i64,
 		include_gestures: bool,
-	) -> anyhow::Result<NativeMediaPipeOutput> {
-		if image.bytes.is_empty() || image.width == 0 || image.height == 0 || image.stride == 0 {
-			anyhow::bail!("RGB image must have non-empty bytes and non-zero dimensions");
-		}
+	) -> anyhow::Result<Box<NativeMediaPipeOutput>> {
+		validate_rgb_image(image)?;
 		if timestamp_ms <= self.last_timestamp_ms {
 			timestamp_ms = self.last_timestamp_ms.saturating_add(1);
 		}
 		self.last_timestamp_ms = timestamp_ms;
 
-		let mut pose = NativePose::default();
-		let mut hands = NativeHands::default();
-		let mut face = NativeFace::default();
-		let mut gestures = NativeGestures::default();
-		let mut holistic = NativeHolistic::default();
+		let mut output = Box::new(NativeMediaPipeOutput::default());
 		let using_holistic = self.options.enable_holistic != 0;
 		let pose_ptr = if self.options.enable_pose != 0 && !using_holistic {
-			&mut pose
+			&mut output.pose
 		} else {
 			std::ptr::null_mut()
 		};
 		let hands_ptr = if self.options.enable_hands != 0 && !using_holistic {
-			&mut hands
+			&mut output.hands
 		} else {
 			std::ptr::null_mut()
 		};
 		let face_ptr = if self.options.enable_face != 0 && !using_holistic {
-			&mut face
+			&mut output.face
 		} else {
 			std::ptr::null_mut()
 		};
 		let gestures_ptr = if include_gestures && self.options.enable_gestures != 0 {
-			&mut gestures
+			&mut output.gestures
 		} else {
 			std::ptr::null_mut()
 		};
 		let holistic_ptr = if self.options.enable_holistic != 0 {
-			&mut holistic
+			&mut output.holistic
 		} else {
 			std::ptr::null_mut()
 		};
@@ -654,29 +681,11 @@ impl NativeMediaPipeRuntime {
 			}
 		};
 
-		if self.running_mode == RUNNING_MODE_LIVE_STREAM {
-			return Ok(NativeMediaPipeOutput {
-				return_code,
-				result_timestamp_ms: None,
-				pose,
-				hands,
-				face,
-				gestures,
-				holistic,
-			});
-		}
-
-		Ok(NativeMediaPipeOutput {
-			return_code,
-			result_timestamp_ms: None,
-			pose,
-			hands,
-			face,
-			gestures,
-			holistic,
-		})
+		output.return_code = return_code;
+		Ok(output)
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn poll_latest_at(
 		&mut self,
 		timestamp_ms: i64,
@@ -771,12 +780,11 @@ pub fn resolve_media_pipe_root(input: &Path) -> anyhow::Result<PathBuf> {
 	if input.join("models/pose_landmarker_lite.task").exists() {
 		return Ok(input.to_path_buf());
 	}
-	if input.file_name().is_some_and(|name| name == "mediapipe") {
-		if let Some(root) = input.parent().and_then(Path::parent) {
-			if root.join("models/pose_landmarker_lite.task").exists() {
-				return Ok(root.to_path_buf());
-			}
-		}
+	if input.file_name().is_some_and(|name| name == "mediapipe")
+		&& let Some(root) = input.parent().and_then(Path::parent)
+		&& root.join("models/pose_landmarker_lite.task").exists()
+	{
+		return Ok(root.to_path_buf());
 	}
 	anyhow::bail!(
 		"failed to locate media-pipe models from {}; pass media-pipe root or native/mediapipe directory",
@@ -812,5 +820,51 @@ mod tests {
 		assert_eq!(std::mem::size_of::<NativeHand>(), 20 * HAND_LANDMARK_COUNT * 2 + 20);
 		assert_eq!(std::mem::size_of::<NativeFaceBlendshape>(), BLENDSHAPE_NAME_BYTES + 4);
 		assert_eq!(std::mem::size_of::<NativeGestureCategory>(), GESTURE_NAME_BYTES + 4);
+	}
+
+	#[test]
+	fn rgb_image_validation_rejects_short_stride_and_buffer() {
+		let bytes = [0_u8; 12];
+		assert!(
+			validate_rgb_image(RgbImageRef {
+				bytes: &bytes,
+				width: 2,
+				height: 2,
+				stride: 5
+			})
+			.is_err()
+		);
+		assert!(
+			validate_rgb_image(RgbImageRef {
+				bytes: &bytes[..11],
+				width: 2,
+				height: 2,
+				stride: 6
+			})
+			.is_err()
+		);
+		assert!(
+			validate_rgb_image(RgbImageRef {
+				bytes: &bytes,
+				width: 2,
+				height: 2,
+				stride: 6
+			})
+			.is_ok()
+		);
+	}
+
+	#[test]
+	fn rgb_image_validation_rejects_dimension_overflow() {
+		let bytes = [0_u8; 1];
+		assert!(
+			validate_rgb_image(RgbImageRef {
+				bytes: &bytes,
+				width: u32::MAX,
+				height: 1,
+				stride: u32::MAX,
+			})
+			.is_err()
+		);
 	}
 }

@@ -3,9 +3,12 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::OnceLock;
 
 use anyhow::Context;
-use rosc::{OscBundle, OscMessage, OscPacket, OscTime, OscType, encoder};
+use rosc::{OscMessage, OscPacket, OscType, encoder};
 use un_motion_frame::{Finger, HandMotion, HumanoidBone, MotionSignalValue, Quatf, TransformSample, UNMotionFrame, Vec3f};
 use un_motion_interfaces::OutputSink;
+
+pub const VMC_MAX_DATAGRAM_BYTES: usize = 1_200;
+pub const VMC_MAX_NAME_BYTES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BlendshapeRoute {
@@ -129,12 +132,11 @@ pub fn vmc_signal_pose_for_unmotion_frame_with_options(
 		}
 	}
 	for signal in &frame.signals {
-		if let Some(route) = blendshape_map.get(&signal.name) {
-			if let MotionSignalValue::Scalar(value) = signal.value {
-				if !pose.blendshapes.iter().any(|(name, _)| name == &route.blendshape_name) {
-					pose.blendshapes.push((route.blendshape_name.clone(), route.map_value(value)));
-				}
-			}
+		if let Some(route) = blendshape_map.get(&signal.name)
+			&& let MotionSignalValue::Scalar(value) = signal.value
+			&& !pose.blendshapes.iter().any(|(name, _)| name == &route.blendshape_name)
+		{
+			pose.blendshapes.push((route.blendshape_name.clone(), route.map_value(value)));
 		}
 	}
 	pose
@@ -200,14 +202,6 @@ impl VmcOutputSink {
 		self.chest_stabilization = ChestStabilizationOptions::new(enabled, strength);
 	}
 
-	fn send_packet(&self, packet: OscPacket) -> anyhow::Result<()> {
-		let encoded = encoder::encode(&packet).context("OSC encode failed")?;
-		self.socket
-			.send_to(&encoded, self.target)
-			.with_context(|| format!("VMC UDP send failed: {}", self.target))?;
-		Ok(())
-	}
-
 	pub fn send_raw_datagram(&self, datagram: &[u8]) -> anyhow::Result<()> {
 		self.socket
 			.send_to(datagram, self.target)
@@ -216,11 +210,49 @@ impl VmcOutputSink {
 	}
 
 	fn send_packets_as_bundle(&self, packets: Vec<OscPacket>) -> anyhow::Result<()> {
-		self.send_packet(OscPacket::Bundle(OscBundle {
-			timetag: OscTime { seconds: 0, fractional: 1 },
-			content: packets,
-		}))
+		for datagram in encode_vmc_datagrams(packets)? {
+			self.socket
+				.send_to(&datagram, self.target)
+				.with_context(|| format!("VMC UDP send failed: {}", self.target))?;
+		}
+		Ok(())
 	}
+}
+
+pub fn encode_vmc_datagrams(packets: Vec<OscPacket>) -> anyhow::Result<Vec<Vec<u8>>> {
+	let mut datagrams = Vec::new();
+	let mut current_packets = Vec::new();
+	let mut current_len = 16usize;
+	for packet in packets {
+		let encoded = encoder::encode(&packet).context("VMC OSC packet encode failed")?;
+		let bundled_len = 4usize.saturating_add(encoded.len());
+		if 16usize.saturating_add(bundled_len) > VMC_MAX_DATAGRAM_BYTES {
+			anyhow::bail!("VMC OSC packet exceeds {VMC_MAX_DATAGRAM_BYTES} byte datagram limit");
+		}
+		if current_len.saturating_add(bundled_len) > VMC_MAX_DATAGRAM_BYTES {
+			datagrams.push(encode_bundle_elements(&current_packets, current_len));
+			current_packets.clear();
+			current_len = 16;
+		}
+		current_len += bundled_len;
+		current_packets.push(encoded);
+	}
+	if !current_packets.is_empty() {
+		datagrams.push(encode_bundle_elements(&current_packets, current_len));
+	}
+	Ok(datagrams)
+}
+
+fn encode_bundle_elements(elements: &[Vec<u8>], encoded_len: usize) -> Vec<u8> {
+	let mut bundle = Vec::with_capacity(encoded_len);
+	bundle.extend_from_slice(b"#bundle\0");
+	bundle.extend_from_slice(&0u32.to_be_bytes());
+	bundle.extend_from_slice(&1u32.to_be_bytes());
+	for element in elements {
+		bundle.extend_from_slice(&(element.len() as u32).to_be_bytes());
+		bundle.extend_from_slice(element);
+	}
+	bundle
 }
 
 impl OutputSink<UNMotionFrame> for VmcOutputSink {
@@ -251,7 +283,7 @@ fn vmc_packets_for_frame_with_options(
 	if send_ok_packet {
 		packets.push(OscPacket::Message(OscMessage {
 			addr: "/VMC/Ext/OK".to_string(),
-			args: vec![OscType::Int(1)],
+			args: vec![OscType::Int(vmc_tracking_ok(frame))],
 		}));
 	}
 
@@ -270,6 +302,9 @@ fn vmc_packets_for_frame_with_options(
 			} else {
 				(expression.name.clone(), expression.value.clamp(0.0, 1.0))
 			};
+			if !valid_vmc_name(&name) {
+				continue;
+			}
 			packets.push(OscPacket::Message(OscMessage {
 				addr: "/VMC/Ext/Blend/Val".to_string(),
 				args: vec![OscType::String(name), OscType::Float(value)],
@@ -286,6 +321,25 @@ fn vmc_packets_for_frame_with_options(
 	}
 
 	packets
+}
+
+fn valid_vmc_name(name: &str) -> bool {
+	!name.is_empty() && name.len() <= VMC_MAX_NAME_BYTES
+}
+
+fn vmc_tracking_ok(frame: &UNMotionFrame) -> i32 {
+	let states = [
+		frame.body.as_ref().map(|body| body.tracking_state),
+		frame.face.as_ref().map(|face| face.tracking_state),
+	];
+	let mut observed = false;
+	for state in states.into_iter().flatten() {
+		observed = true;
+		if state != un_motion_frame::TrackingState::Lost {
+			return 1;
+		}
+	}
+	if observed { 0 } else { 1 }
 }
 
 fn vmc_packet_capacity_hint(frame: &UNMotionFrame, send_ok_packet: bool) -> usize {
@@ -530,7 +584,7 @@ fn vec3_to_array(value: Vec3f) -> [f32; 3] {
 }
 
 fn quat_to_array(value: Quatf) -> [f32; 4] {
-	[value.x, value.y, value.z, value.w]
+	normalize_quat([value.x, value.y, value.z, value.w])
 }
 
 fn humanoid_bone_name(bone: HumanoidBone) -> &'static str {
@@ -1148,10 +1202,11 @@ fn arm_plane_secondary(frame: &UNMotionFrame, side: BodySide, role: ArmSegmentRo
 		signal_vec3(frame, "hand.right.palm.forward"),
 		signal_vec3(frame, "hand.right.palm.normal"),
 	) {
-		if role == ArmSegmentRole::Upper && hands_are_close_overhead(frame) {
-			if let Some(across) = signal_vec3(frame, "hand.right.palm.across") {
-				return Some(across);
-			}
+		if role == ArmSegmentRole::Upper
+			&& hands_are_close_overhead(frame)
+			&& let Some(across) = signal_vec3(frame, "hand.right.palm.across")
+		{
+			return Some(across);
 		}
 		if is_right_folded_front_palm(forward, normal, hand_finger_fold(frame, "right")) {
 			plane = mix3(plane, [0.0, 0.0, 1.0], 0.25).unwrap_or(plane);
@@ -1649,10 +1704,10 @@ const HUMANOID_BONE_REST_POSES: &[BoneRestPose] = &[
 
 fn scalar_signal(frame: &UNMotionFrame, name: &str) -> Option<f32> {
 	frame.signals.iter().find_map(|signal| {
-		if signal.name == name {
-			if let MotionSignalValue::Scalar(value) = signal.value {
-				return Some(value.clamp(-1.0, 1.0));
-			}
+		if signal.name == name
+			&& let MotionSignalValue::Scalar(value) = signal.value
+		{
+			return Some(value.clamp(-1.0, 1.0));
 		}
 		None
 	})
@@ -1859,7 +1914,7 @@ fn quat_from_rotation_matrix(matrix: [[f32; 3]; 3]) -> [f32; 4] {
 
 fn normalize_quat(q: [f32; 4]) -> [f32; 4] {
 	let len = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
-	if len <= 1e-6 {
+	if !len.is_finite() || len <= 1e-6 {
 		IDENTITY_QUAT
 	} else {
 		[q[0] / len, q[1] / len, q[2] / len, q[3] / len]
@@ -2094,16 +2149,25 @@ const PERFECT_SYNC_BLENDSHAPES: &[&str] = &[
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use rosc::decoder;
+	use rosc::{OscBundle, OscTime, decoder};
 	use un_motion_frame::{
 		BodyMotion, BoneSample, ExpressionSample, FaceMotion, Finger, FingerPose, HandMotion, HumanoidBone, HumanoidPose, MotionSignal,
 		MotionSignalValue, Quatf, SampleState, TrackingState, TransformSample,
 	};
 
 	fn recv_messages(receiver: &UdpSocket, buf: &mut [u8]) -> Vec<OscMessage> {
-		let (len, _) = receiver.recv_from(buf).expect("packet");
-		let (_, packet) = decoder::decode_udp(&buf[..len]).expect("decode");
-		flatten_messages(packet)
+		let mut messages = Vec::new();
+		loop {
+			match receiver.recv_from(buf) {
+				Ok((len, _)) => {
+					let (_, packet) = decoder::decode_udp(&buf[..len]).expect("decode");
+					messages.extend(flatten_messages(packet));
+				}
+				Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break,
+				Err(error) => panic!("receive VMC datagram: {error}"),
+			}
+		}
+		messages
 	}
 
 	fn flatten_messages(packet: OscPacket) -> Vec<OscMessage> {
@@ -2181,6 +2245,137 @@ mod tests {
 		for (actual, expected) in actual.into_iter().zip(expected) {
 			assert!((actual - expected).abs() <= epsilon, "actual={actual:?} expected={expected:?}");
 		}
+	}
+
+	#[test]
+	fn vmc_packets_report_tracking_loss_as_ok_zero() {
+		let mut frame = UNMotionFrame::new(1);
+		frame.body = Some(BodyMotion {
+			tracking_state: TrackingState::Lost,
+			confidence: 0.0,
+			humanoid: None,
+		});
+		frame.face = Some(FaceMotion {
+			tracking_state: TrackingState::Lost,
+			confidence: 0.0,
+			head: None,
+			expressions: Vec::new(),
+		});
+		let messages = flatten_messages(OscPacket::Bundle(OscBundle {
+			timetag: OscTime { seconds: 0, fractional: 1 },
+			content: vmc_packets_for_frame(&frame),
+		}));
+		let ok = messages.iter().find(|message| message.addr == "/VMC/Ext/OK").expect("OK packet");
+		assert_eq!(ok.args, vec![OscType::Int(0)]);
+	}
+
+	#[test]
+	fn quaternion_output_is_normalized_and_invalid_values_fall_back_to_identity() {
+		assert_eq!(normalize_quat([0.0, 0.0, 0.0, 2.0]), IDENTITY_QUAT);
+		assert_eq!(normalize_quat([0.0, 0.0, 0.0, f32::NAN]), IDENTITY_QUAT);
+		assert_eq!(normalize_quat([0.0; 4]), IDENTITY_QUAT);
+	}
+
+	#[test]
+	fn large_vmc_frames_split_into_bounded_ordered_datagrams() {
+		let mut frame = UNMotionFrame::new(1);
+		frame.face = Some(FaceMotion {
+			tracking_state: TrackingState::Valid,
+			confidence: 1.0,
+			head: None,
+			expressions: (0..100)
+				.map(|index| ExpressionSample {
+					name: format!("Blend{index}"),
+					value: 0.5,
+					confidence: 1.0,
+					source_index: None,
+					state: SampleState::Valid,
+				})
+				.collect(),
+		});
+		let datagrams = encode_vmc_datagrams(vmc_packets_for_frame(&frame)).expect("encode split VMC frame");
+
+		assert!(datagrams.len() > 1);
+		assert!(datagrams.iter().all(|datagram| datagram.len() <= VMC_MAX_DATAGRAM_BYTES));
+		let mut addresses = Vec::new();
+		for datagram in &datagrams {
+			let (_, packet) = decoder::decode_udp(datagram).expect("decode datagram");
+			addresses.extend(flatten_messages(packet).into_iter().map(|message| message.addr));
+		}
+		assert_eq!(
+			addresses.iter().filter(|address| address.as_str() == "/VMC/Ext/Blend/Val").count(),
+			100
+		);
+		assert_eq!(addresses.last().map(String::as_str), Some("/VMC/Ext/Blend/Apply"));
+	}
+
+	#[test]
+	fn optimized_bundle_encoding_matches_rosc() {
+		let packets = vec![
+			OscPacket::Message(OscMessage {
+				addr: "/VMC/Ext/OK".to_string(),
+				args: vec![OscType::Int(1)],
+			}),
+			OscPacket::Message(OscMessage {
+				addr: "/VMC/Ext/Blend/Apply".to_string(),
+				args: Vec::new(),
+			}),
+		];
+		let expected = encoder::encode(&OscPacket::Bundle(OscBundle {
+			timetag: OscTime { seconds: 0, fractional: 1 },
+			content: packets.clone(),
+		}))
+		.expect("encode reference bundle");
+
+		let actual = encode_vmc_datagrams(packets).expect("encode optimized bundle");
+
+		assert_eq!(actual, vec![expected]);
+	}
+
+	#[test]
+	fn invalid_expression_names_do_not_drop_the_vmc_frame() {
+		let mut frame = UNMotionFrame::new(1);
+		frame.face = Some(FaceMotion {
+			tracking_state: TrackingState::Valid,
+			confidence: 1.0,
+			head: None,
+			expressions: vec![
+				ExpressionSample {
+					name: String::new(),
+					value: 0.25,
+					confidence: 1.0,
+					source_index: None,
+					state: SampleState::Valid,
+				},
+				ExpressionSample {
+					name: "x".repeat(VMC_MAX_NAME_BYTES + 1),
+					value: 0.5,
+					confidence: 1.0,
+					source_index: None,
+					state: SampleState::Valid,
+				},
+				ExpressionSample {
+					name: "Joy".to_string(),
+					value: 0.75,
+					confidence: 1.0,
+					source_index: None,
+					state: SampleState::Valid,
+				},
+			],
+		});
+
+		let datagrams = encode_vmc_datagrams(vmc_packets_for_frame(&frame)).expect("encode valid remainder");
+		let messages = datagrams
+			.iter()
+			.flat_map(|datagram| {
+				let (_, packet) = decoder::decode_udp(datagram).expect("decode datagram");
+				flatten_messages(packet)
+			})
+			.collect::<Vec<_>>();
+
+		assert_eq!(messages.iter().filter(|message| message.addr == "/VMC/Ext/Blend/Val").count(), 1);
+		assert_eq!(find_message(&messages, "/VMC/Ext/Blend/Val", "Joy").args[1], OscType::Float(0.75));
+		assert!(messages.iter().any(|message| message.addr == "/VMC/Ext/Blend/Apply"));
 	}
 
 	#[test]

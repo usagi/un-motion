@@ -332,24 +332,26 @@ mod tests {
 
 	#[test]
 	fn runtime_settings_roundtrip_through_toml() {
-		let mut settings = ProfileRuntimeSettings::default();
-		settings.fps = Some(90);
-		settings.zenoh_enabled = Some(true);
-		settings.zenoh_key_expr = Some("un-motion/frame".to_string());
-		settings.media_pipe_delegate = Some("xnnpack".to_string());
-		settings.media_pipe_num_threads = Some(2);
-		settings.media_pipe_holistic_flow_limiter_enabled = Some(true);
-		settings.media_pipe_holistic_flow_limiter_max_in_flight = Some(2);
-		settings.media_pipe_holistic_flow_limiter_max_in_queue = Some(1);
-		settings.modifier = Some(ProfileModifierSettings {
-			hands_enabled: Some(true),
-			eye_open_bias: Some(0.75),
-			post_process_rules: Some(ProfileMediaPipeAdvancedSettings {
-				finger_derived: Some(false),
+		let settings = ProfileRuntimeSettings {
+			fps: Some(90),
+			zenoh_enabled: Some(true),
+			zenoh_key_expr: Some("un-motion/frame".to_string()),
+			media_pipe_delegate: Some("xnnpack".to_string()),
+			media_pipe_num_threads: Some(2),
+			media_pipe_holistic_flow_limiter_enabled: Some(true),
+			media_pipe_holistic_flow_limiter_max_in_flight: Some(2),
+			media_pipe_holistic_flow_limiter_max_in_queue: Some(1),
+			modifier: Some(ProfileModifierSettings {
+				hands_enabled: Some(true),
+				eye_open_bias: Some(0.75),
+				post_process_rules: Some(ProfileMediaPipeAdvancedSettings {
+					finger_derived: Some(false),
+					..Default::default()
+				}),
 				..Default::default()
 			}),
 			..Default::default()
-		});
+		};
 
 		let text = toml::to_string_pretty(&settings).expect("serialize");
 		assert!(text.contains("fps = 90"));
@@ -421,14 +423,16 @@ mod tests {
 
 	#[test]
 	fn pipeline_components_roundtrip_through_toml() {
-		let mut components = ProfilePipelineComponents::default();
-		components.engine = Some("mediapipe-native".to_string());
-		components.input = Some("webcam-directshow".to_string());
-		components.input_fps = Some(30);
-		components.input_denoise_mode = Some("temporal-iir".to_string());
-		components.input_denoise_temporal_iir_hz = Some(8.0);
-		components.input_resize_enabled = Some(true);
-		components.input_resize_axis = Some("width".to_string());
+		let components = ProfilePipelineComponents {
+			engine: Some("mediapipe-native".to_string()),
+			input: Some("webcam-directshow".to_string()),
+			input_fps: Some(30),
+			input_denoise_mode: Some("temporal-iir".to_string()),
+			input_denoise_temporal_iir_hz: Some(8.0),
+			input_resize_enabled: Some(true),
+			input_resize_axis: Some("width".to_string()),
+			..Default::default()
+		};
 
 		let text = toml::to_string_pretty(&components).expect("serialize");
 		assert!(text.contains("engine = \"mediapipe-native\""));

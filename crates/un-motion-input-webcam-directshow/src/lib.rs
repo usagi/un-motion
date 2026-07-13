@@ -4,6 +4,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use un_motion_interfaces::{ImageFrame, ImageFrameMetadata, ImageInputSource, PixelFormat, TimestampBasis};
 
+const MAX_RGB_FRAME_DIMENSION: u32 = 16_384;
+const MAX_RGB_FRAME_BYTES: usize = 128 * 1024 * 1024;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WebcamDeviceInfo {
 	pub id: String,
@@ -180,7 +183,7 @@ impl DirectShowWebcamBackend {
 	pub fn active_format_label(&self) -> Option<String> {
 		#[cfg(windows)]
 		{
-			return self.active.as_ref().map(ActiveDirectShowCapture::format_label);
+			self.active.as_ref().map(ActiveDirectShowCapture::format_label)
 		}
 		#[cfg(not(windows))]
 		{
@@ -191,7 +194,7 @@ impl DirectShowWebcamBackend {
 	pub fn active_fps(&self) -> Option<f32> {
 		#[cfg(windows)]
 		{
-			return self.active.as_ref().and_then(|active| active.actual_fps);
+			self.active.as_ref().and_then(|active| active.actual_fps)
 		}
 		#[cfg(not(windows))]
 		{
@@ -202,7 +205,7 @@ impl DirectShowWebcamBackend {
 	pub fn active_observed_fps(&self) -> Option<f32> {
 		#[cfg(windows)]
 		{
-			return self.active.as_ref().and_then(ActiveDirectShowCapture::observed_consumer_fps);
+			self.active.as_ref().and_then(ActiveDirectShowCapture::observed_consumer_fps)
 		}
 		#[cfg(not(windows))]
 		{
@@ -213,7 +216,7 @@ impl DirectShowWebcamBackend {
 	pub fn active_observed_source_fps(&self) -> Option<f32> {
 		#[cfg(windows)]
 		{
-			return self.active.as_ref().and_then(ActiveDirectShowCapture::observed_source_fps);
+			self.active.as_ref().and_then(ActiveDirectShowCapture::observed_source_fps)
 		}
 		#[cfg(not(windows))]
 		{
@@ -224,10 +227,9 @@ impl DirectShowWebcamBackend {
 	pub fn active_observed_interval_ms(&self) -> Option<f32> {
 		#[cfg(windows)]
 		{
-			return self
-				.active
+			self.active
 				.as_ref()
-				.and_then(ActiveDirectShowCapture::observed_consumer_interval_ms);
+				.and_then(ActiveDirectShowCapture::observed_consumer_interval_ms)
 		}
 		#[cfg(not(windows))]
 		{
@@ -293,10 +295,12 @@ struct ActiveDirectShowCapture {
 	actual_pixel_format: Option<String>,
 	last_delivered_width: Option<u32>,
 	last_delivered_height: Option<u32>,
+	resize_x_map_source_width: Option<u32>,
+	resize_x_map: Vec<usize>,
 }
 
 #[cfg(windows)]
-struct PendingDirectShowFrame {
+struct PendingDirectShowFrame<'a> {
 	timestamp_ns: u64,
 	frame_timestamp_ns: u64,
 	width: u32,
@@ -307,7 +311,7 @@ struct PendingDirectShowFrame {
 	stride: u32,
 	plane_lengths: [usize; 3],
 	frame_index: u64,
-	data: Vec<u8>,
+	data: &'a [u8],
 }
 
 #[cfg(windows)]
@@ -333,19 +337,19 @@ impl ActiveDirectShowCapture {
 		let mut provider = ccap::Provider::with_device_name_and_extra_info(&device.name, Some("dshow"))?;
 		let requested_label = config.requested_label();
 		let _ = provider.stop_capture();
-		if let (Some(width), Some(height)) = (config.width, config.height) {
-			if let Err(error) = provider.set_resolution(width, height) {
-				tracing::warn!(
-					target: "un_motion_input_webcam_directshow",
-					device_id = %device.id,
-					device_name = %device.name,
-					requested = %requested_label,
-					error = %error,
-					width,
-					height,
-					"DirectShow requested resolution set failed"
-				);
-			}
+		if let (Some(width), Some(height)) = (config.width, config.height)
+			&& let Err(error) = provider.set_resolution(width, height)
+		{
+			tracing::warn!(
+				target: "un_motion_input_webcam_directshow",
+				device_id = %device.id,
+				device_name = %device.name,
+				requested = %requested_label,
+				error = %error,
+				width,
+				height,
+				"DirectShow requested resolution set failed"
+			);
 		}
 		if let Some(pixel_format) = config.pixel_format.as_deref().filter(|value| is_yuv_request(Some(value))) {
 			let requested_pixel_format = ccap_pixel_format_from_label(Some(pixel_format));
@@ -372,18 +376,18 @@ impl ActiveDirectShowCapture {
 				"DirectShow requested output pixel format set failed"
 			);
 		}
-		if let Some(fps) = config.fps {
-			if let Err(error) = provider.set_frame_rate(fps as f64) {
-				tracing::warn!(
-					target: "un_motion_input_webcam_directshow",
-					device_id = %device.id,
-					device_name = %device.name,
-					requested = %requested_label,
-					requested_fps = fps,
-					error = %error,
-					"DirectShow requested frame rate set failed"
-				);
-			}
+		if let Some(fps) = config.fps
+			&& let Err(error) = provider.set_frame_rate(fps as f64)
+		{
+			tracing::warn!(
+				target: "un_motion_input_webcam_directshow",
+				device_id = %device.id,
+				device_name = %device.name,
+				requested = %requested_label,
+				requested_fps = fps,
+				error = %error,
+				"DirectShow requested frame rate set failed"
+			);
 		}
 		provider.start_capture()?;
 		let (actual_width, actual_height) = provider
@@ -429,6 +433,8 @@ impl ActiveDirectShowCapture {
 			actual_pixel_format,
 			last_delivered_width: None,
 			last_delivered_height: None,
+			resize_x_map_source_width: None,
+			resize_x_map: Vec::new(),
 		})
 	}
 
@@ -448,7 +454,8 @@ impl ActiveDirectShowCapture {
 			if requested_width > 0 && requested_height > 0 && (requested_width != width || requested_height != height) {
 				width = requested_width;
 				height = requested_height;
-				resize_ccap_frame_to_rgb8(&pending, requested_width, requested_height)?
+				self.prepare_resize_x_map(pending.width, requested_width);
+				resize_ccap_frame_to_rgb8(&pending, requested_width, requested_height, &self.resize_x_map)?
 			} else {
 				convert_ccap_frame_to_rgb8(&pending)?
 			}
@@ -476,7 +483,7 @@ impl ActiveDirectShowCapture {
 			height,
 			stride_bytes: width.saturating_mul(3),
 			pixel_format: PixelFormat::Rgb8,
-			data,
+			data: data.into(),
 		};
 		self.sequence = self.sequence.saturating_add(1);
 		Ok(Some(image))
@@ -494,7 +501,7 @@ impl ActiveDirectShowCapture {
 		self.stats.observed_source_fps
 	}
 
-	fn observe_frame_sample(&mut self, pending: &PendingDirectShowFrame) {
+	fn observe_frame_sample(&mut self, pending: &PendingDirectShowFrame<'_>) {
 		if let Some(previous) = self.stats.last_consumer_timestamp_ns {
 			let interval_ms = pending.timestamp_ns.saturating_sub(previous) as f32 / 1_000_000.0;
 			if interval_ms > 0.0 {
@@ -503,22 +510,23 @@ impl ActiveDirectShowCapture {
 				self.stats.observed_consumer_fps = Some(smooth_optional_metric(self.stats.observed_consumer_fps, 1000.0 / interval_ms));
 			}
 		}
-		if let (Some(previous_timestamp), Some(previous_index)) = (self.stats.last_source_timestamp_ns, self.stats.last_frame_index) {
-			if pending.frame_timestamp_ns > previous_timestamp && pending.frame_index > previous_index {
-				let interval_ms = (pending.frame_timestamp_ns - previous_timestamp) as f32 / 1_000_000.0;
-				let frame_delta = pending.frame_index - previous_index;
-				if interval_ms > 0.0 && frame_delta > 0 {
-					let source_fps = frame_delta as f32 * 1000.0 / interval_ms;
-					self.stats.observed_source_interval_ms = Some(smooth_optional_metric(
-						self.stats.observed_source_interval_ms,
-						interval_ms / frame_delta as f32,
-					));
-					self.stats.observed_source_fps = Some(smooth_optional_metric(self.stats.observed_source_fps, source_fps));
-					self.stats.observed_frame_index_delta = Some(frame_delta);
-				}
+		if let (Some(previous_timestamp), Some(previous_index)) = (self.stats.last_source_timestamp_ns, self.stats.last_frame_index)
+			&& pending.frame_timestamp_ns > previous_timestamp
+			&& pending.frame_index > previous_index
+		{
+			let interval_ms = (pending.frame_timestamp_ns - previous_timestamp) as f32 / 1_000_000.0;
+			let frame_delta = pending.frame_index - previous_index;
+			if interval_ms > 0.0 && frame_delta > 0 {
+				let source_fps = frame_delta as f32 * 1000.0 / interval_ms;
+				self.stats.observed_source_interval_ms = Some(smooth_optional_metric(
+					self.stats.observed_source_interval_ms,
+					interval_ms / frame_delta as f32,
+				));
+				self.stats.observed_source_fps = Some(smooth_optional_metric(self.stats.observed_source_fps, source_fps));
+				self.stats.observed_frame_index_delta = Some(frame_delta);
 			}
 		}
-		if self.stats.frames == 30 || self.stats.frames == 120 || self.stats.frames % 600 == 0 {
+		if self.stats.frames == 30 || self.stats.frames == 120 || self.stats.frames.is_multiple_of(600) {
 			tracing::info!(
 				target: "un_motion_input_webcam_directshow",
 				device_id = %self.device_id,
@@ -538,7 +546,7 @@ impl ActiveDirectShowCapture {
 		self.stats.frames = self.stats.frames.saturating_add(1);
 	}
 
-	fn log_frame_probe(&self, pending: &PendingDirectShowFrame) {
+	fn log_frame_probe(&self, pending: &PendingDirectShowFrame<'_>) {
 		if self.stats.frames < 3 || self.stats.frames == 30 {
 			tracing::info!(
 				target: "un_motion_input_webcam_directshow",
@@ -561,7 +569,7 @@ impl ActiveDirectShowCapture {
 		}
 	}
 
-	fn apply_effective_orientation(&self, pending: &mut PendingDirectShowFrame) {
+	fn apply_effective_orientation(&self, pending: &mut PendingDirectShowFrame<'_>) {
 		if is_yuv_request(self.config.pixel_format.as_deref())
 			&& is_packed_rgb_frame(pending.pixel_format)
 			&& matches!(pending.reported_orientation, ccap::FrameOrientation::TopToBottom)
@@ -579,6 +587,16 @@ impl ActiveDirectShowCapture {
 				);
 			}
 		}
+	}
+
+	fn prepare_resize_x_map(&mut self, source_width: u32, destination_width: u32) {
+		if self.resize_x_map_source_width == Some(source_width) && self.resize_x_map.len() == destination_width as usize {
+			return;
+		}
+		self.resize_x_map.clear();
+		self.resize_x_map
+			.extend((0..destination_width).map(|x| (x as u64 * source_width as u64 / destination_width as u64) as usize));
+		self.resize_x_map_source_width = Some(source_width);
 	}
 
 	fn format_label(&self) -> String {
@@ -650,7 +668,7 @@ fn store_cached_capture(active: ActiveDirectShowCapture) {
 }
 
 #[cfg(windows)]
-fn pending_frame_from_ccap_frame(frame: &ccap::VideoFrame) -> anyhow::Result<PendingDirectShowFrame> {
+fn pending_frame_from_ccap_frame(frame: &ccap::VideoFrame) -> anyhow::Result<PendingDirectShowFrame<'_>> {
 	let info = frame.info()?;
 	let Some(src) = info.data_planes[0] else {
 		anyhow::bail!("DirectShow frame has no first data plane");
@@ -672,7 +690,7 @@ fn pending_frame_from_ccap_frame(frame: &ccap::VideoFrame) -> anyhow::Result<Pen
 		stride: info.strides[0],
 		plane_lengths,
 		frame_index: info.frame_index,
-		data: src.to_vec(),
+		data: src,
 	})
 }
 
@@ -809,6 +827,7 @@ fn ccap_pixel_format_from_label(value: Option<&str>) -> ccap::PixelFormat {
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 fn log_capture_negotiation(
 	device_id: &str,
 	device_name: &str,
@@ -821,20 +840,21 @@ fn log_capture_negotiation(
 ) {
 	if let (Some(requested_width), Some(requested_height), Some(width), Some(height)) =
 		(config.width, config.height, actual_width, actual_height)
+		&& requested_width > 0
+		&& requested_height > 0
+		&& (requested_width != width || requested_height != height)
 	{
-		if requested_width > 0 && requested_height > 0 && (requested_width != width || requested_height != height) {
-			tracing::warn!(
-				target: "un_motion_input_webcam_directshow",
-				device_id = %device_id,
-				device_name = %device_name,
-				requested = %requested_label,
-				requested_width = requested_width,
-				requested_height = requested_height,
-				actual_width = width,
-				actual_height = height,
-				"DirectShow capture resolution was changed by backend"
-			);
-		}
+		tracing::warn!(
+			target: "un_motion_input_webcam_directshow",
+			device_id = %device_id,
+			device_name = %device_name,
+			requested = %requested_label,
+			requested_width = requested_width,
+			requested_height = requested_height,
+			actual_width = width,
+			actual_height = height,
+			"DirectShow capture resolution was changed by backend"
+		);
 	}
 	match (config.fps, actual_fps) {
 		(Some(requested_fps), Some(actual_fps)) if requested_fps > 0 => {
@@ -894,10 +914,16 @@ fn log_capture_negotiation(
 }
 
 #[cfg(windows)]
-fn resize_ccap_frame_to_rgb8(frame: &PendingDirectShowFrame, dst_width: u32, dst_height: u32) -> anyhow::Result<Vec<u8>> {
+fn resize_ccap_frame_to_rgb8(
+	frame: &PendingDirectShowFrame<'_>,
+	dst_width: u32,
+	dst_height: u32,
+	x_map: &[usize],
+) -> anyhow::Result<Vec<u8>> {
 	if frame.width == 0 || frame.height == 0 || dst_width == 0 || dst_height == 0 {
 		anyhow::bail!("invalid RGB resize dimensions");
 	}
+	let dst_len = checked_rgb8_output_len(dst_width, dst_height)?;
 	if frame.width == dst_width && frame.height == dst_height {
 		return convert_ccap_frame_to_rgb8(frame);
 	}
@@ -906,7 +932,10 @@ fn resize_ccap_frame_to_rgb8(frame: &PendingDirectShowFrame, dst_width: u32, dst
 	let src_height = frame.height as usize;
 	let dst_width_usize = dst_width as usize;
 	let dst_height_usize = dst_height as usize;
-	let src = frame.data.as_slice();
+	if x_map.len() != dst_width_usize {
+		anyhow::bail!("RGB resize x-map length does not match destination width");
+	}
+	let src: &[u8] = frame.data;
 	let stride = frame.stride as usize;
 	let row_bytes = ccap_pixel_row_bytes(frame.pixel_format, src_width)?;
 	if stride < row_bytes {
@@ -918,10 +947,7 @@ fn resize_ccap_frame_to_rgb8(frame: &PendingDirectShowFrame, dst_width: u32, dst
 	if src.len() < required {
 		anyhow::bail!("DirectShow frame data is shorter than stride * height");
 	}
-	let x_map = (0..dst_width)
-		.map(|x| (x as u64 * frame.width as u64 / dst_width as u64) as usize)
-		.collect::<Vec<_>>();
-	let mut dst = vec![0_u8; dst_width_usize * dst_height_usize * 3];
+	let mut dst = vec![0_u8; dst_len];
 	for y in 0..dst_height_usize {
 		let mapped_y = y * src_height / dst_height_usize;
 		let src_y = match frame.orientation {
@@ -937,11 +963,28 @@ fn resize_ccap_frame_to_rgb8(frame: &PendingDirectShowFrame, dst_width: u32, dst
 	Ok(dst)
 }
 
+fn checked_rgb8_output_len(width: u32, height: u32) -> anyhow::Result<usize> {
+	if width == 0 || height == 0 {
+		anyhow::bail!("RGB output dimensions must be non-zero");
+	}
+	if width > MAX_RGB_FRAME_DIMENSION || height > MAX_RGB_FRAME_DIMENSION {
+		anyhow::bail!("RGB output dimensions exceed {MAX_RGB_FRAME_DIMENSION}: {width}x{height}");
+	}
+	let bytes = (width as usize)
+		.checked_mul(height as usize)
+		.and_then(|pixels| pixels.checked_mul(3))
+		.ok_or_else(|| anyhow::anyhow!("RGB output size overflow for {width}x{height}"))?;
+	if bytes > MAX_RGB_FRAME_BYTES {
+		anyhow::bail!("RGB output exceeds {} bytes: {width}x{height}", MAX_RGB_FRAME_BYTES);
+	}
+	Ok(bytes)
+}
+
 #[cfg(windows)]
-fn convert_ccap_frame_to_rgb8(frame: &PendingDirectShowFrame) -> anyhow::Result<Vec<u8>> {
+fn convert_ccap_frame_to_rgb8(frame: &PendingDirectShowFrame<'_>) -> anyhow::Result<Vec<u8>> {
 	let width = frame.width as usize;
 	let height = frame.height as usize;
-	let src = frame.data.as_slice();
+	let src: &[u8] = frame.data;
 	let stride = frame.stride as usize;
 	let row_bytes = ccap_pixel_row_bytes(frame.pixel_format, width)?;
 	if stride < row_bytes {
@@ -1057,7 +1100,7 @@ fn ccap_pixel_row_bytes(pixel_format: ccap::PixelFormat, width: usize) -> anyhow
 }
 
 #[cfg(windows)]
-fn read_ccap_rgb_pixel(frame: &PendingDirectShowFrame, src: &[u8], stride: usize, x: usize, y: usize) -> anyhow::Result<[u8; 3]> {
+fn read_ccap_rgb_pixel(frame: &PendingDirectShowFrame<'_>, src: &[u8], stride: usize, x: usize, y: usize) -> anyhow::Result<[u8; 3]> {
 	match frame.pixel_format {
 		ccap::PixelFormat::Rgb24 | ccap::PixelFormat::Bgr24 | ccap::PixelFormat::Rgba32 | ccap::PixelFormat::Bgra32 => {
 			let (channels, order) = ccap_pixel_layout(frame.pixel_format)?;
@@ -1510,6 +1553,13 @@ fn now_unix_ns() -> u64 {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn rgb8_output_size_accepts_8k_and_rejects_unbounded_dimensions() {
+		assert_eq!(checked_rgb8_output_len(7680, 4320).expect("8K frame"), 99_532_800);
+		assert!(checked_rgb8_output_len(u32::MAX, 1).is_err());
+		assert!(checked_rgb8_output_len(16_384, 16_384).is_err());
+	}
 
 	#[derive(Default)]
 	struct MockBackend {

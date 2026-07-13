@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::io::{ErrorKind, Read};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use un_motion_frame::{
 	BodyMotion, BoneSample, CoordinateSpace, EyeMotion, FaceMotion, GazeSample, Handedness, HumanoidBone, HumanoidPose, LengthUnit,
@@ -11,6 +12,8 @@ use un_motion_frame::{
 pub const IFACIALMOCAP_UDP_PORT: u16 = 49983;
 pub const IFACIALMOCAP_TCP_PORT: u16 = 49986;
 const TCP_REASSEMBLY_MAX_BYTES: usize = 64 * 1024;
+const MAX_RECEIVES_PER_POLL: usize = 64;
+const TCP_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const TCP_FRAME_DELIMITER: &str = "___iFacialMocap";
 const IFACIALMOCAP_EYE_ROTATION_SCALE: f32 = 0.35;
 const IFACIALMOCAP_EYE_ROTATION_CLAMP_DEG: f32 = 8.0;
@@ -74,6 +77,10 @@ pub struct IfacialMocapFrame {
 impl IfacialMocapFrame {
 	pub fn to_unmotion_frame(&self, sequence: u64) -> UNMotionFrame {
 		let mut frame = UNMotionFrame::new(sequence);
+		let expression_lookup = ExpressionLookup::new(&self.expressions);
+		let output_expressions = output_expression_samples(&expression_lookup);
+		let blink_left = expression_output_value(&output_expressions, "EyeBlinkLeft");
+		let blink_right = expression_output_value(&output_expressions, "EyeBlinkRight");
 		let head = mirror_euler_left_right(self.head);
 		let left_eye = conditioned_eye_euler(mirror_euler_left_right(self.right_eye));
 		let right_eye = conditioned_eye_euler(mirror_euler_left_right(self.left_eye));
@@ -102,30 +109,14 @@ impl IfacialMocapFrame {
 		});
 
 		let source_index = Some(0);
-		frame.face = Some(FaceMotion {
-			tracking_state: tracking_state(self.confidence),
-			confidence: self.confidence,
-			head: Some(transform_from_euler(head)),
-			expressions: output_expression_samples(&self.expressions)
-				.into_iter()
-				.map(|(name, value)| un_motion_frame::ExpressionSample {
-					name,
-					value: value.clamp(0.0, 1.0),
-					confidence: self.confidence,
-					source_index,
-					state: SampleState::Valid,
-				})
-				.collect(),
-		});
-
 		frame.eyes = Some(EyeMotion {
 			tracking_state: tracking_state(self.confidence),
 			confidence: self.confidence,
 			left_gaze: Some(gaze_from_euler(left_eye, self.confidence)),
 			right_gaze: Some(gaze_from_euler(right_eye, self.confidence)),
 			combined_gaze: Some(gaze_from_euler(average_euler(left_eye, right_eye), self.confidence)),
-			blink_left: expression_output_value(&self.expressions, "EyeBlinkLeft"),
-			blink_right: expression_output_value(&self.expressions, "EyeBlinkRight"),
+			blink_left,
+			blink_right,
 		});
 
 		frame.body = Some(BodyMotion {
@@ -148,7 +139,7 @@ impl IfacialMocapFrame {
 		push_scalar_signal(&mut frame, "eye.left.pitch", left_eye.pitch, self.confidence, source_index);
 		push_scalar_signal(&mut frame, "eye.right.yaw", right_eye.yaw, self.confidence, source_index);
 		push_scalar_signal(&mut frame, "eye.right.pitch", right_eye.pitch, self.confidence, source_index);
-		for (output_name, value) in output_expression_samples(&self.expressions) {
+		for (output_name, value) in &output_expressions {
 			push_scalar_signal(
 				&mut frame,
 				format!("face.{output_name}"),
@@ -157,6 +148,21 @@ impl IfacialMocapFrame {
 				source_index,
 			);
 		}
+		frame.face = Some(FaceMotion {
+			tracking_state: tracking_state(self.confidence),
+			confidence: self.confidence,
+			head: Some(transform_from_euler(head)),
+			expressions: output_expressions
+				.into_iter()
+				.map(|(name, value)| un_motion_frame::ExpressionSample {
+					name,
+					value: value.clamp(0.0, 1.0),
+					confidence: self.confidence,
+					source_index,
+					state: SampleState::Valid,
+				})
+				.collect(),
+		});
 		frame.metadata.producer = Some("un-motion-input-ifacialmocap".to_string());
 		frame.metadata.notes.push("source_protocol=ifacialmocap".to_string());
 		frame
@@ -174,6 +180,7 @@ pub struct IfacialMocapInputSource {
 	config: IfacialMocapInputConfig,
 	udp_socket: Option<UdpSocket>,
 	tcp_stream: Option<TcpStream>,
+	tcp_reconnect_after: Option<Instant>,
 	tcp_reassembly_buffer: Vec<u8>,
 	receive_buffer: [u8; 8192],
 	tcp_read_buffer: [u8; 4096],
@@ -185,6 +192,7 @@ impl IfacialMocapInputSource {
 			config,
 			udp_socket: None,
 			tcp_stream: None,
+			tcp_reconnect_after: None,
 			tcp_reassembly_buffer: Vec::with_capacity(4096),
 			receive_buffer: [0; 8192],
 			tcp_read_buffer: [0; 4096],
@@ -244,6 +252,7 @@ impl IfacialMocapInputSource {
 		let stream = TcpStream::connect(remote_addr)?;
 		stream.set_nonblocking(true)?;
 		self.tcp_stream = Some(stream);
+		self.tcp_reconnect_after = None;
 		Ok(())
 	}
 
@@ -253,9 +262,16 @@ impl IfacialMocapInputSource {
 			return batch;
 		};
 
+		let mut receives = 0;
 		loop {
 			match socket.recv_from(&mut self.receive_buffer) {
-				Ok((len, _addr)) => self.parse_payload_bytes(&mut batch, &self.receive_buffer[..len]),
+				Ok((len, _addr)) => {
+					receives += 1;
+					self.parse_payload_bytes(&mut batch, &self.receive_buffer[..len]);
+					if receives >= MAX_RECEIVES_PER_POLL {
+						break;
+					}
+				}
 				Err(error) if error.kind() == ErrorKind::WouldBlock => break,
 				Err(error) => {
 					push_decode_error(&mut batch, format!("UDP receive failed: {error}"));
@@ -268,20 +284,33 @@ impl IfacialMocapInputSource {
 
 	fn poll_tcp(&mut self) -> anyhow::Result<IfacialMocapPollBatch> {
 		let mut batch = IfacialMocapPollBatch::default();
+		if self.tcp_stream.is_none() && self.tcp_reconnect_after.is_some_and(|retry_at| Instant::now() >= retry_at) {
+			self.tcp_reconnect_after = Some(Instant::now() + TCP_RECONNECT_DELAY);
+			if let Err(error) = self.connect_tcp() {
+				push_decode_error(&mut batch, format!("TCP reconnect failed: {error}"));
+			}
+		}
 		let Some(mut stream) = self.tcp_stream.as_ref().and_then(|stream| stream.try_clone().ok()) else {
 			return Ok(batch);
 		};
 
+		let mut reads = 0;
 		loop {
 			match stream.read(&mut self.tcp_read_buffer) {
 				Ok(0) => {
+					self.tcp_stream = None;
+					self.tcp_reconnect_after = Some(Instant::now() + TCP_RECONNECT_DELAY);
 					push_decode_error(&mut batch, "TCP stream closed by peer".to_string());
 					break;
 				}
 				Ok(len) => {
+					reads += 1;
 					self.tcp_reassembly_buffer.extend_from_slice(&self.tcp_read_buffer[..len]);
 					self.trim_tcp_reassembly_buffer(&mut batch);
 					self.parse_reassembled_tcp_frames(&mut batch);
+					if reads >= MAX_RECEIVES_PER_POLL {
+						break;
+					}
 				}
 				Err(error) if error.kind() == ErrorKind::WouldBlock => break,
 				Err(error) => {
@@ -320,13 +349,18 @@ impl IfacialMocapInputSource {
 	}
 
 	fn parse_reassembled_tcp_frames(&mut self, batch: &mut IfacialMocapPollBatch) {
-		while let Some(delimiter_start) = find_tcp_frame_delimiter(&self.tcp_reassembly_buffer) {
-			let delimiter_len = tcp_delimiter_len(&self.tcp_reassembly_buffer[delimiter_start..]);
-			let raw_frame: Vec<u8> = self.tcp_reassembly_buffer.drain(..delimiter_start).collect();
-			self.tcp_reassembly_buffer.drain(..delimiter_len);
+		while let Some(raw_frame) = take_reassembled_tcp_frame(&mut self.tcp_reassembly_buffer) {
 			self.parse_payload_bytes(batch, &raw_frame);
 		}
 	}
+}
+
+fn take_reassembled_tcp_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+	let delimiter_start = find_tcp_frame_delimiter(buffer)?;
+	let delimiter_len = tcp_delimiter_len(&buffer[delimiter_start..]);
+	let mut raw_frame = buffer.drain(..delimiter_start + delimiter_len).collect::<Vec<_>>();
+	raw_frame.truncate(delimiter_start);
+	Some(raw_frame)
 }
 
 pub fn parse_ifacialmocap_frame(packet: &str, source_id: &str, received_timestamp_ns: u64) -> anyhow::Result<IfacialMocapFrame> {
@@ -341,9 +375,7 @@ pub fn parse_ifacialmocap_frame(packet: &str, source_id: &str, received_timestam
 		if trimmed.is_empty() {
 			continue;
 		}
-		let normalized = trimmed
-			.trim_start_matches(|character| matches!(character, '=' | '/' | ':' | ';' | ','))
-			.trim();
+		let normalized = trimmed.trim_start_matches(['=', '/', ':', ';', ',']).trim();
 		let Some((field_name, raw_value)) = normalized.split_once('#') else {
 			if let Some((name, value)) = parse_blendshape_segment(normalized) {
 				push_expression_if_supported(&mut expressions, name, value);
@@ -360,8 +392,8 @@ pub fn parse_ifacialmocap_frame(packet: &str, source_id: &str, received_timestam
 		} else if field_name.eq_ignore_ascii_case("rightEye") {
 			right_eye = Some(parse_triplet(raw_value)?);
 		} else if field_name.eq_ignore_ascii_case("confidence") {
-			confidence = raw_value.parse::<f32>().unwrap_or(confidence).clamp(0.0, 1.0);
-		} else if let Ok(value) = raw_value.parse::<f32>() {
+			confidence = parse_finite_f32(raw_value).unwrap_or(confidence).clamp(0.0, 1.0);
+		} else if let Some(value) = parse_finite_f32(raw_value) {
 			push_expression_if_supported(
 				&mut expressions,
 				normalize_expression_name(field_name),
@@ -395,6 +427,17 @@ fn parse_next_triplet_value<'a>(values: &mut impl Iterator<Item = &'a str>, raw:
 		.ok_or_else(|| anyhow::anyhow!("invalid triplet '{raw}': missing {label}"))?
 		.parse::<f32>()
 		.map_err(|error| anyhow::anyhow!("invalid triplet '{raw}': {error}"))
+		.and_then(|value| {
+			value
+				.is_finite()
+				.then_some(value)
+				.ok_or_else(|| anyhow::anyhow!("invalid triplet '{raw}': {label} is not finite"))
+		})
+}
+
+fn parse_finite_f32(raw: &str) -> Option<f32> {
+	let value = raw.parse::<f32>().ok()?;
+	value.is_finite().then_some(value)
 }
 
 fn normalize_payload(bytes: &[u8]) -> &str {
@@ -436,7 +479,7 @@ fn parse_blendshape_segment(segment: &str) -> Option<(String, f32)> {
 	if name.is_empty() {
 		return None;
 	}
-	let value = raw_value.parse::<f32>().ok()?;
+	let value = parse_finite_f32(raw_value)?;
 	Some((normalize_expression_name(name), normalize_blendshape_value(value)))
 }
 
@@ -464,7 +507,7 @@ fn push_expression_if_supported(expressions: &mut Vec<(String, f32)>, name: Stri
 }
 
 fn is_supported_expression_name(name: &str) -> bool {
-	PERFECT_SYNC_EXPRESSION_NAMES.iter().any(|candidate| *candidate == name)
+	PERFECT_SYNC_EXPRESSION_NAMES.contains(&name)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -486,7 +529,28 @@ impl ExpressionRoute {
 	}
 }
 
-fn output_expression_samples(expressions: &[(String, f32)]) -> Vec<(String, f32)> {
+struct ExpressionLookup<'a> {
+	values: HashMap<&'a str, f32>,
+}
+
+impl<'a> ExpressionLookup<'a> {
+	fn new(expressions: &'a [(String, f32)]) -> Self {
+		Self {
+			values: expressions.iter().map(|(name, value)| (name.as_str(), *value)).collect(),
+		}
+	}
+
+	fn get(&self, name: &str) -> Option<f32> {
+		self.values.get(name).copied().or_else(|| {
+			self.values
+				.iter()
+				.find(|(expression_name, _)| expression_name.eq_ignore_ascii_case(name))
+				.map(|(_, value)| *value)
+		})
+	}
+}
+
+fn output_expression_samples(expressions: &ExpressionLookup<'_>) -> Vec<(String, f32)> {
 	WAIDAYO_EXPRESSION_ROUTES
 		.iter()
 		.filter_map(|route| {
@@ -497,28 +561,18 @@ fn output_expression_samples(expressions: &[(String, f32)]) -> Vec<(String, f32)
 		.collect()
 }
 
-fn expression_input_value(expressions: &[(String, f32)], name: &str) -> Option<f32> {
-	expressions
-		.iter()
-		.find(|(expression_name, _)| expression_name.eq_ignore_ascii_case(name))
-		.map(|(_, value)| *value)
-}
-
-fn routed_expression_input_value(expressions: &[(String, f32)], name: &str) -> Option<f32> {
-	expression_input_value(expressions, name)
+fn routed_expression_input_value(expressions: &ExpressionLookup<'_>, name: &str) -> Option<f32> {
+	expressions.get(name)
 }
 
 fn expression_output_value(expressions: &[(String, f32)], target_name: &str) -> Option<f32> {
-	if let Some(value) = reference_expression_value(target_name, expressions) {
-		return Some(value);
-	}
-	WAIDAYO_EXPRESSION_ROUTES
+	expressions
 		.iter()
-		.find(|route| route.target.eq_ignore_ascii_case(target_name))
-		.and_then(|route| routed_expression_input_value(expressions, route.source).map(|value| route.apply(value)))
+		.find(|(name, _)| name.eq_ignore_ascii_case(target_name))
+		.map(|(_, value)| *value)
 }
 
-fn reference_expression_value(target_name: &str, expressions: &[(String, f32)]) -> Option<f32> {
+fn reference_expression_value(target_name: &str, expressions: &ExpressionLookup<'_>) -> Option<f32> {
 	if is_mouth_reference_target(target_name) && !has_mouth_reference_activity(expressions) {
 		return has_mouth_reference_input(expressions).then_some(0.0);
 	}
@@ -587,7 +641,7 @@ fn reference_expression_value(target_name: &str, expressions: &[(String, f32)]) 
 			expressions,
 			-0.0440393,
 			&[
-				("mouthPucker", 1.047880),
+				("mouthPucker", 1.047_88),
 				("mouthDimpleRight", 0.583544),
 				("mouthShrugLower", -0.522829),
 				("mouthShrugUpper", 0.422763),
@@ -691,13 +745,13 @@ fn is_mouth_reference_target(target_name: &str) -> bool {
 	)
 }
 
-fn has_mouth_reference_activity(expressions: &[(String, f32)]) -> bool {
+fn has_mouth_reference_activity(expressions: &ExpressionLookup<'_>) -> bool {
 	mouth_reference_source_names()
 		.iter()
 		.any(|name| routed_expression_input_value(expressions, name).is_some_and(|value| value > neutral_expression_deadzone(name) + 0.03))
 }
 
-fn has_mouth_reference_input(expressions: &[(String, f32)]) -> bool {
+fn has_mouth_reference_input(expressions: &ExpressionLookup<'_>) -> bool {
 	mouth_reference_source_names()
 		.iter()
 		.any(|name| routed_expression_input_value(expressions, name).is_some())
@@ -720,7 +774,7 @@ fn mouth_reference_source_names() -> &'static [&'static str] {
 	]
 }
 
-fn linear_reference_expression(expressions: &[(String, f32)], intercept: f32, terms: &[(&str, f32)]) -> f32 {
+fn linear_reference_expression(expressions: &ExpressionLookup<'_>, intercept: f32, terms: &[(&str, f32)]) -> f32 {
 	let mut value = intercept;
 	for (name, coefficient) in terms {
 		value += routed_expression_input_value(expressions, name).unwrap_or(0.0) * coefficient;
@@ -1314,6 +1368,16 @@ pub fn resolve_socket_addr(addr: impl ToSocketAddrs) -> anyhow::Result<SocketAdd
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn tcp_reassembly_extracts_one_frame_and_delimiter_per_pass() {
+		let mut buffer = format!("first{TCP_FRAME_DELIMITER}second\npartial").into_bytes();
+
+		assert_eq!(take_reassembled_tcp_frame(&mut buffer), Some(b"first".to_vec()));
+		assert_eq!(take_reassembled_tcp_frame(&mut buffer), Some(b"second".to_vec()));
+		assert_eq!(take_reassembled_tcp_frame(&mut buffer), None);
+		assert_eq!(buffer, b"partial");
+	}
 	use std::io::Write;
 	use std::net::TcpListener;
 	use std::thread;
@@ -1335,6 +1399,17 @@ mod tests {
 			frame.expressions,
 			vec![("eyeBlinkLeft".to_string(), 0.7), ("mouthSmileRight".to_string(), 0.65)]
 		);
+	}
+
+	#[test]
+	fn rejects_non_finite_tracking_values() {
+		let invalid_head = "head#NaN,0,0|leftEye#0,0,0|rightEye#0,0,0";
+		assert!(parse_ifacialmocap_frame(invalid_head, "ifm:test", 1).is_err());
+
+		let packet = "head#0,0,0|leftEye#0,0,0|rightEye#0,0,0|confidence#NaN|jawOpen#inf";
+		let frame = parse_ifacialmocap_frame(packet, "ifm:test", 1).expect("parse finite fields");
+		assert_eq!(frame.confidence, 1.0);
+		assert!(frame.expressions.iter().all(|(name, _)| name != "jawOpen"));
 	}
 
 	#[test]
@@ -1589,6 +1664,31 @@ mod tests {
 	}
 
 	#[test]
+	fn udp_receiver_bounds_work_per_poll() {
+		let mut source = IfacialMocapInputSource::bind(IfacialMocapInputConfig {
+			source_id: "ifm:udp".to_string(),
+			bind_addr: "127.0.0.1:0".parse().expect("addr"),
+			remote_addr: None,
+			transport: IfacialMocapTransport::Udp,
+			start_command: None,
+		})
+		.expect("bind udp");
+		let target = source.local_addr().expect("local addr");
+		let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
+		let packet = b"head#0,0,0|leftEye#0,0,0|rightEye#0,0,0";
+		for _ in 0..(MAX_RECEIVES_PER_POLL + 1) {
+			sender.send_to(packet, target).expect("send frame");
+		}
+		thread::sleep(Duration::from_millis(20));
+
+		let first = source.poll_batch().expect("first poll");
+		let second = source.poll_batch().expect("second poll");
+
+		assert_eq!(first.frames.len(), MAX_RECEIVES_PER_POLL);
+		assert_eq!(second.frames.len(), 1);
+	}
+
+	#[test]
 	fn tcp_receiver_reassembles_split_frames() {
 		let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
 		let remote_addr = listener.local_addr().expect("listener addr");
@@ -1617,5 +1717,67 @@ mod tests {
 		assert_eq!(frames[0].head.pitch, 3.0);
 		assert_eq!(frames[0].head.yaw, -1.5);
 		assert_eq!(frames[0].confidence, 0.9);
+	}
+
+	#[test]
+	fn tcp_receiver_reports_peer_close_once() {
+		let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+		let remote_addr = listener.local_addr().expect("listener addr");
+		let writer = thread::spawn(move || drop(listener.accept().expect("accept")));
+		let mut source = IfacialMocapInputSource::bind(IfacialMocapInputConfig::tcp(remote_addr)).expect("connect tcp");
+		writer.join().expect("writer");
+
+		let mut closed = None;
+		for _ in 0..20 {
+			let batch = source.poll_batch().expect("poll close");
+			if batch.decode_errors != 0 {
+				closed = Some(batch);
+				break;
+			}
+			thread::sleep(Duration::from_millis(10));
+		}
+
+		let closed = closed.expect("peer close must be observed");
+		assert_eq!(closed.decode_errors, 1);
+		assert_eq!(closed.decode_error_examples, vec!["TCP stream closed by peer"]);
+		assert_eq!(source.poll_batch().expect("poll after close").decode_errors, 0);
+		assert!(source.local_addr().is_err());
+	}
+
+	#[test]
+	fn tcp_receiver_reconnects_after_peer_close() {
+		let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+		let remote_addr = listener.local_addr().expect("listener addr");
+		let writer = thread::spawn(move || {
+			drop(listener.accept().expect("first accept"));
+			let (mut stream, _) = listener.accept().expect("second accept");
+			stream
+				.write_all(b"head#4,2,1|leftEye#0,0,0|rightEye#0,0,0___iFacialMocap")
+				.expect("write reconnected frame");
+		});
+		let mut source = IfacialMocapInputSource::bind(IfacialMocapInputConfig::tcp(remote_addr)).expect("connect tcp");
+
+		let mut closed = false;
+		for _ in 0..20 {
+			if source.poll_batch().expect("poll close").decode_errors != 0 {
+				closed = true;
+				break;
+			}
+			thread::sleep(Duration::from_millis(10));
+		}
+		assert!(closed, "first peer close must be observed");
+		source.tcp_reconnect_after = Some(Instant::now());
+		let mut frames = Vec::new();
+		for _ in 0..20 {
+			frames.extend(source.poll_batch().expect("poll reconnect").frames);
+			if !frames.is_empty() {
+				break;
+			}
+			thread::sleep(Duration::from_millis(10));
+		}
+		writer.join().expect("writer");
+
+		assert_eq!(frames.len(), 1);
+		assert_eq!(frames[0].head.pitch, 4.0);
 	}
 }

@@ -44,6 +44,13 @@
 		exitCode: number | null;
 	}
 
+	interface CapturerLogChunk {
+		id: number;
+		baseIndex: number;
+		nextIndex: number;
+		lines: string[];
+	}
+
 	interface CapturerRuntimeStatus {
 		id: number;
 		state: CapturerState;
@@ -638,6 +645,11 @@
 	let startupAutoLaunchAttempted = false;
 
 	let pollHandle: ReturnType<typeof setInterval> | null = null;
+	let refreshCapturersPromise: Promise<void> | null = null;
+	let refreshRuntimeStatusesPromise: Promise<void> | null = null;
+	let refreshCapturerLogsPromise: Promise<void> | null = null;
+	const capturerLogCursors = new Map<number, number>();
+	let capturerListGeneration = 0;
 
 	function updateProfileHintFromEvent(event: Event): void {
 		const target = event.target instanceof HTMLElement ? event.target : null;
@@ -896,10 +908,10 @@
 		appVersion = await invoke<string>("app_version").catch(() => "?");
 		availableLocales = await invoke<string[]>("i18n_available_locales").catch(() => ["ja-JP", "en-US"]);
 		await Promise.all([loadBackendSettings(), refreshCapturers(), refreshProfiles()]);
+		await refreshCapturerLogs();
 		await maybeAutoLaunchSelectedOnStartup();
 		pollHandle = setInterval(() => {
-			void refreshCapturers();
-			void refreshRuntimeStatuses();
+			void refreshCapturers().then(() => Promise.all([refreshRuntimeStatuses(), refreshCapturerLogs()]));
 		}, 1500);
 	});
 
@@ -908,12 +920,56 @@
 		cancelProfilePointerDrag();
 	});
 
-	async function refreshCapturers() {
-		try {
-			capturers = await invoke<CapturerInstance[]>("list_capturers");
-		} catch (error) {
-			errorMessage = `list_capturers failed: ${String(error)}`;
-		}
+	function refreshCapturers(): Promise<void> {
+		if (refreshCapturersPromise) return refreshCapturersPromise;
+		refreshCapturersPromise = (async () => {
+			try {
+				const existingLogs = new Map(capturers.map((capturer) => [capturer.id, capturer.stderrTail]));
+				const listed = await invoke<CapturerInstance[]>("list_capturers");
+				capturers = listed.map((capturer) => ({
+					...capturer,
+					stderrTail: existingLogs.get(capturer.id) ?? capturer.stderrTail,
+				}));
+				capturerListGeneration += 1;
+			} catch (error) {
+				errorMessage = `list_capturers failed: ${String(error)}`;
+			}
+		})().finally(() => {
+			refreshCapturersPromise = null;
+		});
+		return refreshCapturersPromise;
+	}
+
+	function refreshCapturerLogs(): Promise<void> {
+		if (refreshCapturerLogsPromise) return refreshCapturerLogsPromise;
+		refreshCapturerLogsPromise = (async () => {
+			const ids = new Set(capturers.map((capturer) => capturer.id));
+			for (const id of capturerLogCursors.keys()) {
+				if (!ids.has(id)) capturerLogCursors.delete(id);
+			}
+			const chunks = await Promise.all(
+				capturers.map((capturer) =>
+					invoke<CapturerLogChunk>("capturer_logs", {
+						id: capturer.id,
+						afterIndex: capturerLogCursors.get(capturer.id) ?? 0,
+					}).catch(() => null),
+				),
+			);
+			const chunksById = new Map(chunks.filter((chunk): chunk is CapturerLogChunk => chunk !== null).map((chunk) => [chunk.id, chunk]));
+			capturers = capturers.map((capturer) => {
+				const chunk = chunksById.get(capturer.id);
+				if (!chunk) return capturer;
+				const previousIndex = capturerLogCursors.get(capturer.id) ?? 0;
+				capturerLogCursors.set(capturer.id, chunk.nextIndex);
+				const stderrTail = previousIndex < chunk.baseIndex
+					? chunk.lines
+					: [...capturer.stderrTail, ...chunk.lines].slice(-800);
+				return { ...capturer, stderrTail };
+			});
+		})().finally(() => {
+			refreshCapturerLogsPromise = null;
+		});
+		return refreshCapturerLogsPromise;
 	}
 
 	async function refreshProfiles() {
@@ -2368,19 +2424,24 @@
 		void refreshWebcamFormats(device);
 	});
 
-	async function refreshRuntimeStatuses() {
-		const updates: Record<number, CapturerRuntimeStatus> = {};
-		for (const capturer of capturers) {
-			if (capturer.state !== "running" && capturer.state !== "starting") {
-				continue;
+	function refreshRuntimeStatuses(): Promise<void> {
+		if (refreshRuntimeStatusesPromise) return refreshRuntimeStatusesPromise;
+		const generation = capturerListGeneration;
+		const activeCapturers = capturers.filter((capturer) => capturer.state === "running" || capturer.state === "starting");
+		refreshRuntimeStatusesPromise = (async () => {
+			const results = await Promise.allSettled(
+				activeCapturers.map((capturer) => invoke<CapturerRuntimeStatus>("capturer_runtime_status", { id: capturer.id })),
+			);
+			if (generation !== capturerListGeneration) return;
+			const updates: Record<number, CapturerRuntimeStatus> = {};
+			for (const result of results) {
+				if (result.status === "fulfilled") updates[result.value.id] = result.value;
 			}
-			try {
-				updates[capturer.id] = await invoke<CapturerRuntimeStatus>("capturer_runtime_status", { id: capturer.id });
-			} catch {
-				// 個別 Capturer の telemetry 失敗は GUI 全体を壊さない。
-			}
-		}
-		runtimeStatuses = { ...runtimeStatuses, ...updates };
+			runtimeStatuses = { ...runtimeStatuses, ...updates };
+		})().finally(() => {
+			refreshRuntimeStatusesPromise = null;
+		});
+		return refreshRuntimeStatusesPromise;
 	}
 
 	async function launchCapturer() {

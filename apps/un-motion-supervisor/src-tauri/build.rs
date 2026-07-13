@@ -71,7 +71,7 @@ fn bootstrap_capturer(manifest_dir: &Path) {
 	let bootstrap_target = repo.join("target").join("bootstrap");
 	let profile_dir = cargo_profile_dir();
 
-	println!("cargo:warning=bootstrap: building un-motion-capturer release binary");
+	eprintln!("bootstrap: building un-motion-capturer release binary");
 	let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
 	let status = Command::new(cargo)
 		.current_dir(&repo)
@@ -93,7 +93,7 @@ fn bootstrap_capturer(manifest_dir: &Path) {
 		panic!("cargo build un-motion-capturer failed with {status}");
 	}
 
-	println!("cargo:warning=bootstrap: copying un-motion-capturer next to un-motion-supervisor");
+	eprintln!("bootstrap: copying un-motion-capturer next to un-motion-supervisor");
 	let exe_file = exe_name("un-motion-capturer");
 	let from = bootstrap_target.join("release").join(&exe_file);
 	let to = profile_dir.join(&exe_file);
@@ -106,8 +106,8 @@ fn bootstrap_capturer(manifest_dir: &Path) {
 			}
 			std::fs::copy(&from, &fallback)
 				.unwrap_or_else(|err| panic!("copy {} to fallback {}: {err}", from.display(), fallback.display()));
-			println!(
-				"cargo:warning=bootstrap: {} was locked; wrote fresh capturer sidecar {}",
+			eprintln!(
+				"bootstrap: {} was locked; wrote fresh capturer sidecar {}",
 				to.display(),
 				fallback.display()
 			);
@@ -173,8 +173,8 @@ fn build_frontend(frontend_dir: &Path) {
 	let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
 	let node_modules = frontend_dir.join("node_modules");
 	if !node_modules.exists() {
-		println!(
-			"cargo:warning=`{}/node_modules` not found, running `npm install` (first-run only, may take a while)",
+		eprintln!(
+			"`{}/node_modules` not found, running `npm install` (first-run only, may take a while)",
 			frontend_dir.display()
 		);
 		let status = Command::new(npm).current_dir(frontend_dir).args(["install"]).status();
@@ -184,8 +184,8 @@ fn build_frontend(frontend_dir: &Path) {
 			Err(error) => panic!("failed to spawn `npm install` for supervisor frontend: {error}"),
 		}
 	}
-	println!(
-		"cargo:warning=Running `npm run build` for un-motion-supervisor frontend ({})",
+	eprintln!(
+		"Running `npm run build` for un-motion-supervisor frontend ({})",
 		frontend_dir.display()
 	);
 	let status = Command::new(npm).current_dir(frontend_dir).args(["run", "build"]).status();

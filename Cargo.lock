@@ -6889,6 +6889,7 @@ dependencies = [
  "actix-cors",
  "actix-web",
  "anyhow",
+ "arc-swap",
  "futures-util",
  "image",
  "rosc",
@@ -7103,6 +7104,7 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "tempfile",
  "toml 0.8.23",
 ]
 

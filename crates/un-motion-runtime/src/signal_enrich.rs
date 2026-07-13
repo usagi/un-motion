@@ -14,17 +14,17 @@ pub(crate) fn frame_needs_signal_derived_motion(frame: &UNMotionFrame) -> bool {
 
 fn enrich_frame_with_signal_derived_hands(frame: &mut UNMotionFrame) -> bool {
 	let mut inserted = false;
-	if frame.left_hand.is_none() {
-		if let Some(hand) = signal_derived_hand(frame, "left") {
-			frame.left_hand = Some(hand);
-			inserted = true;
-		}
+	if frame.left_hand.is_none()
+		&& let Some(hand) = signal_derived_hand(frame, "left")
+	{
+		frame.left_hand = Some(hand);
+		inserted = true;
 	}
-	if frame.right_hand.is_none() {
-		if let Some(hand) = signal_derived_hand(frame, "right") {
-			frame.right_hand = Some(hand);
-			inserted = true;
-		}
+	if frame.right_hand.is_none()
+		&& let Some(hand) = signal_derived_hand(frame, "right")
+	{
+		frame.right_hand = Some(hand);
+		inserted = true;
 	}
 	inserted
 }
@@ -134,7 +134,7 @@ fn signal_derived_finger_poses(frame: &UNMotionFrame, side: &str, hand_prefix: &
 				);
 				TransformSample {
 					translation: None,
-					rotation: Some(finger_curl_to_quatf(joint_curl, spread, factor, &rest, side, finger_curl)),
+					rotation: Some(finger_curl_to_quatf(joint_curl, spread, factor, rest, side, finger_curl)),
 					scale: None,
 					linear_velocity: None,
 					angular_velocity: None,

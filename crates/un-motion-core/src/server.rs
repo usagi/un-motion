@@ -340,19 +340,45 @@ async fn events_stream(state: web::Data<CoreControlState>) -> HttpResponse {
 }
 
 async fn events_response(state: web::Data<CoreControlState>) -> HttpResponse {
-	let initial_event = state.snapshot_event().await;
+	let (initial_event, receiver) = subscribe_before_snapshot(&state).await;
 	let initial = stream::once(async move { Ok::<Bytes, Error>(format_sse_event(&initial_event)) });
-	let event_stream = stream::unfold(state.subscribe(), |mut receiver| async move {
-		loop {
-			match receiver.recv().await {
-				Ok(event) => return Some((Ok::<Bytes, Error>(format_sse_event(&event)), receiver)),
-				Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-				Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-			}
-		}
+	let event_stream = stream::unfold((state.clone(), receiver), |(state, receiver)| async move {
+		let (event, next_receiver) = receive_event_or_resync(&state, receiver).await?;
+		Some((Ok::<Bytes, Error>(format_sse_event(&event)), (state, next_receiver)))
 	});
 
 	sse_response(initial.chain(event_stream))
+}
+
+async fn receive_event_or_resync(
+	state: &CoreControlState,
+	mut receiver: tokio::sync::broadcast::Receiver<CoreEvent>,
+) -> Option<(CoreEvent, tokio::sync::broadcast::Receiver<CoreEvent>)> {
+	match classify_event_delivery(receiver.recv().await) {
+		EventDelivery::Event(event) => Some((*event, receiver)),
+		EventDelivery::Snapshot => Some(subscribe_before_snapshot(state).await),
+		EventDelivery::Closed => None,
+	}
+}
+
+async fn subscribe_before_snapshot(state: &CoreControlState) -> (CoreEvent, tokio::sync::broadcast::Receiver<CoreEvent>) {
+	let receiver = state.subscribe();
+	let snapshot = state.snapshot_event().await;
+	(snapshot, receiver)
+}
+
+enum EventDelivery {
+	Event(Box<CoreEvent>),
+	Snapshot,
+	Closed,
+}
+
+fn classify_event_delivery(result: Result<CoreEvent, tokio::sync::broadcast::error::RecvError>) -> EventDelivery {
+	match result {
+		Ok(event) => EventDelivery::Event(Box::new(event)),
+		Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => EventDelivery::Snapshot,
+		Err(tokio::sync::broadcast::error::RecvError::Closed) => EventDelivery::Closed,
+	}
 }
 
 fn sse_response<S>(body: S) -> HttpResponse
@@ -384,6 +410,43 @@ mod tests {
 	};
 
 	use super::*;
+
+	#[actix_web::test]
+	async fn lagged_event_delivery_requests_a_snapshot() {
+		assert!(matches!(
+			classify_event_delivery(Err(tokio::sync::broadcast::error::RecvError::Lagged(7))),
+			EventDelivery::Snapshot
+		));
+	}
+
+	#[actix_web::test]
+	async fn event_subscription_is_active_after_initial_snapshot() {
+		let state = CoreControlState::default();
+		let (_, mut receiver) = subscribe_before_snapshot(&state).await;
+
+		state.start_runtime().await;
+		let event = receiver.recv().await.expect("runtime event");
+		assert_eq!(event.kind, crate::CoreEventKind::RuntimeStarted);
+		state.stop_runtime().await;
+	}
+
+	#[actix_web::test]
+	async fn lagged_event_subscription_discards_pre_snapshot_queue() {
+		let state = CoreControlState::default();
+		let receiver = state.subscribe();
+		for index in 0..130 {
+			let mut document = state.profile_document().await;
+			document.profiles[0].name = format!("profile-{index}");
+			state.set_profile_document(document).await.expect("profile update");
+		}
+
+		let (event, mut receiver) = receive_event_or_resync(&state, receiver).await.expect("resync event");
+		assert_eq!(event.kind, crate::CoreEventKind::Snapshot);
+		assert!(matches!(
+			receiver.try_recv(),
+			Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+		));
+	}
 
 	#[actix_web::test]
 	async fn rest_start_stop_status_endpoints_work() {

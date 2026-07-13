@@ -6,6 +6,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rosc::{OscMessage, OscPacket, OscType, decoder};
 
 const MAX_DATAGRAMS_PER_POLL: usize = 64;
+pub const MAX_VMC_BLENDSHAPES: usize = 1_024;
+pub const MAX_VMC_NAME_BYTES: usize = 256;
+pub const MAX_VMC_BONES_PER_FRAME: usize = 256;
+pub const MAX_VMC_MESSAGES_PER_FRAME: usize = 1_024;
+const MAX_OSC_BUNDLE_DEPTH: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VmcInputConfig {
@@ -129,27 +134,52 @@ impl VmcPacketDecoder {
 
 	pub fn decode_packet(&mut self, packet: &OscPacket, received_timestamp_ns: u64) -> Option<VmcInputFrame> {
 		let mut frame = VmcInputFrame::empty(self.source_id.clone(), received_timestamp_ns);
-		self.visit_packet(packet, &mut frame);
+		self.visit_packet(packet, &mut frame, 0);
 		if frame.is_empty() { None } else { Some(frame) }
 	}
 
 	pub fn decode_datagram(&mut self, data: &[u8], received_timestamp_ns: u64) -> anyhow::Result<Option<VmcInputFrame>> {
+		self.decode_datagram_with_raw(data, received_timestamp_ns, true)
+	}
+
+	pub fn decode_datagram_without_raw(&mut self, data: &[u8], received_timestamp_ns: u64) -> anyhow::Result<Option<VmcInputFrame>> {
+		self.decode_datagram_with_raw(data, received_timestamp_ns, false)
+	}
+
+	fn decode_datagram_with_raw(
+		&mut self,
+		data: &[u8],
+		received_timestamp_ns: u64,
+		preserve_raw: bool,
+	) -> anyhow::Result<Option<VmcInputFrame>> {
 		if is_unsupported_waidayo_mp_datagram(data) {
 			return Ok(None);
 		}
-		let (_remaining, packet) = decoder::decode_udp(data)?;
+		validate_osc_bundle_depth(data)?;
+		let (remaining, packet) = decoder::decode_udp(data)?;
+		if !remaining.is_empty() {
+			anyhow::bail!("VMC OSC datagram has {} trailing byte(s)", remaining.len());
+		}
 		Ok(self.decode_packet(&packet, received_timestamp_ns).map(|mut frame| {
-			frame.raw_datagram = Some(data.to_vec());
+			if preserve_raw {
+				frame.raw_datagram = Some(data.to_vec());
+			}
 			frame
 		}))
 	}
 
-	fn visit_packet(&mut self, packet: &OscPacket, frame: &mut VmcInputFrame) {
+	fn visit_packet(&mut self, packet: &OscPacket, frame: &mut VmcInputFrame, depth: usize) {
+		if depth > MAX_OSC_BUNDLE_DEPTH || frame.message_count >= MAX_VMC_MESSAGES_PER_FRAME {
+			return;
+		}
 		match packet {
 			OscPacket::Message(message) => self.visit_message(message, frame),
 			OscPacket::Bundle(bundle) => {
 				for packet in &bundle.content {
-					self.visit_packet(packet, frame);
+					self.visit_packet(packet, frame, depth + 1);
+					if frame.message_count >= MAX_VMC_MESSAGES_PER_FRAME {
+						break;
+					}
 				}
 			}
 		}
@@ -165,7 +195,11 @@ impl VmcPacketDecoder {
 				frame.root = parse_transform(&message.args);
 			}
 			"/VMC/Ext/Bone/Pos" => {
-				if let Some(transform) = parse_transform(&message.args) {
+				if frame.bones.len() < MAX_VMC_BONES_PER_FRAME
+					&& let Some(transform) = parse_transform(&message.args)
+					&& !transform.name.is_empty()
+					&& transform.name.len() <= MAX_VMC_NAME_BYTES
+				{
 					frame.bones.push(VmcBoneSample {
 						name: transform.name,
 						position: transform.position,
@@ -175,11 +209,15 @@ impl VmcPacketDecoder {
 			}
 			"/VMC/Ext/Blend/Val" => {
 				if let (Some(name), Some(value)) = (message.args.first().and_then(osc_string), message.args.get(1).and_then(osc_float)) {
-					self.pending_blendshapes.insert(name.to_string(), value);
-					frame.blendshapes.push(VmcBlendshapeSample {
-						name: name.to_string(),
-						value,
-					});
+					let valid_name = !name.is_empty() && name.len() <= MAX_VMC_NAME_BYTES;
+					let has_capacity = self.pending_blendshapes.contains_key(name) || self.pending_blendshapes.len() < MAX_VMC_BLENDSHAPES;
+					if valid_name && has_capacity {
+						self.pending_blendshapes.insert(name.to_string(), value);
+						frame.blendshapes.push(VmcBlendshapeSample {
+							name: name.to_string(),
+							value,
+						});
+					}
 				}
 			}
 			"/VMC/Ext/Blend/Apply" => {
@@ -197,6 +235,44 @@ impl VmcPacketDecoder {
 			_ => {}
 		}
 	}
+}
+
+fn validate_osc_bundle_depth(data: &[u8]) -> anyhow::Result<()> {
+	const BUNDLE_PREFIX: &[u8; 8] = b"#bundle\0";
+	if !data.starts_with(BUNDLE_PREFIX) {
+		return Ok(());
+	}
+	let mut pending = vec![(data, 1_usize)];
+	while let Some((bundle, depth)) = pending.pop() {
+		if depth > MAX_OSC_BUNDLE_DEPTH {
+			anyhow::bail!("VMC OSC bundle depth exceeds {MAX_OSC_BUNDLE_DEPTH}");
+		}
+		if bundle.len() < 16 {
+			continue;
+		}
+		let mut offset = 16_usize;
+		while offset < bundle.len() {
+			let Some(size_bytes) = bundle.get(offset..offset.saturating_add(4)) else {
+				break;
+			};
+			let size = i32::from_be_bytes([size_bytes[0], size_bytes[1], size_bytes[2], size_bytes[3]]);
+			let Ok(size) = usize::try_from(size) else {
+				break;
+			};
+			let element_start = offset + 4;
+			let Some(element_end) = element_start.checked_add(size) else {
+				break;
+			};
+			let Some(element) = bundle.get(element_start..element_end) else {
+				break;
+			};
+			if element.starts_with(BUNDLE_PREFIX) {
+				pending.push((element, depth + 1));
+			}
+			offset = element_end;
+		}
+	}
+	Ok(())
 }
 
 pub struct VmcInputSource {
@@ -260,7 +336,7 @@ impl VmcInputSource {
 					received += 1;
 					let data = &buf[..len];
 					let was_dropped_as_non_vmc = is_unsupported_waidayo_mp_datagram(data);
-					match self.decoder.decode_datagram(data, now_unix_ns()) {
+					match self.decoder.decode_datagram_without_raw(data, now_unix_ns()) {
 						Ok(Some(frame)) => frames.push(frame),
 						Ok(None) => {
 							if was_dropped_as_non_vmc {
@@ -327,17 +403,33 @@ fn parse_transform(args: &[OscType]) -> Option<VmcTransform> {
 		args.get(2).and_then(osc_float)?,
 		args.get(3).and_then(osc_float)?,
 	];
-	let rotation = [
+	let rotation = normalize_input_quaternion([
 		args.get(4).and_then(osc_float)?,
 		args.get(5).and_then(osc_float)?,
 		args.get(6).and_then(osc_float)?,
 		args.get(7).and_then(osc_float)?,
-	];
+	])?;
 	Some(VmcTransform {
 		name: name.to_string(),
 		position,
 		rotation,
 	})
+}
+
+fn normalize_input_quaternion(rotation: [f32; 4]) -> Option<[f32; 4]> {
+	let length_squared = rotation.iter().map(|value| value * value).sum::<f32>();
+	if !length_squared.is_finite() || length_squared <= 1e-12 {
+		return None;
+	}
+	let inverse_length = length_squared.sqrt().recip();
+	let normalized = rotation.map(|value| value * inverse_length);
+	let negate = normalized[3] < 0.0
+		|| (normalized[3] == 0.0
+			&& normalized[..3]
+				.iter()
+				.find(|value| **value != 0.0)
+				.is_some_and(|value| *value < 0.0));
+	Some(if negate { normalized.map(|value| -value) } else { normalized })
 }
 
 fn osc_string(value: &OscType) -> Option<&str> {
@@ -348,13 +440,14 @@ fn osc_string(value: &OscType) -> Option<&str> {
 }
 
 fn osc_float(value: &OscType) -> Option<f32> {
-	match value {
+	let value = match value {
 		OscType::Float(value) => Some(*value),
 		OscType::Double(value) => Some(*value as f32),
 		OscType::Int(value) => Some(*value as f32),
 		OscType::Long(value) => Some(*value as f32),
 		_ => None,
-	}
+	}?;
+	value.is_finite().then_some(value)
 }
 
 fn osc_int(value: &OscType) -> Option<i32> {
@@ -396,6 +489,128 @@ mod tests {
 			timetag: OscTime { seconds: 0, fractional: 1 },
 			content,
 		})
+	}
+
+	fn nested_bundle(depth: usize, mut packet: OscPacket) -> OscPacket {
+		for _ in 0..depth {
+			packet = bundle(vec![packet]);
+		}
+		packet
+	}
+
+	#[test]
+	fn nested_bundle_depth_is_bounded() {
+		let message = || packet_message("/VMC/Ext/OK", vec![OscType::Int(1)]);
+		let mut decoder = VmcPacketDecoder::new("depth");
+		assert!(decoder.decode_packet(&nested_bundle(MAX_OSC_BUNDLE_DEPTH, message()), 1).is_some());
+		assert!(
+			decoder
+				.decode_packet(&nested_bundle(MAX_OSC_BUNDLE_DEPTH + 1, message()), 2)
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn rejects_excessive_bundle_depth_before_osc_decode() {
+		let packet = nested_bundle(MAX_OSC_BUNDLE_DEPTH + 1, packet_message("/VMC/Ext/OK", vec![OscType::Int(1)]));
+		let data = encoder::encode(&packet).expect("encode nested bundle");
+		let mut decoder = VmcPacketDecoder::new("wire-depth");
+
+		let error = decoder.decode_datagram(&data, 1).expect_err("wire depth must fail");
+
+		assert!(error.to_string().contains("bundle depth exceeds"), "{error:#}");
+	}
+
+	#[test]
+	fn bounds_messages_and_bones_per_frame() {
+		let bone = || {
+			packet_message(
+				"/VMC/Ext/Bone/Pos",
+				vec![
+					OscType::String("Head".to_string()),
+					OscType::Float(0.0),
+					OscType::Float(1.0),
+					OscType::Float(0.0),
+					OscType::Float(0.0),
+					OscType::Float(0.0),
+					OscType::Float(0.0),
+					OscType::Float(1.0),
+				],
+			)
+		};
+		let packet = bundle((0..MAX_VMC_MESSAGES_PER_FRAME + 100).map(|_| bone()).collect());
+		let mut decoder = VmcPacketDecoder::new("bounded-frame");
+
+		let frame = decoder.decode_packet(&packet, 1).expect("bounded frame");
+
+		assert_eq!(frame.message_count, MAX_VMC_MESSAGES_PER_FRAME);
+		assert_eq!(frame.bones.len(), MAX_VMC_BONES_PER_FRAME);
+	}
+
+	#[test]
+	fn rejects_trailing_bytes_after_osc_packet() {
+		let mut data = encoder::encode(&packet_message("/VMC/Ext/OK", vec![OscType::Int(1)])).expect("encode packet");
+		data.extend_from_slice(&[0, 0, 0, 0]);
+		let mut decoder = VmcPacketDecoder::new("trailing");
+
+		let error = decoder.decode_datagram(&data, 1).expect_err("trailing bytes must fail");
+
+		assert!(error.to_string().contains("trailing byte"), "{error:#}");
+	}
+
+	#[test]
+	fn rejects_non_finite_osc_numbers() {
+		assert_eq!(osc_float(&OscType::Float(f32::NAN)), None);
+		assert_eq!(osc_float(&OscType::Double(f64::INFINITY)), None);
+		assert!(
+			parse_transform(&[
+				OscType::String("Head".to_string()),
+				OscType::Float(f32::NAN),
+				OscType::Float(0.0),
+				OscType::Float(0.0),
+				OscType::Float(0.0),
+				OscType::Float(0.0),
+				OscType::Float(0.0),
+				OscType::Float(1.0),
+			])
+			.is_none()
+		);
+	}
+
+	#[test]
+	fn rejects_zero_quaternions_and_normalizes_valid_transforms() {
+		assert_eq!(normalize_input_quaternion([0.0; 4]), None);
+		let normalized = normalize_input_quaternion([0.0, 0.0, 0.0, 2.0]).expect("valid quaternion");
+		assert_eq!(normalized, [0.0, 0.0, 0.0, 1.0]);
+	}
+
+	#[test]
+	fn equivalent_quaternion_signs_are_canonicalized() {
+		let positive = normalize_input_quaternion([0.25, -0.5, 0.75, 1.0]).expect("positive quaternion");
+		let negative = normalize_input_quaternion([-0.25, 0.5, -0.75, -1.0]).expect("negative quaternion");
+
+		assert_eq!(positive, negative);
+		assert!(positive[3] >= 0.0);
+		let half_turn = normalize_input_quaternion([1.0, 0.0, 0.0, 0.0]).expect("half-turn quaternion");
+		let negated_half_turn = normalize_input_quaternion([-1.0, -0.0, -0.0, -0.0]).expect("negated half-turn quaternion");
+		assert_eq!(half_turn, negated_half_turn);
+	}
+
+	#[test]
+	fn pending_blendshape_names_are_bounded() {
+		let mut decoder = VmcPacketDecoder::new("bounded");
+		for index in 0..(MAX_VMC_BLENDSHAPES + 10) {
+			let packet = packet_message(
+				"/VMC/Ext/Blend/Val",
+				vec![OscType::String(format!("Blend{index}")), OscType::Float(0.5)],
+			);
+			let _ = decoder.decode_packet(&packet, index as u64);
+		}
+		assert_eq!(decoder.pending_blendshapes.len(), MAX_VMC_BLENDSHAPES);
+		let oversized = "x".repeat(MAX_VMC_NAME_BYTES + 1);
+		let packet = packet_message("/VMC/Ext/Blend/Val", vec![OscType::String(oversized.clone()), OscType::Float(0.5)]);
+		assert!(decoder.decode_packet(&packet, 0).is_none());
+		assert!(!decoder.pending_blendshapes.contains_key(&oversized));
 	}
 
 	fn encoded_bone_packet(name: &str, x: f32) -> Vec<u8> {
@@ -456,7 +671,10 @@ mod tests {
 		assert_eq!(frame.root.expect("root").position, [1.0, 2.0, 3.0]);
 		assert_eq!(frame.bones.len(), 1);
 		assert_eq!(frame.bones[0].name, "Head");
-		assert_eq!(frame.bones[0].rotation, [0.0, 0.2, 0.0, 0.98]);
+		let rotation = frame.bones[0].rotation;
+		let length = rotation.iter().map(|value| value * value).sum::<f32>().sqrt();
+		assert!((length - 1.0).abs() < 1e-6);
+		assert!((rotation[1] - 0.199_960_01).abs() < 1e-6);
 		assert_eq!(frame.message_count, 3);
 	}
 
@@ -517,6 +735,18 @@ mod tests {
 		assert_eq!(frame.blendshapes.len(), 1);
 		assert_eq!(frame.blendshapes[0].name, "eyeBlinkLeft");
 		assert!(!frame.blend_apply);
+	}
+
+	#[test]
+	fn runtime_decode_can_skip_raw_datagram_copy() {
+		let packet = packet_message("/VMC/Ext/OK", vec![OscType::Int(1)]);
+		let encoded = encoder::encode(&packet).expect("encode");
+		let mut decoder = VmcPacketDecoder::new("vmc:runtime");
+
+		let frame = decoder.decode_datagram_without_raw(&encoded, 10).expect("decode").expect("frame");
+
+		assert!(frame.raw_datagram.is_none());
+		assert_eq!(frame.ok, Some(1));
 	}
 
 	#[test]

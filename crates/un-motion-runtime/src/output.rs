@@ -4,22 +4,56 @@ use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{
-	Arc,
-	mpsc::{self, Receiver, Sender},
+	Arc, Mutex,
+	atomic::{AtomicBool, Ordering},
+	mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use rosc::{OscBundle, OscMessage, OscPacket, OscTime, OscType, encoder};
+use rosc::{OscMessage, OscPacket, OscType};
 use tracing::{debug, info, warn};
 use un_motion_frame::UNMotionFrame;
-use un_motion_output_vmc::{vmc_packets_for_frame, vmc_packets_for_frame_without_ok};
-use un_motion_output_vrc_osc::{VrcOscAvatarParameters, VrcOscOutputOptions, VrcOscOutputSink};
+use un_motion_output_vmc::{encode_vmc_datagrams, vmc_packets_for_frame, vmc_packets_for_frame_without_ok};
+use un_motion_output_vrc_osc::{MAX_VRC_AVATAR_PARAMETER_STATES, VrcOscAvatarParameters, VrcOscOutputOptions, VrcOscOutputSink};
 use un_motion_record::MessagePackStreamRecorder;
 
 use crate::signal_enrich::{enrich_frame_with_signal_derived_motion, frame_needs_signal_derived_motion};
 use crate::{ModifierConfig, ModifierPipeline, vmc_bone_name_to_humanoid_bone};
+
+const OSCQUERY_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const OSCQUERY_MAX_TREE_DEPTH: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputDisconnected;
+
+pub(crate) struct LatestFrameSlot<T> {
+	inner: Arc<Mutex<Option<T>>>,
+}
+
+impl<T> Clone for LatestFrameSlot<T> {
+	fn clone(&self) -> Self {
+		Self { inner: self.inner.clone() }
+	}
+}
+
+impl<T> LatestFrameSlot<T> {
+	pub(crate) fn new() -> Self {
+		Self {
+			inner: Arc::new(Mutex::new(None)),
+		}
+	}
+
+	pub(crate) fn replace(&self, value: T) -> Result<(), OutputDisconnected> {
+		*self.inner.lock().map_err(|_| OutputDisconnected)? = Some(value);
+		Ok(())
+	}
+
+	pub(crate) fn take(&self) -> Option<T> {
+		self.inner.lock().ok()?.take()
+	}
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct VmcOutputConfig {
@@ -55,13 +89,13 @@ impl VmcOutputConfig {
 pub enum VmcOutputFrame {
 	/// 正式経路: post-process 済み `UNMotionFrame` を受け取り、Modifier 適用後に
 	/// `vmc_packets_for_frame` で OSC bundle に変換して送信する。
-	UnmotionFrame(UNMotionFrame),
+	UnmotionFrame(Box<UNMotionFrame>),
 	SharedUnmotionFrame(Arc<UNMotionFrame>),
 }
 
 impl From<UNMotionFrame> for VmcOutputFrame {
 	fn from(frame: UNMotionFrame) -> Self {
-		Self::UnmotionFrame(frame)
+		Self::UnmotionFrame(Box::new(frame))
 	}
 }
 
@@ -73,7 +107,7 @@ impl From<Arc<UNMotionFrame>> for VmcOutputFrame {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum VmcOutputCommand {
-	Send(VmcOutputFrame),
+	FrameReady,
 	Shutdown,
 }
 
@@ -172,19 +206,18 @@ impl VmcOutputWorker {
 			});
 		}
 		let packet_count = packets.len() as u64;
-		let encoded = encoder::encode(&OscPacket::Bundle(OscBundle {
-			timetag: OscTime { seconds: 0, fractional: 1 },
-			content: packets,
-		}))
-		.context("VMC OSC encode failed")?;
-		self.socket
-			.send_to(&encoded, self.config.target_addr)
-			.with_context(|| format!("VMC UDP send failed: {}", self.config.target_addr))?;
-		self.stats.sent_datagrams += 1;
+		let datagrams = encode_vmc_datagrams(packets)?;
+		for encoded in &datagrams {
+			self.socket
+				.send_to(encoded, self.config.target_addr)
+				.with_context(|| format!("VMC UDP send failed: {}", self.config.target_addr))?;
+		}
+		let datagram_count = datagrams.len() as u64;
+		self.stats.sent_datagrams += datagram_count;
 		self.stats.sent_packets += packet_count;
 		Ok(VmcOutputEvent::Sent {
 			target_addr: self.config.target_addr,
-			datagrams: 1,
+			datagrams: datagram_count,
 			packets: packet_count,
 		})
 	}
@@ -227,28 +260,29 @@ fn vmc_message_enabled(message: &OscMessage, modifier: &ModifierConfig) -> bool 
 
 pub struct VmcOutputWorkerHandle {
 	pub target_addr: SocketAddr,
-	command_tx: Sender<VmcOutputCommand>,
+	command_tx: SyncSender<VmcOutputCommand>,
+	latest_frame: LatestFrameSlot<VmcOutputFrame>,
 	join: Option<JoinHandle<()>>,
+	stop: Arc<AtomicBool>,
 }
 
 impl VmcOutputWorkerHandle {
-	pub fn send(&self, frame: impl Into<VmcOutputFrame>) -> Result<(), std::sync::mpsc::SendError<VmcOutputCommand>> {
-		self.command_tx.send(VmcOutputCommand::Send(frame.into()))
+	pub fn send(&self, frame: impl Into<VmcOutputFrame>) -> Result<bool, OutputDisconnected> {
+		self.latest_frame.replace(frame.into())?;
+		match self.command_tx.try_send(VmcOutputCommand::FrameReady) {
+			Ok(()) | Err(TrySendError::Full(_)) => Ok(true),
+			Err(TrySendError::Disconnected(_)) => Err(OutputDisconnected),
+		}
 	}
 
 	pub fn shutdown(&self) {
-		let _ = self.command_tx.send(VmcOutputCommand::Shutdown);
+		self.stop.store(true, Ordering::Release);
+		let _ = self.command_tx.try_send(VmcOutputCommand::Shutdown);
 	}
 
 	pub fn join(mut self) -> thread::Result<()> {
 		self.shutdown();
 		if let Some(join) = self.join.take() { join.join() } else { Ok(()) }
-	}
-}
-
-impl Drop for VmcOutputWorkerHandle {
-	fn drop(&mut self) {
-		let _ = self.command_tx.send(VmcOutputCommand::Shutdown);
 	}
 }
 
@@ -284,7 +318,7 @@ impl FileOutputConfig {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum FileOutputCommand {
-	WriteFrame(UNMotionFrame),
+	WriteFrame(Box<UNMotionFrame>),
 	Flush,
 	Shutdown,
 }
@@ -372,21 +406,25 @@ impl FileOutputWorker {
 
 pub struct FileOutputWorkerHandle {
 	pub path: PathBuf,
-	command_tx: Sender<FileOutputCommand>,
+	command_tx: SyncSender<FileOutputCommand>,
 	join: Option<JoinHandle<()>>,
+	stop: Arc<AtomicBool>,
 }
 
 impl FileOutputWorkerHandle {
-	pub fn write_frame(&self, frame: UNMotionFrame) -> Result<(), std::sync::mpsc::SendError<FileOutputCommand>> {
-		self.command_tx.send(FileOutputCommand::WriteFrame(frame))
+	pub fn write_frame(&self, frame: UNMotionFrame) -> Result<(), OutputDisconnected> {
+		self.command_tx
+			.send(FileOutputCommand::WriteFrame(Box::new(frame)))
+			.map_err(|_| OutputDisconnected)
 	}
 
-	pub fn flush(&self) -> Result<(), std::sync::mpsc::SendError<FileOutputCommand>> {
-		self.command_tx.send(FileOutputCommand::Flush)
+	pub fn flush(&self) -> Result<(), OutputDisconnected> {
+		self.command_tx.send(FileOutputCommand::Flush).map_err(|_| OutputDisconnected)
 	}
 
 	pub fn shutdown(&self) {
-		let _ = self.command_tx.send(FileOutputCommand::Shutdown);
+		self.stop.store(true, Ordering::Release);
+		let _ = self.command_tx.try_send(FileOutputCommand::Shutdown);
 	}
 
 	pub fn join(mut self) -> thread::Result<()> {
@@ -395,26 +433,26 @@ impl FileOutputWorkerHandle {
 	}
 }
 
-impl Drop for FileOutputWorkerHandle {
-	fn drop(&mut self) {
-		let _ = self.command_tx.send(FileOutputCommand::Shutdown);
-	}
-}
-
 pub fn spawn_vmc_output_worker(config: VmcOutputConfig, event_tx: Sender<VmcOutputEvent>) -> anyhow::Result<VmcOutputWorkerHandle> {
 	let mut worker = VmcOutputWorker::bind(config)?;
 	let target_addr = worker.target_addr();
+	let latest_frame = LatestFrameSlot::new();
+	let worker_latest_frame = latest_frame.clone();
 	info!(
 		target: "un_motion_runtime::vmc_output",
 		target_addr = %target_addr,
 		"VMC output worker bound",
 	);
-	let (command_tx, command_rx) = mpsc::channel();
-	let join = thread::spawn(move || run_vmc_output_worker(&mut worker, command_rx, event_tx));
+	let (command_tx, command_rx) = mpsc::sync_channel(1);
+	let stop = Arc::new(AtomicBool::new(false));
+	let worker_stop = Arc::clone(&stop);
+	let join = thread::spawn(move || run_vmc_output_worker(&mut worker, command_rx, worker_latest_frame, event_tx, worker_stop));
 	Ok(VmcOutputWorkerHandle {
 		target_addr,
 		command_tx,
+		latest_frame,
 		join: Some(join),
+		stop,
 	})
 }
 
@@ -464,13 +502,13 @@ impl VrcOscOutputConfig {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum VrcOscOutputFrame {
-	UnmotionFrame(UNMotionFrame),
+	UnmotionFrame(Box<UNMotionFrame>),
 	SharedUnmotionFrame(Arc<UNMotionFrame>),
 }
 
 impl From<UNMotionFrame> for VrcOscOutputFrame {
 	fn from(frame: UNMotionFrame) -> Self {
-		Self::UnmotionFrame(frame)
+		Self::UnmotionFrame(Box::new(frame))
 	}
 }
 
@@ -482,7 +520,7 @@ impl From<Arc<UNMotionFrame>> for VrcOscOutputFrame {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum VrcOscOutputCommand {
-	Send(VrcOscOutputFrame),
+	FrameReady,
 	Shutdown,
 }
 
@@ -567,6 +605,9 @@ impl VrcOscOutputWorker {
 		match frame {
 			VrcOscOutputFrame::UnmotionFrame(mut frame) => self.send_unmotion_frame(&mut frame),
 			VrcOscOutputFrame::SharedUnmotionFrame(frame) => {
+				if self.config.modifier.is_pass_through() {
+					return self.send_borrowed_unmotion_frame(&frame);
+				}
 				let mut frame = (*frame).clone();
 				self.send_unmotion_frame(&mut frame)
 			}
@@ -574,8 +615,12 @@ impl VrcOscOutputWorker {
 	}
 
 	fn send_unmotion_frame(&mut self, frame: &mut UNMotionFrame) -> anyhow::Result<VrcOscOutputEvent> {
-		self.refresh_avatar_parameters_if_due();
 		self.modifier_pipeline.apply(frame);
+		self.send_borrowed_unmotion_frame(frame)
+	}
+
+	fn send_borrowed_unmotion_frame(&mut self, frame: &UNMotionFrame) -> anyhow::Result<VrcOscOutputEvent> {
+		self.refresh_avatar_parameters_if_due();
 		let (datagrams, packets) = self.sink.send(frame)?;
 		if datagrams == 0 || packets == 0 {
 			self.stats.skipped_frames = self.stats.skipped_frames.saturating_add(1);
@@ -654,28 +699,29 @@ impl VrcOscOutputWorker {
 
 pub struct VrcOscOutputWorkerHandle {
 	pub target_addr: SocketAddr,
-	command_tx: Sender<VrcOscOutputCommand>,
+	command_tx: SyncSender<VrcOscOutputCommand>,
+	latest_frame: LatestFrameSlot<VrcOscOutputFrame>,
 	join: Option<JoinHandle<()>>,
+	stop: Arc<AtomicBool>,
 }
 
 impl VrcOscOutputWorkerHandle {
-	pub fn send(&self, frame: impl Into<VrcOscOutputFrame>) -> Result<(), std::sync::mpsc::SendError<VrcOscOutputCommand>> {
-		self.command_tx.send(VrcOscOutputCommand::Send(frame.into()))
+	pub fn send(&self, frame: impl Into<VrcOscOutputFrame>) -> Result<bool, OutputDisconnected> {
+		self.latest_frame.replace(frame.into())?;
+		match self.command_tx.try_send(VrcOscOutputCommand::FrameReady) {
+			Ok(()) | Err(TrySendError::Full(_)) => Ok(true),
+			Err(TrySendError::Disconnected(_)) => Err(OutputDisconnected),
+		}
 	}
 
 	pub fn shutdown(&self) {
-		let _ = self.command_tx.send(VrcOscOutputCommand::Shutdown);
+		self.stop.store(true, Ordering::Release);
+		let _ = self.command_tx.try_send(VrcOscOutputCommand::Shutdown);
 	}
 
 	pub fn join(mut self) -> thread::Result<()> {
 		self.shutdown();
 		if let Some(join) = self.join.take() { join.join() } else { Ok(()) }
-	}
-}
-
-impl Drop for VrcOscOutputWorkerHandle {
-	fn drop(&mut self) {
-		let _ = self.command_tx.send(VrcOscOutputCommand::Shutdown);
 	}
 }
 
@@ -685,58 +731,72 @@ pub fn spawn_vrc_osc_output_worker(
 ) -> anyhow::Result<VrcOscOutputWorkerHandle> {
 	let mut worker = VrcOscOutputWorker::bind(config)?;
 	let target_addr = worker.target_addr();
+	let latest_frame = LatestFrameSlot::new();
+	let worker_latest_frame = latest_frame.clone();
 	info!(
 		target: "un_motion_runtime::vrc_osc_output",
 		target_addr = %target_addr,
 		"VRC OSC output worker bound",
 	);
-	let (command_tx, command_rx) = mpsc::channel();
-	let join = thread::spawn(move || run_vrc_osc_output_worker(&mut worker, command_rx, event_tx));
+	let (command_tx, command_rx) = mpsc::sync_channel(1);
+	let stop = Arc::new(AtomicBool::new(false));
+	let worker_stop = Arc::clone(&stop);
+	let join = thread::spawn(move || run_vrc_osc_output_worker(&mut worker, command_rx, worker_latest_frame, event_tx, worker_stop));
 	Ok(VrcOscOutputWorkerHandle {
 		target_addr,
 		command_tx,
+		latest_frame,
 		join: Some(join),
+		stop,
 	})
 }
 
 fn run_vrc_osc_output_worker(
 	worker: &mut VrcOscOutputWorker,
 	command_rx: Receiver<VrcOscOutputCommand>,
+	latest_frame: LatestFrameSlot<VrcOscOutputFrame>,
 	event_tx: Sender<VrcOscOutputEvent>,
+	stop: Arc<AtomicBool>,
 ) {
 	const SEND_LOG_INTERVAL: u64 = 30;
 	let target_addr = worker.target_addr();
 	for command in command_rx {
+		if stop.load(Ordering::Acquire) {
+			break;
+		}
 		match command {
-			VrcOscOutputCommand::Send(frame) => match worker.send_frame(frame) {
-				Ok(event) => {
-					let stats = worker.stats();
-					if stats.sent_datagrams == 1 || stats.sent_datagrams % SEND_LOG_INTERVAL == 0 {
-						debug!(
+			VrcOscOutputCommand::FrameReady => {
+				let Some(frame) = latest_frame.take() else { continue };
+				match worker.send_frame(frame) {
+					Ok(event) => {
+						let stats = worker.stats();
+						if stats.sent_datagrams == 1 || stats.sent_datagrams.is_multiple_of(SEND_LOG_INTERVAL) {
+							debug!(
+								target: "un_motion_runtime::vrc_osc_output",
+								target_addr = %target_addr,
+								sent_datagrams = stats.sent_datagrams,
+								sent_packets = stats.sent_packets,
+								skipped_frames = stats.skipped_frames,
+								vrchat_detected = worker.vrchat_detected(),
+								"VRC OSC output event",
+							);
+						}
+						let _ = event_tx.send(event);
+					}
+					Err(error) => {
+						warn!(
 							target: "un_motion_runtime::vrc_osc_output",
 							target_addr = %target_addr,
-							sent_datagrams = stats.sent_datagrams,
-							sent_packets = stats.sent_packets,
-							skipped_frames = stats.skipped_frames,
-							vrchat_detected = worker.vrchat_detected(),
-							"VRC OSC output event",
+							error = %error,
+							"VRC OSC datagram send failed",
 						);
+						let _ = event_tx.send(VrcOscOutputEvent::Error {
+							target_addr,
+							message: error.to_string(),
+						});
 					}
-					let _ = event_tx.send(event);
 				}
-				Err(error) => {
-					warn!(
-						target: "un_motion_runtime::vrc_osc_output",
-						target_addr = %target_addr,
-						error = %error,
-						"VRC OSC datagram send failed",
-					);
-					let _ = event_tx.send(VrcOscOutputEvent::Error {
-						target_addr,
-						message: error.to_string(),
-					});
-				}
-			},
+			}
 			VrcOscOutputCommand::Shutdown => break,
 		}
 	}
@@ -755,24 +815,34 @@ fn fetch_vrchat_avatar_parameters(port: u16) -> anyhow::Result<VrcOscAvatarParam
 	let response = http_get_loopback(port, "/avatar/parameters")?;
 	let value: serde_json::Value = serde_json::from_str(&response).context("VRChat OSCQuery avatar parameters JSON parse failed")?;
 	let mut parameters = VrcOscAvatarParameters::new();
-	collect_oscquery_avatar_parameters(&value, &mut parameters);
+	collect_oscquery_avatar_parameters(&value, &mut parameters, 0);
 	Ok(parameters)
 }
 
-fn collect_oscquery_avatar_parameters(value: &serde_json::Value, parameters: &mut VrcOscAvatarParameters) {
+fn collect_oscquery_avatar_parameters(value: &serde_json::Value, parameters: &mut VrcOscAvatarParameters, depth: usize) {
+	if depth > OSCQUERY_MAX_TREE_DEPTH || parameters.len() >= MAX_VRC_AVATAR_PARAMETER_STATES {
+		return;
+	}
 	let full_path = value.get("FULL_PATH").and_then(serde_json::Value::as_str);
 	let parameter = full_path.and_then(|path| path.strip_prefix("/avatar/parameters/"));
 	let type_tag = value.get("TYPE").and_then(serde_json::Value::as_str);
 	if let (Some(parameter), Some(type_tag)) = (parameter, type_tag) {
 		match type_tag {
-			"f" => parameters.insert_float(parameter),
-			"T" | "F" => parameters.insert_bool(parameter),
+			"f" => {
+				parameters.insert_float(parameter);
+			}
+			"T" | "F" => {
+				parameters.insert_bool(parameter);
+			}
 			_ => {}
 		}
 	}
 	if let Some(contents) = value.get("CONTENTS").and_then(serde_json::Value::as_object) {
 		for child in contents.values() {
-			collect_oscquery_avatar_parameters(child, parameters);
+			collect_oscquery_avatar_parameters(child, parameters, depth + 1);
+			if parameters.len() >= MAX_VRC_AVATAR_PARAMETER_STATES {
+				break;
+			}
 		}
 	}
 }
@@ -787,9 +857,13 @@ fn http_get_loopback(port: u16, path: &str) -> anyhow::Result<String> {
 		.write_all(request.as_bytes())
 		.context("VRChat OSCQuery request write failed")?;
 	let mut response = String::new();
-	stream
+	(&mut stream)
+		.take((OSCQUERY_MAX_RESPONSE_BYTES + 1) as u64)
 		.read_to_string(&mut response)
 		.context("VRChat OSCQuery response read failed")?;
+	if response.len() > OSCQUERY_MAX_RESPONSE_BYTES {
+		anyhow::bail!("VRChat OSCQuery response exceeds {OSCQUERY_MAX_RESPONSE_BYTES} byte limit");
+	}
 	let (headers, body) = response
 		.split_once("\r\n\r\n")
 		.context("VRChat OSCQuery response did not contain HTTP header terminator")?;
@@ -827,49 +901,64 @@ Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
 pub fn spawn_file_output_worker(config: FileOutputConfig, event_tx: Sender<FileOutputEvent>) -> anyhow::Result<FileOutputWorkerHandle> {
 	let mut worker = FileOutputWorker::open(config)?;
 	let path = worker.path().clone();
-	let (command_tx, command_rx) = mpsc::channel();
-	let join = thread::spawn(move || run_file_output_worker(&mut worker, command_rx, event_tx));
+	let (command_tx, command_rx) = mpsc::sync_channel(1);
+	let stop = Arc::new(AtomicBool::new(false));
+	let worker_stop = Arc::clone(&stop);
+	let join = thread::spawn(move || run_file_output_worker(&mut worker, command_rx, event_tx, worker_stop));
 	Ok(FileOutputWorkerHandle {
 		path,
 		command_tx,
 		join: Some(join),
+		stop,
 	})
 }
 
-fn run_vmc_output_worker(worker: &mut VmcOutputWorker, command_rx: Receiver<VmcOutputCommand>, event_tx: Sender<VmcOutputEvent>) {
+fn run_vmc_output_worker(
+	worker: &mut VmcOutputWorker,
+	command_rx: Receiver<VmcOutputCommand>,
+	latest_frame: LatestFrameSlot<VmcOutputFrame>,
+	event_tx: Sender<VmcOutputEvent>,
+	stop: Arc<AtomicBool>,
+) {
 	// Phase E e2e Step B: 1 秒に 1 回程度 (30 fps 想定で 30 datagram 毎) で send が
 	// 進んでいるか debug log に流す。「送信側で詰まっているか」の切り分けに使う。
 	const SEND_LOG_INTERVAL: u64 = 30;
 	let target_addr = worker.target_addr();
 	for command in command_rx {
+		if stop.load(Ordering::Acquire) {
+			break;
+		}
 		match command {
-			VmcOutputCommand::Send(frame) => match worker.send_frame(frame) {
-				Ok(event) => {
-					let stats = worker.stats();
-					if stats.sent_datagrams == 1 || stats.sent_datagrams % SEND_LOG_INTERVAL == 0 {
-						debug!(
+			VmcOutputCommand::FrameReady => {
+				let Some(frame) = latest_frame.take() else { continue };
+				match worker.send_frame(frame) {
+					Ok(event) => {
+						let stats = worker.stats();
+						if stats.sent_datagrams == 1 || stats.sent_datagrams.is_multiple_of(SEND_LOG_INTERVAL) {
+							debug!(
+								target: "un_motion_runtime::vmc_output",
+								target_addr = %target_addr,
+								sent_datagrams = stats.sent_datagrams,
+								sent_packets = stats.sent_packets,
+								"VMC datagram sent",
+							);
+						}
+						let _ = event_tx.send(event);
+					}
+					Err(error) => {
+						warn!(
 							target: "un_motion_runtime::vmc_output",
 							target_addr = %target_addr,
-							sent_datagrams = stats.sent_datagrams,
-							sent_packets = stats.sent_packets,
-							"VMC datagram sent",
+							error = %error,
+							"VMC datagram send failed",
 						);
+						let _ = event_tx.send(VmcOutputEvent::Error {
+							target_addr,
+							message: error.to_string(),
+						});
 					}
-					let _ = event_tx.send(event);
 				}
-				Err(error) => {
-					warn!(
-						target: "un_motion_runtime::vmc_output",
-						target_addr = %target_addr,
-						error = %error,
-						"VMC datagram send failed",
-					);
-					let _ = event_tx.send(VmcOutputEvent::Error {
-						target_addr,
-						message: error.to_string(),
-					});
-				}
-			},
+			}
 			VmcOutputCommand::Shutdown => break,
 		}
 	}
@@ -883,8 +972,16 @@ fn run_vmc_output_worker(worker: &mut VmcOutputWorker, command_rx: Receiver<VmcO
 	let _ = event_tx.send(worker.stopped_event());
 }
 
-fn run_file_output_worker(worker: &mut FileOutputWorker, command_rx: Receiver<FileOutputCommand>, event_tx: Sender<FileOutputEvent>) {
+fn run_file_output_worker(
+	worker: &mut FileOutputWorker,
+	command_rx: Receiver<FileOutputCommand>,
+	event_tx: Sender<FileOutputEvent>,
+	stop: Arc<AtomicBool>,
+) {
 	for command in command_rx {
+		if stop.load(Ordering::Acquire) {
+			break;
+		}
 		match command {
 			FileOutputCommand::WriteFrame(frame) => match worker.write_frame(&frame) {
 				Ok(event) => {
@@ -923,7 +1020,7 @@ fn run_file_output_worker(worker: &mut FileOutputWorker, command_rx: Receiver<Fi
 #[cfg(test)]
 mod tests {
 	use std::fs::{self, File};
-	use std::net::UdpSocket;
+	use std::net::{TcpListener, UdpSocket};
 	use std::sync::mpsc;
 	use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -933,6 +1030,42 @@ mod tests {
 
 	use super::*;
 
+	#[test]
+	fn oscquery_response_size_is_bounded() {
+		let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+		let port = listener.local_addr().expect("listener addr").port();
+		let server = std::thread::spawn(move || {
+			let (mut stream, _) = listener.accept().expect("accept");
+			let mut request = [0u8; 1024];
+			let _ = stream.read(&mut request);
+			stream
+				.write_all(b"HTTP/1.0 200 OK\r\nConnection: close\r\n\r\n")
+				.expect("write headers");
+			let _ = stream.write_all(&vec![b'x'; OSCQUERY_MAX_RESPONSE_BYTES + 1]);
+		});
+
+		let error = http_get_loopback(port, "/avatar/parameters").expect_err("oversized response must fail");
+		server.join().expect("server");
+
+		assert!(error.to_string().contains("response exceeds"));
+	}
+
+	#[test]
+	fn oscquery_parameter_collection_stops_at_tree_depth_limit() {
+		let mut value = serde_json::json!({
+			"FULL_PATH": "/avatar/parameters/too-deep",
+			"TYPE": "f"
+		});
+		for index in 0..=OSCQUERY_MAX_TREE_DEPTH {
+			value = serde_json::json!({ "CONTENTS": { format!("level-{index}"): value } });
+		}
+		let mut parameters = VrcOscAvatarParameters::new();
+
+		collect_oscquery_avatar_parameters(&value, &mut parameters, 0);
+
+		assert!(parameters.is_empty());
+	}
+
 	fn temp_record_path(label: &str) -> PathBuf {
 		let nonce = SystemTime::now().duration_since(UNIX_EPOCH).expect("system time").as_nanos();
 		std::env::temp_dir().join(format!("un-motion-runtime-{label}-{}-{nonce}.unmf", std::process::id()))
@@ -940,10 +1073,17 @@ mod tests {
 
 	fn recv_messages(receiver: &UdpSocket) -> Vec<OscMessage> {
 		let mut buf = [0_u8; 65535];
-		let (len, _) = receiver.recv_from(&mut buf).expect("recv");
-		let (_, packet) = decoder::decode_udp(&buf[..len]).expect("decode");
 		let mut messages = Vec::new();
-		collect_messages(packet, &mut messages);
+		loop {
+			match receiver.recv_from(&mut buf) {
+				Ok((len, _)) => {
+					let (_, packet) = decoder::decode_udp(&buf[..len]).expect("decode");
+					collect_messages(packet, &mut messages);
+				}
+				Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break,
+				Err(error) => panic!("receive VMC datagram: {error}"),
+			}
+		}
 		messages
 	}
 
@@ -963,6 +1103,64 @@ mod tests {
 			.iter()
 			.find(|message| message.addr == addr && message.args.first() == Some(&OscType::String(name.to_string())))
 			.expect("message")
+	}
+
+	#[test]
+	fn live_output_queue_replaces_pending_frame_with_latest() {
+		let (command_tx, command_rx) = mpsc::sync_channel(1);
+		let latest_frame = LatestFrameSlot::new();
+		let handle = VmcOutputWorkerHandle {
+			target_addr: "127.0.0.1:39540".parse().expect("target"),
+			command_tx,
+			latest_frame: latest_frame.clone(),
+			join: None,
+			stop: Arc::new(AtomicBool::new(false)),
+		};
+
+		assert_eq!(handle.send(UNMotionFrame::new(1)), Ok(true));
+		assert_eq!(handle.send(UNMotionFrame::new(2)), Ok(true));
+		let VmcOutputFrame::UnmotionFrame(frame) = latest_frame.take().expect("latest frame") else {
+			panic!("expected owned frame");
+		};
+		assert_eq!(frame.header.sequence, 2);
+		drop(command_rx);
+		assert_eq!(handle.send(UNMotionFrame::new(3)), Err(OutputDisconnected));
+	}
+
+	#[test]
+	fn dropping_live_output_handle_disconnects_without_enqueueing_shutdown() {
+		let (command_tx, command_rx) = mpsc::sync_channel(1);
+		command_tx.send(VmcOutputCommand::FrameReady).expect("fill command queue");
+		let handle = VmcOutputWorkerHandle {
+			target_addr: "127.0.0.1:39540".parse().expect("target"),
+			command_tx,
+			latest_frame: LatestFrameSlot::new(),
+			join: None,
+			stop: Arc::new(AtomicBool::new(false)),
+		};
+
+		drop(handle);
+		assert_eq!(command_rx.recv(), Ok(VmcOutputCommand::FrameReady));
+		assert!(command_rx.recv().is_err());
+	}
+
+	#[test]
+	fn live_output_shutdown_does_not_block_on_full_command_queue() {
+		let (command_tx, command_rx) = mpsc::sync_channel(1);
+		command_tx.send(VmcOutputCommand::FrameReady).expect("fill command queue");
+		let stop = Arc::new(AtomicBool::new(false));
+		let handle = VmcOutputWorkerHandle {
+			target_addr: "127.0.0.1:39540".parse().expect("target"),
+			command_tx,
+			latest_frame: LatestFrameSlot::new(),
+			join: None,
+			stop: Arc::clone(&stop),
+		};
+
+		handle.shutdown();
+
+		assert!(stop.load(Ordering::Acquire));
+		assert_eq!(command_rx.try_recv(), Ok(VmcOutputCommand::FrameReady));
 	}
 
 	#[test]
@@ -1030,9 +1228,7 @@ mod tests {
 			}),
 		});
 
-		let event = worker
-			.send_frame(VmcOutputFrame::UnmotionFrame(frame))
-			.expect("send unmotion frame");
+		let event = worker.send_frame(VmcOutputFrame::from(frame)).expect("send unmotion frame");
 		assert!(matches!(event, VmcOutputEvent::Sent { datagrams: 1, .. }));
 
 		let messages = recv_messages(&receiver);
@@ -1070,9 +1266,7 @@ mod tests {
 			}],
 		});
 
-		let event = worker
-			.send_frame(VrcOscOutputFrame::UnmotionFrame(frame))
-			.expect("send vrc osc frame");
+		let event = worker.send_frame(VrcOscOutputFrame::from(frame)).expect("send vrc osc frame");
 		assert!(matches!(
 			event,
 			VrcOscOutputEvent::Sent {
@@ -1102,7 +1296,7 @@ mod tests {
 		.expect("worker");
 
 		let event = worker
-			.send_frame(VrcOscOutputFrame::UnmotionFrame(UNMotionFrame::new(1)))
+			.send_frame(VrcOscOutputFrame::from(UNMotionFrame::new(1)))
 			.expect("send empty frame");
 
 		assert!(matches!(
@@ -1161,7 +1355,7 @@ mod tests {
 		let mut worker = VmcOutputWorker::bind(VmcOutputConfig::new(target).with_ok_packet(false).with_modifier(modifier)).expect("worker");
 
 		worker
-			.send_frame(VmcOutputFrame::UnmotionFrame(frame_with_left_hand(
+			.send_frame(VmcOutputFrame::from(frame_with_left_hand(
 				1,
 				Quatf {
 					x: 0.0,
@@ -1174,7 +1368,7 @@ mod tests {
 		let _ = recv_messages(&receiver);
 
 		worker
-			.send_frame(VmcOutputFrame::UnmotionFrame(frame_with_left_hand(
+			.send_frame(VmcOutputFrame::from(frame_with_left_hand(
 				2,
 				Quatf {
 					x: 1.0,
@@ -1241,11 +1435,11 @@ mod tests {
 		)
 		.expect("worker");
 		smooth_worker
-			.send_frame(VmcOutputFrame::UnmotionFrame(finger_frame(1, 0.0)))
+			.send_frame(VmcOutputFrame::from(finger_frame(1, 0.0)))
 			.expect("send first");
 		let _ = recv_messages(&smooth_receiver);
 		smooth_worker
-			.send_frame(VmcOutputFrame::UnmotionFrame(finger_frame(2, 1.0)))
+			.send_frame(VmcOutputFrame::from(finger_frame(2, 1.0)))
 			.expect("send second");
 		let smoothed = right_index_intermediate_z(&recv_messages(&smooth_receiver)).abs();
 
@@ -1253,9 +1447,7 @@ mod tests {
 		raw_receiver.set_read_timeout(Some(Duration::from_millis(500))).expect("timeout");
 		let mut raw_worker =
 			VmcOutputWorker::bind(VmcOutputConfig::new(raw_receiver.local_addr().expect("target")).with_ok_packet(false)).expect("worker");
-		raw_worker
-			.send_frame(VmcOutputFrame::UnmotionFrame(finger_frame(2, 1.0)))
-			.expect("send raw");
+		raw_worker.send_frame(VmcOutputFrame::from(finger_frame(2, 1.0))).expect("send raw");
 		let raw = right_index_intermediate_z(&recv_messages(&raw_receiver)).abs();
 
 		assert!(smoothed > 0.01, "expected smoothed finger to move");
@@ -1283,9 +1475,7 @@ mod tests {
 		});
 
 		// 空の body だが OK packet が無い前提なら何も送らない (packets = 0)。
-		let event = worker
-			.send_frame(VmcOutputFrame::UnmotionFrame(frame))
-			.expect("send unmotion frame");
+		let event = worker.send_frame(VmcOutputFrame::from(frame)).expect("send unmotion frame");
 		assert!(matches!(
 			event,
 			VmcOutputEvent::Sent {
@@ -1329,7 +1519,7 @@ mod tests {
 			}),
 		});
 
-		worker.send_frame(VmcOutputFrame::UnmotionFrame(frame)).expect("send frame");
+		worker.send_frame(VmcOutputFrame::from(frame)).expect("send frame");
 
 		let messages = recv_messages(&receiver);
 		assert!(

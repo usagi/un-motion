@@ -44,7 +44,7 @@ pub trait MotionFrameSource: Send + 'static {
 pub struct MotionFrameStreamPoll {
 	pub stream_id: StreamId,
 	pub frames: Vec<UNMotionFrame>,
-	pub state: StreamState,
+	pub state: Arc<StreamState>,
 	pub snapshot: StreamSnapshot,
 }
 
@@ -57,7 +57,13 @@ impl MotionFrameStreamPoll {
 pub struct MotionFrameStreamWorker<S> {
 	config: MotionFrameStreamConfig,
 	source: S,
-	state: StreamState,
+	state: Arc<StreamState>,
+}
+
+struct MotionFrameStreamSinglePoll {
+	stream_id: StreamId,
+	frame: Option<UNMotionFrame>,
+	state: Arc<StreamState>,
 }
 
 impl<S> MotionFrameStreamWorker<S>
@@ -65,7 +71,7 @@ where
 	S: MotionFrameSource,
 {
 	pub fn new(config: MotionFrameStreamConfig, source: S) -> Self {
-		let state = StreamState::new(config.stream_id.clone());
+		let state = Arc::new(StreamState::new(config.stream_id.clone()));
 		Self { config, source, state }
 	}
 
@@ -78,19 +84,47 @@ where
 	}
 
 	pub fn poll_once(&mut self) -> anyhow::Result<MotionFrameStreamPoll> {
+		let poll = self.poll_single_once()?;
+		let snapshot = poll.state.snapshot_at(now_unix_ns(), self.config.stale_after_ns);
+		Ok(MotionFrameStreamPoll {
+			stream_id: poll.stream_id,
+			frames: poll.frame.into_iter().collect(),
+			state: poll.state,
+			snapshot,
+		})
+	}
+
+	fn poll_single_once(&mut self) -> anyhow::Result<MotionFrameStreamSinglePoll> {
 		let observed_at_ns = now_unix_ns();
-		let mut frames = Vec::new();
-		if let Some(frame) = self.source.next_frame()? {
-			apply_unmotion_frame_to_stream_state(&mut self.state, &frame, observed_at_ns);
-			frames.push(frame);
+		let frame = self.source.next_frame()?;
+		if let Some(frame) = frame.as_ref() {
+			let mut next_state = next_stream_state(&self.state);
+			apply_unmotion_frame_to_stream_state(&mut next_state, frame, observed_at_ns);
+			self.state = Arc::new(next_state);
 		}
 
-		Ok(MotionFrameStreamPoll {
+		Ok(MotionFrameStreamSinglePoll {
 			stream_id: self.config.stream_id.clone(),
-			frames,
-			state: self.state.clone(),
-			snapshot: self.state.snapshot_at(now_unix_ns(), self.config.stale_after_ns),
+			frame,
+			state: Arc::clone(&self.state),
 		})
+	}
+}
+
+fn next_stream_state(previous: &StreamState) -> StreamState {
+	StreamState {
+		stream_id: previous.stream_id.clone(),
+		enabled: previous.enabled,
+		first_packet_at_ns: previous.first_packet_at_ns,
+		last_packet_at_ns: previous.last_packet_at_ns,
+		last_event_at_ns: previous.last_event_at_ns,
+		packet_count: previous.packet_count,
+		event_count: previous.event_count,
+		decode_error_count: previous.decode_error_count,
+		root: None,
+		bones: Default::default(),
+		blendshapes: Default::default(),
+		part_diagnostics: Default::default(),
 	}
 }
 
@@ -101,7 +135,7 @@ enum MotionFrameStreamWorkerControl {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MotionFrameStreamWorkerMessage {
-	Poll(MotionFrameStreamPoll),
+	Poll(Box<MotionFrameStreamPoll>),
 	Error { stream_id: StreamId, message: String },
 	Stopped { stream_id: StreamId },
 }
@@ -121,7 +155,6 @@ pub struct LatestMotionFrame {
 	pub stream_id: StreamId,
 	pub frame: Arc<UNMotionFrame>,
 	pub state: Arc<StreamState>,
-	pub snapshot: StreamSnapshot,
 }
 
 #[derive(Clone)]
@@ -257,7 +290,7 @@ fn run_frame_stream_worker<S>(
 		match worker.poll_once() {
 			Ok(poll) => {
 				let idle = poll.is_idle();
-				if !idle && output_tx.send(MotionFrameStreamWorkerMessage::Poll(poll)).is_err() {
+				if !idle && output_tx.send(MotionFrameStreamWorkerMessage::Poll(Box::new(poll))).is_err() {
 					break;
 				}
 				if idle {
@@ -297,15 +330,14 @@ fn run_latest_frame_stream_worker<S>(
 			break;
 		}
 
-		match worker.poll_once() {
-			Ok(mut poll) => {
-				let idle = poll.is_idle();
-				if let Some(frame) = poll.frames.pop() {
+		match worker.poll_single_once() {
+			Ok(poll) => {
+				let idle = poll.frame.is_none();
+				if let Some(frame) = poll.frame {
 					slot.store(LatestMotionFrame {
 						stream_id: poll.stream_id,
 						frame: Arc::new(frame),
-						state: Arc::new(poll.state),
-						snapshot: poll.snapshot,
+						state: poll.state,
 					});
 				}
 				if idle {
@@ -371,24 +403,24 @@ fn observe_unmotion_part_diagnostics(
 	diagnostics: &mut std::collections::BTreeMap<MotionPart, crate::PartDiagnostic>,
 	frame: &UNMotionFrame,
 ) {
-	if let Some(body) = frame.body.as_ref() {
-		if let Some(humanoid) = body.humanoid.as_ref() {
-			for bone in &humanoid.bones {
-				upsert_part_diagnostic(
-					diagnostics,
-					part_for_humanoid_bone(bone.bone),
-					status_for_bone(bone),
-					bone.confidence,
-				);
-			}
-			if let Some(root) = humanoid.root.as_ref() {
-				upsert_part_diagnostic(
-					diagnostics,
-					MotionPart::Torso,
-					status_for_tracking_state(body.tracking_state),
-					body.confidence.max(transform_confidence_hint(root)),
-				);
-			}
+	if let Some(body) = frame.body.as_ref()
+		&& let Some(humanoid) = body.humanoid.as_ref()
+	{
+		for bone in &humanoid.bones {
+			upsert_part_diagnostic(
+				diagnostics,
+				part_for_humanoid_bone(bone.bone),
+				status_for_bone(bone),
+				bone.confidence,
+			);
+		}
+		if let Some(root) = humanoid.root.as_ref() {
+			upsert_part_diagnostic(
+				diagnostics,
+				MotionPart::Torso,
+				status_for_tracking_state(body.tracking_state),
+				body.confidence.max(transform_confidence_hint(root)),
+			);
 		}
 	}
 	if let Some(face) = frame.face.as_ref() {
@@ -591,7 +623,9 @@ mod tests {
 		assert_eq!(state.packet_count, 1);
 		assert_eq!(state.last_event_at_ns, Some(100));
 		assert_eq!(state.root.as_ref().expect("root").position, [0.25, 1.0, -0.5]);
-		assert_eq!(state.bones["Head"].rotation, [0.0, 0.25, 0.0, 0.9682458]);
+		for (actual, expected) in state.bones["Head"].rotation.into_iter().zip([0.0, 0.25, 0.0, 0.9682458]) {
+			assert!((actual - expected).abs() < 1e-6, "actual={actual} expected={expected}");
+		}
 		assert_eq!(state.blendshapes["Joy"], 0.75);
 		assert_eq!(state.part_diagnostics[&MotionPart::Head].status, PartTrackingStatus::Estimated);
 		assert_eq!(state.part_diagnostics[&MotionPart::Face].status, PartTrackingStatus::Estimated);
@@ -686,6 +720,7 @@ mod tests {
 		assert_eq!(poll.state.packet_count, 1);
 		assert_eq!(poll.state.blendshapes["jawOpen"], 0.5);
 		assert_eq!(poll.snapshot.stream_id, StreamId::new("unmotion:stream-4"));
+		assert!(Arc::ptr_eq(&poll.state, &worker.state));
 	}
 
 	#[test]
@@ -705,11 +740,11 @@ mod tests {
 		handle.join().expect("join");
 		let stopped = rx.recv_timeout(Duration::from_secs(1)).expect("stopped");
 
-		assert!(matches!(
-			poll,
-			MotionFrameStreamWorkerMessage::Poll(MotionFrameStreamPoll { stream_id, state, .. })
-				if stream_id == StreamId::new("unmotion:stream-5") && state.blendshapes["eyeBlinkLeft"] == 0.6
-		));
+		let MotionFrameStreamWorkerMessage::Poll(poll) = poll else {
+			panic!("expected poll message");
+		};
+		assert_eq!(poll.stream_id, StreamId::new("unmotion:stream-5"));
+		assert_eq!(poll.state.blendshapes["eyeBlinkLeft"], 0.6);
 		assert!(matches!(
 			stopped,
 			MotionFrameStreamWorkerMessage::Stopped { stream_id } if stream_id == StreamId::new("unmotion:stream-5")

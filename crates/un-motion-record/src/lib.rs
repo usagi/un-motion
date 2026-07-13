@@ -4,23 +4,68 @@ use anyhow::Context;
 use un_motion_frame::UNMotionFrame;
 use un_motion_interfaces::OutputSink;
 
+pub const MAX_FRAME_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
+struct BoundedVecWriter<'a> {
+	buffer: &'a mut Vec<u8>,
+	max_len: usize,
+}
+
+impl Write for BoundedVecWriter<'_> {
+	fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+		if self.buffer.len().saturating_add(bytes.len()) > self.max_len {
+			return Err(std::io::Error::new(
+				ErrorKind::InvalidData,
+				format!("frame payload exceeds {} byte limit", self.max_len),
+			));
+		}
+		self.buffer.extend_from_slice(bytes);
+		Ok(bytes.len())
+	}
+
+	fn flush(&mut self) -> std::io::Result<()> {
+		Ok(())
+	}
+}
+
 pub struct MessagePackStreamRecorder<W: Write> {
 	writer: W,
+	payload_buffer: Vec<u8>,
 }
 
 impl<W: Write> MessagePackStreamRecorder<W> {
 	pub fn new(writer: W) -> Self {
-		Self { writer }
+		Self {
+			writer,
+			payload_buffer: Vec::new(),
+		}
 	}
 
 	pub fn write_frame(&mut self, frame: &UNMotionFrame) -> anyhow::Result<()> {
-		let payload = rmp_serde::to_vec_named(frame).context("messagepack encode failed")?;
-		let payload_len: u32 = payload.len().try_into().context("frame payload too large for u32 length prefix")?;
+		self.payload_buffer.clear();
+		rmp_serde::encode::write_named(
+			&mut BoundedVecWriter {
+				buffer: &mut self.payload_buffer,
+				max_len: MAX_FRAME_PAYLOAD_BYTES,
+			},
+			frame,
+		)
+		.context("messagepack encode failed")?;
+		if self.payload_buffer.len() > MAX_FRAME_PAYLOAD_BYTES {
+			anyhow::bail!("frame payload exceeds {MAX_FRAME_PAYLOAD_BYTES} byte limit");
+		}
+		let payload_len: u32 = self
+			.payload_buffer
+			.len()
+			.try_into()
+			.context("frame payload too large for u32 length prefix")?;
 
 		self.writer
 			.write_all(&payload_len.to_le_bytes())
 			.context("failed to write frame length prefix")?;
-		self.writer.write_all(&payload).context("failed to write frame payload")?;
+		self.writer
+			.write_all(&self.payload_buffer)
+			.context("failed to write frame payload")?;
 		Ok(())
 	}
 
@@ -36,31 +81,48 @@ impl<W: Write> MessagePackStreamRecorder<W> {
 
 pub fn decode_framed_stream<R: Read>(mut reader: R) -> anyhow::Result<Vec<UNMotionFrame>> {
 	let mut out = Vec::new();
+	let mut payload = Vec::new();
 
-	loop {
-		let mut len_buf = [0_u8; 4];
-		match reader.read_exact(&mut len_buf) {
-			Ok(()) => {}
-			Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
-			Err(err) => return Err(err).context("failed to read frame length prefix"),
-		}
-
-		let payload_len = u32::from_le_bytes(len_buf) as usize;
-		let mut payload = vec![0_u8; payload_len];
-		reader.read_exact(&mut payload).context("failed to read frame payload")?;
-
-		let frame: UNMotionFrame = rmp_serde::from_slice(&payload).context("messagepack decode failed")?;
+	while let Some(frame) = decode_next_frame(&mut reader, &mut payload)? {
 		out.push(frame);
 	}
 
 	Ok(out)
 }
 
-pub fn replay_framed_stream_to_sink<R: Read, S: OutputSink<UNMotionFrame>>(reader: R, sink: &mut S) -> anyhow::Result<usize> {
-	let frames = decode_framed_stream(reader)?;
+fn decode_next_frame<R: Read>(reader: &mut R, payload: &mut Vec<u8>) -> anyhow::Result<Option<UNMotionFrame>> {
+	let Some(len_buf) = read_frame_length_prefix(reader)? else {
+		return Ok(None);
+	};
+	let payload_len = u32::from_le_bytes(len_buf) as usize;
+	if payload_len > MAX_FRAME_PAYLOAD_BYTES {
+		anyhow::bail!("frame payload exceeds {MAX_FRAME_PAYLOAD_BYTES} byte limit: {payload_len}");
+	}
+	payload.resize(payload_len, 0);
+	reader.read_exact(payload).context("failed to read frame payload")?;
+	let frame = rmp_serde::from_slice(payload).context("messagepack decode failed")?;
+	Ok(Some(frame))
+}
+
+fn read_frame_length_prefix<R: Read>(reader: &mut R) -> anyhow::Result<Option<[u8; 4]>> {
+	let mut prefix = [0u8; 4];
+	loop {
+		match reader.read(&mut prefix[..1]) {
+			Ok(0) => return Ok(None),
+			Ok(_) => break,
+			Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+			Err(error) => return Err(error).context("failed to read frame length prefix"),
+		}
+	}
+	reader.read_exact(&mut prefix[1..]).context("truncated frame length prefix")?;
+	Ok(Some(prefix))
+}
+
+pub fn replay_framed_stream_to_sink<R: Read, S: OutputSink<UNMotionFrame>>(mut reader: R, sink: &mut S) -> anyhow::Result<usize> {
 	let mut sent_count = 0_usize;
-	for frame in &frames {
-		sink.send(frame)
+	let mut payload = Vec::new();
+	while let Some(frame) = decode_next_frame(&mut reader, &mut payload)? {
+		sink.send(&frame)
 			.with_context(|| format!("failed to send replay frame sequence={}", frame.header.sequence))?;
 		sent_count += 1;
 	}
@@ -100,6 +162,29 @@ mod tests {
 	}
 
 	#[test]
+	fn recorder_reuses_messagepack_payload_capacity() {
+		let mut recorder = MessagePackStreamRecorder::new(Vec::<u8>::new());
+		recorder.write_frame(&UNMotionFrame::new(1)).expect("first frame");
+		let capacity = recorder.payload_buffer.capacity();
+
+		recorder.write_frame(&UNMotionFrame::new(2)).expect("second frame");
+
+		assert_eq!(recorder.payload_buffer.capacity(), capacity);
+	}
+
+	#[test]
+	fn recorder_stops_serialization_at_payload_limit() {
+		let mut frame = UNMotionFrame::new(1);
+		frame.metadata.notes.push("x".repeat(MAX_FRAME_PAYLOAD_BYTES + 1));
+		let mut recorder = MessagePackStreamRecorder::new(Vec::<u8>::new());
+
+		let error = recorder.write_frame(&frame).expect_err("oversized frame must fail");
+
+		assert!(error.to_string().contains("messagepack encode failed"));
+		assert!(recorder.payload_buffer.len() <= MAX_FRAME_PAYLOAD_BYTES);
+	}
+
+	#[test]
 	fn decode_fails_on_truncated_payload() {
 		let frame = UNMotionFrame::new(1);
 		let payload = rmp_serde::to_vec_named(&frame).expect("encode");
@@ -110,6 +195,21 @@ mod tests {
 
 		let err = decode_framed_stream(bytes.as_slice()).expect_err("should fail on truncated payload");
 		assert!(err.to_string().contains("failed to read frame payload"));
+	}
+
+	#[test]
+	fn decode_rejects_oversized_payload_before_allocation() {
+		let oversized = (MAX_FRAME_PAYLOAD_BYTES as u32 + 1).to_le_bytes();
+		let error = decode_framed_stream(oversized.as_slice()).expect_err("oversized payload must fail");
+		assert!(error.to_string().contains("frame payload exceeds"));
+	}
+
+	#[test]
+	fn decode_rejects_partial_length_prefixes() {
+		for length in 1..4 {
+			let error = decode_framed_stream(&[0u8; 3][..length]).expect_err("partial prefix must fail");
+			assert!(error.to_string().contains("truncated frame length prefix"));
+		}
 	}
 
 	#[test]
@@ -125,5 +225,42 @@ mod tests {
 
 		assert_eq!(sent, 2);
 		assert_eq!(sink.sequences, vec![101, 102]);
+	}
+
+	#[test]
+	fn replay_stops_reading_after_sink_failure() {
+		struct RejectingSink;
+		impl OutputSink<UNMotionFrame> for RejectingSink {
+			fn send(&mut self, _frame: &UNMotionFrame) -> anyhow::Result<()> {
+				anyhow::bail!("sink rejected frame")
+			}
+		}
+
+		let mut recorder = MessagePackStreamRecorder::new(Vec::<u8>::new());
+		recorder.write_frame(&UNMotionFrame::new(1)).expect("write frame");
+		let mut bytes = recorder.into_inner();
+		bytes.extend_from_slice(&(MAX_FRAME_PAYLOAD_BYTES as u32 + 1).to_le_bytes());
+
+		let error = replay_framed_stream_to_sink(bytes.as_slice(), &mut RejectingSink).expect_err("sink must fail first");
+
+		assert!(error.to_string().contains("failed to send replay frame sequence=1"));
+	}
+
+	#[test]
+	fn decoder_reuses_payload_capacity() {
+		let mut recorder = MessagePackStreamRecorder::new(Vec::<u8>::new());
+		recorder.write_frame(&UNMotionFrame::new(1)).expect("first frame");
+		recorder.write_frame(&UNMotionFrame::new(2)).expect("second frame");
+		let bytes = recorder.into_inner();
+		let mut reader = bytes.as_slice();
+		let mut payload = Vec::new();
+
+		decode_next_frame(&mut reader, &mut payload).expect("decode first").expect("first");
+		let capacity = payload.capacity();
+		decode_next_frame(&mut reader, &mut payload)
+			.expect("decode second")
+			.expect("second");
+
+		assert_eq!(payload.capacity(), capacity);
 	}
 }

@@ -1,8 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use image::{ImageBuffer, RgbaImage, imageops};
-use un_motion_interfaces::{ImageFrame, ImageInputSource, ImageResizeOptions, PixelFormat, ResizeAxis, TimestampBasis};
+use un_motion_interfaces::{
+	ImageFrame, ImageInputSource, ImageResizeOptions, PixelFormat, ResizeAxis, TimestampBasis, checked_image_pixel_count,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileImageEmissionMode {
@@ -34,7 +37,7 @@ impl FileImageInputConfig {
 
 pub struct FileImageInputSource {
 	config: FileImageInputConfig,
-	frame_data: Vec<u8>,
+	frame_data: Arc<[u8]>,
 	width: u32,
 	height: u32,
 	stride_bytes: u32,
@@ -45,6 +48,15 @@ pub struct FileImageInputSource {
 
 impl FileImageInputSource {
 	pub fn open(config: FileImageInputConfig) -> anyhow::Result<Self> {
+		let (source_width, source_height) = image::image_dimensions(&config.path)?;
+		checked_image_pixel_count(source_width, source_height)?;
+		if let Some(resize) = config.resize
+			&& resize.output_width > 0
+			&& resize.output_height > 0
+			&& resize.reference_length > 0
+		{
+			checked_image_pixel_count(resize.output_width, resize.output_height)?;
+		}
 		let image = image::open(&config.path)?;
 		let image = if let Some(resize) = config.resize {
 			resize_rgba(image.to_rgba8(), resize)
@@ -53,7 +65,7 @@ impl FileImageInputSource {
 		};
 		let width = image.width();
 		let height = image.height();
-		let frame_data = rgba_to_rgb(image);
+		let frame_data = Arc::from(rgba_to_rgb(image));
 		Ok(Self {
 			config,
 			frame_data,
@@ -164,7 +176,8 @@ fn scale_other_axis(reference: u32, src_reference: u32, src_other: u32) -> u32 {
 }
 
 fn rgba_to_rgb(image: RgbaImage) -> Vec<u8> {
-	let mut rgb = Vec::with_capacity(image.width() as usize * image.height() as usize * 3);
+	let pixels = checked_image_pixel_count(image.width(), image.height()).expect("validated image dimensions");
+	let mut rgb = Vec::with_capacity(pixels * 3);
 	for pixel in image.pixels() {
 		rgb.extend_from_slice(&pixel.0[..3]);
 	}
@@ -190,6 +203,19 @@ mod tests {
 	}
 
 	#[test]
+	fn repeated_frames_share_immutable_pixel_storage() {
+		let path = temp_image_path("shared-repeat-source.png");
+		write_test_image(&path);
+		let mut config = FileImageInputConfig::once(&path);
+		config.emission_mode = FileImageEmissionMode::RepeatFps(60);
+		let mut source = FileImageInputSource::open(config).unwrap();
+		let first = source.build_frame();
+		let second = source.build_frame();
+		assert!(Arc::ptr_eq(&first.data, &second.data));
+		let _ = std::fs::remove_file(path);
+	}
+
+	#[test]
 	fn resize_can_letterbox_to_requested_canvas() {
 		let path = temp_image_path("letterbox-source.png");
 		write_test_image(&path);
@@ -206,6 +232,23 @@ mod tests {
 		let frame = source.next_image_frame().unwrap().expect("frame");
 		assert_eq!((frame.width, frame.height), (4, 4));
 		assert_eq!(&frame.data[..3], &[1, 2, 3]);
+		let _ = std::fs::remove_file(path);
+	}
+
+	#[test]
+	fn oversized_resize_canvas_is_rejected_before_allocation() {
+		let path = temp_image_path("oversized-resize.png");
+		write_test_image(&path);
+		let mut config = FileImageInputConfig::once(&path);
+		config.resize = Some(ImageResizeOptions {
+			preserve_aspect_ratio: false,
+			reference_axis: ResizeAxis::Width,
+			reference_length: 1,
+			output_width: 8192,
+			output_height: 8192,
+			pad_color: RgbaColor::BLACK,
+		});
+		assert!(FileImageInputSource::open(config).is_err());
 		let _ = std::fs::remove_file(path);
 	}
 

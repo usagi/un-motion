@@ -11,7 +11,8 @@
 
 use std::sync::{
 	Arc,
-	mpsc::{self, Receiver, Sender},
+	atomic::{AtomicBool, Ordering},
+	mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,7 +24,9 @@ use un_motion_frame::{
 };
 use un_motion_frame_zenoh::{Publisher, TopicMode, ZenohSessionBackend, ZenohTopicStrategy};
 
+use crate::OutputDisconnected;
 use crate::modifier::{ModifierConfig, ModifierPipeline};
+use crate::output::LatestFrameSlot;
 use crate::signal_enrich::enrich_frame_with_signal_derived_motion;
 
 /// UNMotion → Zenoh 出力の設定。
@@ -93,13 +96,13 @@ impl ZenohOutputConfig {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ZenohOutputFrame {
-	UnmotionFrame(UNMotionFrame),
+	UnmotionFrame(Box<UNMotionFrame>),
 	SharedUnmotionFrame(Arc<UNMotionFrame>),
 }
 
 impl From<UNMotionFrame> for ZenohOutputFrame {
 	fn from(frame: UNMotionFrame) -> Self {
-		Self::UnmotionFrame(frame)
+		Self::UnmotionFrame(Box::new(frame))
 	}
 }
 
@@ -111,7 +114,7 @@ impl From<Arc<UNMotionFrame>> for ZenohOutputFrame {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ZenohOutputCommand {
-	Send(ZenohOutputFrame),
+	FrameReady,
 	Shutdown,
 }
 
@@ -187,7 +190,7 @@ impl ZenohOutputWorker {
 
 	pub fn send_frame(&mut self, frame: ZenohOutputFrame) -> anyhow::Result<ZenohOutputEvent> {
 		let mut unmotion_frame = match frame {
-			ZenohOutputFrame::UnmotionFrame(frame) => self.finalize_frame(frame),
+			ZenohOutputFrame::UnmotionFrame(frame) => self.finalize_frame(*frame),
 			ZenohOutputFrame::SharedUnmotionFrame(frame) => self.finalize_frame((*frame).clone()),
 		};
 		// MediaPipe Native などの signal-only frame は VMC 出力側では signal fallback で
@@ -206,7 +209,7 @@ impl ZenohOutputWorker {
 		// 初回 1 frame と以降は 600 frame ごとに INFO で「実際に publish した key と
 		// payload 概要」を出す。これにより subscribe 側 (UN Avatar) で同じ key を
 		// listen しているか / 中身は空でないか をユーザー stderr で確認できる。
-		if self.stats.sent_frames == 1 || self.stats.sent_frames % 600 == 0 {
+		if self.stats.sent_frames == 1 || self.stats.sent_frames.is_multiple_of(600) {
 			let bones = unmotion_frame
 				.body
 				.as_ref()
@@ -364,17 +367,24 @@ fn diagnostic_finger_quat_summary(hand: Option<&un_motion_frame::HandMotion>) ->
 
 pub struct ZenohOutputWorkerHandle {
 	pub base_key_expr: String,
-	command_tx: Sender<ZenohOutputCommand>,
+	command_tx: SyncSender<ZenohOutputCommand>,
+	latest_frame: LatestFrameSlot<ZenohOutputFrame>,
 	join: Option<JoinHandle<()>>,
+	stop: Arc<AtomicBool>,
 }
 
 impl ZenohOutputWorkerHandle {
-	pub fn send(&self, frame: impl Into<ZenohOutputFrame>) -> Result<(), std::sync::mpsc::SendError<ZenohOutputCommand>> {
-		self.command_tx.send(ZenohOutputCommand::Send(frame.into()))
+	pub fn send(&self, frame: impl Into<ZenohOutputFrame>) -> Result<bool, OutputDisconnected> {
+		self.latest_frame.replace(frame.into())?;
+		match self.command_tx.try_send(ZenohOutputCommand::FrameReady) {
+			Ok(()) | Err(TrySendError::Full(_)) => Ok(true),
+			Err(TrySendError::Disconnected(_)) => Err(OutputDisconnected),
+		}
 	}
 
 	pub fn shutdown(&self) {
-		let _ = self.command_tx.send(ZenohOutputCommand::Shutdown);
+		self.stop.store(true, Ordering::Release);
+		let _ = self.command_tx.try_send(ZenohOutputCommand::Shutdown);
 	}
 
 	pub fn join(mut self) -> thread::Result<()> {
@@ -383,17 +393,13 @@ impl ZenohOutputWorkerHandle {
 	}
 }
 
-impl Drop for ZenohOutputWorkerHandle {
-	fn drop(&mut self) {
-		let _ = self.command_tx.send(ZenohOutputCommand::Shutdown);
-	}
-}
-
 pub fn spawn_zenoh_output_worker(config: ZenohOutputConfig, event_tx: Sender<ZenohOutputEvent>) -> anyhow::Result<ZenohOutputWorkerHandle> {
 	let worker = ZenohOutputWorker::open(config)?;
 	let base_key_expr = worker.config.base_key_expr.clone();
 	let topic_mode = worker.config.topic_mode;
 	let stream_id = worker.config.stream_id.clone();
+	let latest_frame = LatestFrameSlot::new();
+	let worker_latest_frame = latest_frame.clone();
 	info!(
 		target: "un_motion_runtime::zenoh_output",
 		base_key_expr = %base_key_expr,
@@ -401,27 +407,43 @@ pub fn spawn_zenoh_output_worker(config: ZenohOutputConfig, event_tx: Sender<Zen
 		stream_id = stream_id.as_deref().unwrap_or("-"),
 		"Zenoh output worker started",
 	);
-	let (command_tx, command_rx) = mpsc::channel();
-	let join = thread::spawn(move || run_zenoh_output_worker(worker, command_rx, event_tx));
+	let (command_tx, command_rx) = mpsc::sync_channel(1);
+	let stop = Arc::new(AtomicBool::new(false));
+	let worker_stop = Arc::clone(&stop);
+	let join = thread::spawn(move || run_zenoh_output_worker(worker, command_rx, worker_latest_frame, event_tx, worker_stop));
 	Ok(ZenohOutputWorkerHandle {
 		base_key_expr,
 		command_tx,
+		latest_frame,
 		join: Some(join),
+		stop,
 	})
 }
 
-fn run_zenoh_output_worker(mut worker: ZenohOutputWorker, command_rx: Receiver<ZenohOutputCommand>, event_tx: Sender<ZenohOutputEvent>) {
+fn run_zenoh_output_worker(
+	mut worker: ZenohOutputWorker,
+	command_rx: Receiver<ZenohOutputCommand>,
+	latest_frame: LatestFrameSlot<ZenohOutputFrame>,
+	event_tx: Sender<ZenohOutputEvent>,
+	stop: Arc<AtomicBool>,
+) {
 	// 1 秒に 1 回程度の頻度で送信状況を debug ログに出す。多すぎると log が溢れ、
 	// 少なすぎると Phase E e2e Step B の切り分けに使えないので保守的に 30 frame 毎。
 	const SEND_LOG_INTERVAL: u64 = 30;
 	let base_key_expr = worker.config.base_key_expr.clone();
 	for command in command_rx {
+		if stop.load(Ordering::Acquire) {
+			break;
+		}
 		match command {
-			ZenohOutputCommand::Send(frame) => match worker.send_frame(frame) {
-				Ok(event) => {
-					let frames = worker.stats().sent_frames;
-					if frames == 1 || frames % SEND_LOG_INTERVAL == 0 {
-						if let ZenohOutputEvent::Sent { key_expr, .. } = &event {
+			ZenohOutputCommand::FrameReady => {
+				let Some(frame) = latest_frame.take() else { continue };
+				match worker.send_frame(frame) {
+					Ok(event) => {
+						let frames = worker.stats().sent_frames;
+						if (frames == 1 || frames.is_multiple_of(SEND_LOG_INTERVAL))
+							&& let ZenohOutputEvent::Sent { key_expr, .. } = &event
+						{
 							debug!(
 								target: "un_motion_runtime::zenoh_output",
 								base_key_expr = %base_key_expr,
@@ -430,21 +452,21 @@ fn run_zenoh_output_worker(mut worker: ZenohOutputWorker, command_rx: Receiver<Z
 								"Zenoh publish ok",
 							);
 						}
+						let _ = event_tx.send(event);
 					}
-					let _ = event_tx.send(event);
+					Err(error) => {
+						warn!(
+							target: "un_motion_runtime::zenoh_output",
+							base_key_expr = %base_key_expr,
+							error = %error,
+							"Zenoh publish failed",
+						);
+						let _ = event_tx.send(ZenohOutputEvent::Error {
+							message: error.to_string(),
+						});
+					}
 				}
-				Err(error) => {
-					warn!(
-						target: "un_motion_runtime::zenoh_output",
-						base_key_expr = %base_key_expr,
-						error = %error,
-						"Zenoh publish failed",
-					);
-					let _ = event_tx.send(ZenohOutputEvent::Error {
-						message: error.to_string(),
-					});
-				}
-			},
+			}
 			ZenohOutputCommand::Shutdown => break,
 		}
 	}

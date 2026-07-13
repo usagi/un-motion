@@ -44,9 +44,14 @@ use un_motion_frame::{
 	BodyMotion, BoneSample, CoordinateSpace, ExpressionSample, FaceMotion, Handedness, HumanoidBone, HumanoidPose, LengthUnit, Quatf,
 	SampleState, TrackingState, TransformSample, UNMotionFrame, Vec3f,
 };
-use un_motion_input_vmc::{VmcBlendshapeSample, VmcBoneSample, VmcInputConfig, VmcInputFrame, VmcInputSource, VmcTransform};
+use un_motion_input_vmc::{
+	MAX_VMC_BLENDSHAPES, MAX_VMC_NAME_BYTES, VmcBlendshapeSample, VmcBoneSample, VmcInputConfig, VmcInputFrame, VmcInputSource,
+	VmcTransform,
+};
 
 use crate::{MotionFrameSource, SourceTelemetryHandle};
+
+const BLENDSHAPE_TRANSACTION_TIMEOUT_NS: u64 = 1_000_000_000;
 
 /// VMC/UDP 受信を `MotionFrameSource` として提供する。
 ///
@@ -80,13 +85,19 @@ pub struct VmcUnmotionSource {
 	source: VmcInputSource,
 	source_id: String,
 	sequence: u64,
+	/// `/VMC/Ext/OK` が示す送信元のtracking状態。
+	pending_ok: Option<i32>,
 	/// per-bundle に届く root transform の最新値。
 	pending_root: Option<VmcTransform>,
 	/// bone 名 (VMC 規約上は HumanoidBone enum と 1:1 の "Hips", "Spine" 等) →
 	/// 最新の VmcBoneSample。
 	pending_bones: BTreeMap<String, VmcBoneSample>,
-	/// blendshape 名 → 最新値。VMC `/VMC/Ext/Blend/Val` の累積。
+	/// blendshape 名 → Apply 済みの最新値。
 	pending_blendshapes: BTreeMap<String, f32>,
+	/// `/VMC/Ext/Blend/Val` で受信し、次の Apply まで公開しない値。
+	staged_blendshapes: BTreeMap<String, f32>,
+	/// 現在の未Apply transactionで最初の値を受信したtimestamp。
+	staged_blendshapes_started_ts: Option<u64>,
 	/// 最新の受信 unix timestamp ns。emit する UNMotionFrame の
 	/// `capture_timestamp_ns` / `frame_timestamp_ns` に使う。
 	pending_received_ts: u64,
@@ -129,9 +140,12 @@ impl VmcUnmotionSource {
 			source,
 			source_id: source_id.clone(),
 			sequence: 0,
+			pending_ok: None,
 			pending_root: None,
 			pending_bones: BTreeMap::new(),
 			pending_blendshapes: BTreeMap::new(),
+			staged_blendshapes: BTreeMap::new(),
+			staged_blendshapes_started_ts: None,
 			pending_received_ts: 0,
 			pending_dirty: false,
 			telemetry: SourceTelemetryHandle::new("vmc-receive", source_id),
@@ -144,19 +158,52 @@ impl VmcUnmotionSource {
 	/// 1 つの `VmcInputFrame` を accumulator にマージする。同じ channel の値が
 	/// 既にあれば上書き (=「最後に届いた値が現在の状態」)。
 	fn merge_bundle(&mut self, frame: &VmcInputFrame) {
+		if self
+			.staged_blendshapes_started_ts
+			.is_some_and(|started| frame.received_timestamp_ns.saturating_sub(started) > BLENDSHAPE_TRANSACTION_TIMEOUT_NS)
+		{
+			self.staged_blendshapes.clear();
+			self.staged_blendshapes_started_ts = None;
+		}
+		if let Some(ok) = frame.ok {
+			self.pending_ok = Some(ok);
+			if ok <= 0 {
+				self.pending_root = None;
+				self.pending_bones.clear();
+				self.pending_blendshapes.clear();
+				self.staged_blendshapes.clear();
+				self.staged_blendshapes_started_ts = None;
+				self.pending_received_ts = self.pending_received_ts.max(frame.received_timestamp_ns);
+				self.pending_dirty = true;
+				self.telemetry.atomics.bundles_merged.fetch_add(1, Ordering::Relaxed);
+				return;
+			}
+		}
 		if let Some(root) = &frame.root {
 			self.pending_root = Some(root.clone());
 		}
 		for bone in &frame.bones {
-			self.pending_bones.insert(bone.name.clone(), bone.clone());
+			if humanoid_bone_from_name(&bone.name).is_some() {
+				self.pending_bones.insert(bone.name.clone(), bone.clone());
+			}
 		}
 		for blend in &frame.blendshapes {
-			self.pending_blendshapes.insert(blend.name.clone(), blend.value);
+			let valid_name = !blend.name.is_empty() && blend.name.len() <= MAX_VMC_NAME_BYTES;
+			let has_capacity = self.staged_blendshapes.contains_key(&blend.name) || self.staged_blendshapes.len() < MAX_VMC_BLENDSHAPES;
+			if valid_name && has_capacity {
+				self.staged_blendshapes_started_ts.get_or_insert(frame.received_timestamp_ns);
+				self.staged_blendshapes.insert(blend.name.clone(), blend.value);
+			}
+		}
+		if frame.blend_apply {
+			self.pending_blendshapes = std::mem::take(&mut self.staged_blendshapes);
+			self.staged_blendshapes_started_ts = None;
 		}
 		if frame.received_timestamp_ns > self.pending_received_ts {
 			self.pending_received_ts = frame.received_timestamp_ns;
 		}
-		if frame.has_vmc_payload() || frame.blend_apply {
+		let has_immediate_payload = frame.ok.is_some() || frame.root.is_some() || !frame.bones.is_empty();
+		if has_immediate_payload || frame.blend_apply {
 			self.pending_dirty = true;
 			self.telemetry.atomics.bundles_merged.fetch_add(1, Ordering::Relaxed);
 		}
@@ -171,7 +218,7 @@ impl VmcUnmotionSource {
 			source_id: self.source_id.clone(),
 			received_timestamp_ns: self.pending_received_ts,
 			raw_datagram: None,
-			ok: None,
+			ok: self.pending_ok,
 			root: self.pending_root.clone(),
 			bones: self.pending_bones.values().cloned().collect(),
 			blendshapes: self
@@ -367,6 +414,20 @@ pub fn vmc_input_frame_to_unmotion_frame(frame: &VmcInputFrame, sequence: u64) -
 	output.header.coordinate_space = CoordinateSpace::Vmc;
 	output.header.handedness = Handedness::LeftHanded;
 	output.header.length_unit = LengthUnit::Meter;
+	if frame.ok.is_some_and(|ok| ok <= 0) {
+		output.body = Some(BodyMotion {
+			tracking_state: TrackingState::Lost,
+			confidence: 0.0,
+			humanoid: None,
+		});
+		output.face = Some(FaceMotion {
+			tracking_state: TrackingState::Lost,
+			confidence: 0.0,
+			head: None,
+			expressions: Vec::new(),
+		});
+		return output;
+	}
 
 	let root_sample = frame.root.as_ref().map(vmc_transform_to_frame_transform);
 	let bone_samples: Vec<BoneSample> = frame
@@ -735,6 +796,51 @@ mod tests {
 		assert_eq!(face.expressions.len(), 12, "face.expressions should have 12 blendshapes");
 	}
 
+	#[test]
+	fn vmc_unmotion_source_does_not_emit_partial_blendshape_frames() {
+		let mut source = VmcUnmotionSource::bind("test-blend-boundary", "127.0.0.1:0".parse().unwrap()).expect("bind");
+		let bound = source.local_addr().expect("local_addr");
+		let sender = UdpSocket::bind("127.0.0.1:0").expect("sender bind");
+		let val = rosc::OscPacket::Message(OscMessage {
+			addr: "/VMC/Ext/Blend/Val".to_string(),
+			args: vec![OscType::String("Joy".to_string()), OscType::Float(0.8)],
+		});
+		sender
+			.send_to(&encoder::encode(&val).expect("encode val"), bound)
+			.expect("send val");
+
+		let deadline = Instant::now() + Duration::from_secs(1);
+		while source.telemetry.atomics.raw_received.load(Ordering::Relaxed) < 1 && Instant::now() < deadline {
+			assert!(
+				source.next_frame().expect("poll val").is_none(),
+				"Blend/Val must not emit before Apply"
+			);
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		assert_eq!(source.telemetry.atomics.raw_received.load(Ordering::Relaxed), 1);
+		assert_eq!(source.telemetry.atomics.frames_emitted.load(Ordering::Relaxed), 0);
+
+		let apply = rosc::OscPacket::Message(OscMessage {
+			addr: "/VMC/Ext/Blend/Apply".to_string(),
+			args: Vec::new(),
+		});
+		sender
+			.send_to(&encoder::encode(&apply).expect("encode apply"), bound)
+			.expect("send apply");
+		let deadline = Instant::now() + Duration::from_secs(1);
+		let emitted = loop {
+			if let Some(frame) = source.next_frame().expect("poll apply") {
+				break frame;
+			}
+			assert!(Instant::now() < deadline, "Apply did not emit a frame");
+			std::thread::sleep(Duration::from_millis(10));
+		};
+		let face = emitted.face.expect("Apply frame face");
+		assert_eq!(face.expressions.len(), 1);
+		assert_eq!(face.expressions[0].name, "Joy");
+		assert_eq!(source.telemetry.atomics.frames_emitted.load(Ordering::Relaxed), 1);
+	}
+
 	/// `/MP/` (Waidayo MotionPath 拡張) datagram は silent drop されるが、
 	/// `non_vmc_dropped` カウンタは加算される。これによりログに
 	/// 「VMC 受信 engine dropped non-VMC datagrams」が出てユーザーが
@@ -831,6 +937,167 @@ mod tests {
 		assert_eq!(humanoid_bone_from_name("LeftThumbProximal"), None);
 		assert_eq!(humanoid_bone_from_name(""), None);
 		assert_eq!(humanoid_bone_from_name("UnknownBone"), None);
+	}
+
+	#[test]
+	fn accumulator_rejects_unknown_bones_and_bounds_blendshapes() {
+		let mut source = VmcUnmotionSource::bind("bounded", "127.0.0.1:0".parse().unwrap()).expect("bind");
+		let mut frame = VmcInputFrame {
+			source_id: "bounded".to_string(),
+			received_timestamp_ns: 1,
+			raw_datagram: None,
+			ok: None,
+			root: None,
+			bones: Vec::new(),
+			blendshapes: Vec::new(),
+			blend_apply: false,
+			message_count: 0,
+		};
+		frame.bones.push(VmcBoneSample {
+			name: "UnknownBone".to_string(),
+			position: [0.0; 3],
+			rotation: [0.0, 0.0, 0.0, 1.0],
+		});
+		for index in 0..(MAX_VMC_BLENDSHAPES + 10) {
+			frame.blendshapes.push(VmcBlendshapeSample {
+				name: format!("Blend{index}"),
+				value: 0.5,
+			});
+		}
+		source.merge_bundle(&frame);
+		assert!(source.pending_bones.is_empty());
+		assert_eq!(source.staged_blendshapes.len(), MAX_VMC_BLENDSHAPES);
+	}
+
+	#[test]
+	fn accumulator_publishes_blendshapes_only_on_apply() {
+		let mut source = VmcUnmotionSource::bind("blend-apply", "127.0.0.1:0".parse().unwrap()).expect("bind");
+		let mut frame = VmcInputFrame {
+			source_id: "blend-apply".to_string(),
+			received_timestamp_ns: 1,
+			raw_datagram: None,
+			ok: None,
+			root: None,
+			bones: Vec::new(),
+			blendshapes: vec![VmcBlendshapeSample {
+				name: "Joy".to_string(),
+				value: 0.75,
+			}],
+			blend_apply: false,
+			message_count: 1,
+		};
+
+		source.merge_bundle(&frame);
+		assert!(!source.pending_dirty);
+		assert!(source.pending_blendshapes.is_empty());
+		assert_eq!(source.staged_blendshapes.get("Joy"), Some(&0.75));
+
+		frame.blendshapes.clear();
+		frame.blend_apply = true;
+		source.merge_bundle(&frame);
+		assert!(source.pending_dirty);
+		assert_eq!(source.pending_blendshapes.get("Joy"), Some(&0.75));
+		assert!(source.staged_blendshapes.is_empty());
+	}
+
+	#[test]
+	fn accumulator_expires_unapplied_blendshape_transactions() {
+		let mut source = VmcUnmotionSource::bind("blend-timeout", "127.0.0.1:0".parse().unwrap()).expect("bind");
+		let mut frame = VmcInputFrame {
+			source_id: "blend-timeout".to_string(),
+			received_timestamp_ns: 1,
+			raw_datagram: None,
+			ok: None,
+			root: None,
+			bones: Vec::new(),
+			blendshapes: vec![VmcBlendshapeSample {
+				name: "Stale".to_string(),
+				value: 0.75,
+			}],
+			blend_apply: false,
+			message_count: 1,
+		};
+		source.merge_bundle(&frame);
+
+		frame.received_timestamp_ns = BLENDSHAPE_TRANSACTION_TIMEOUT_NS + 2;
+		frame.blendshapes = vec![VmcBlendshapeSample {
+			name: "Fresh".to_string(),
+			value: 0.5,
+		}];
+		frame.blend_apply = true;
+		source.merge_bundle(&frame);
+
+		assert!(!source.pending_blendshapes.contains_key("Stale"));
+		assert_eq!(source.pending_blendshapes.get("Fresh"), Some(&0.5));
+		assert!(source.staged_blendshapes_started_ts.is_none());
+	}
+
+	#[test]
+	fn accumulator_replaces_previous_blendshape_set_on_apply() {
+		let mut source = VmcUnmotionSource::bind("blend-replace", "127.0.0.1:0".parse().unwrap()).expect("bind");
+		let mut frame = VmcInputFrame {
+			source_id: "blend-replace".to_string(),
+			received_timestamp_ns: 1,
+			raw_datagram: None,
+			ok: None,
+			root: None,
+			bones: Vec::new(),
+			blendshapes: vec![VmcBlendshapeSample {
+				name: "Joy".to_string(),
+				value: 0.75,
+			}],
+			blend_apply: true,
+			message_count: 2,
+		};
+		source.merge_bundle(&frame);
+		assert_eq!(source.pending_blendshapes.get("Joy"), Some(&0.75));
+
+		frame.blendshapes = vec![VmcBlendshapeSample {
+			name: "Blink".to_string(),
+			value: 1.0,
+		}];
+		source.merge_bundle(&frame);
+		assert!(!source.pending_blendshapes.contains_key("Joy"));
+		assert_eq!(source.pending_blendshapes.get("Blink"), Some(&1.0));
+	}
+
+	#[test]
+	fn accumulator_clears_tracked_state_when_vmc_reports_not_ok() {
+		let mut source = VmcUnmotionSource::bind("tracking-loss", "127.0.0.1:0".parse().unwrap()).expect("bind");
+		source.pending_root = Some(VmcTransform {
+			name: "root".to_string(),
+			position: [0.0; 3],
+			rotation: [0.0, 0.0, 0.0, 1.0],
+		});
+		source.pending_bones.insert(
+			"Head".to_string(),
+			VmcBoneSample {
+				name: "Head".to_string(),
+				position: [0.0; 3],
+				rotation: [0.0, 0.0, 0.0, 1.0],
+			},
+		);
+		source.pending_blendshapes.insert("Joy".to_string(), 1.0);
+		let lost = VmcInputFrame {
+			source_id: "tracking-loss".to_string(),
+			received_timestamp_ns: 2,
+			raw_datagram: None,
+			ok: Some(0),
+			root: None,
+			bones: Vec::new(),
+			blendshapes: Vec::new(),
+			blend_apply: false,
+			message_count: 1,
+		};
+
+		source.merge_bundle(&lost);
+		let frame = source.build_frame_from_accumulator(4);
+
+		assert!(source.pending_root.is_none());
+		assert!(source.pending_bones.is_empty());
+		assert!(source.pending_blendshapes.is_empty());
+		assert_eq!(frame.body.expect("lost body").tracking_state, TrackingState::Lost);
+		assert_eq!(frame.face.expect("lost face").tracking_state, TrackingState::Lost);
 	}
 
 	#[test]

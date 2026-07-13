@@ -1,5 +1,3 @@
-use std::fmt::Write as _;
-
 use un_motion_engine_mediapipe_types::MediaPipeRawOutput;
 use un_motion_frame::{
 	BodyMotion, BoneSample, CoordinateSpace, ExpressionSample, FaceMotion, Finger, FingerPose, HandMotion, HumanoidBone, HumanoidPose,
@@ -208,21 +206,6 @@ impl MediaPipePostProcessor {
 			apply_anatomical_constraints(&mut frame);
 		}
 		self.stabilizer.apply(&mut frame, &observation_quality, &self.config.rules);
-		frame.metadata.notes.push(format!(
-			"mediapipe.post_process native_return_code={} pose={} hands={} face={} holistic_pose={} holistic_left_hand={} holistic_right_hand={} holistic_face={}",
-			native.return_code,
-			native.pose.landmark_count,
-			native.hands.hand_count,
-			native.face.landmark_count,
-			native.holistic.pose.landmark_count,
-			native.holistic.left_hand.landmark_count,
-			native.holistic.right_hand.landmark_count,
-			native.holistic.face.landmark_count
-		));
-		frame.metadata.notes.push(format!(
-			"mediapipe.post_process rules={}",
-			post_process_rules_summary(&self.config.rules)
-		));
 		frame.metadata.notes.push(observation_quality.summary_note());
 		if let Some(note) = pose_head_note {
 			frame.metadata.notes.push(note);
@@ -241,7 +224,7 @@ impl MediaPipePostProcessor {
 		&self,
 		output_sequence: u64,
 		capture_timestamp_ns: u64,
-		native: &NativeMediaPipeOutput,
+		_native: &NativeMediaPipeOutput,
 	) -> UNMotionFrame {
 		let mut frame = UNMotionFrame::new(output_sequence);
 		frame.header.timestamp_basis = TimestampBasis::SourceLocal;
@@ -259,10 +242,6 @@ impl MediaPipePostProcessor {
 			latency_ns: None,
 			state: TrackingState::Lost,
 		});
-		frame.metadata.notes.push(format!(
-			"post_process=none native_return_code={} pose={} hands={} face={}",
-			native.return_code, native.pose.landmark_count, native.hands.hand_count, native.face.landmark_count
-		));
 		frame
 	}
 }
@@ -342,7 +321,6 @@ fn mediapipe_observation_qualities(native: &NativeMediaPipeOutput, config: &Medi
 		arms: arms_observation_quality(
 			pose,
 			config.min_landmark_confidence,
-			config.hands_enabled,
 			config.arms_ik_enabled && config.rules.arm_ik_from_hands,
 			&left_hand,
 			&right_hand,
@@ -642,22 +620,20 @@ impl MotionStabilizer {
 					timestamp_ns.saturating_sub(snapshot.timestamp_ns),
 					Self::HEAD_MAX_ANGULAR_SPEED_RAD_PER_SEC,
 					Self::ROTATION_JUMP_SLACK_RAD,
-				) {
-				if let Some(limited) = blend_body_bone(
+				) && let Some(limited) = blend_body_bone(
+				snapshot.bone.as_ref(),
+				body_bone(frame, HumanoidBone::Head),
+				rotation_delta_limit_alpha(
 					snapshot.bone.as_ref(),
 					body_bone(frame, HumanoidBone::Head),
-					rotation_delta_limit_alpha(
-						snapshot.bone.as_ref(),
-						body_bone(frame, HumanoidBone::Head),
-						timestamp_ns.saturating_sub(snapshot.timestamp_ns),
-						Self::HEAD_MAX_ANGULAR_SPEED_RAD_PER_SEC,
-						Self::ROTATION_JUMP_SLACK_RAD,
-					)
-					.unwrap_or(1.0),
-				) {
-					upsert_body_bone(frame, limited);
-					frame.metadata.notes.push("mediapipe.stability head=rotation_limited".to_string());
-				}
+					timestamp_ns.saturating_sub(snapshot.timestamp_ns),
+					Self::HEAD_MAX_ANGULAR_SPEED_RAD_PER_SEC,
+					Self::ROTATION_JUMP_SLACK_RAD,
+				)
+				.unwrap_or(1.0),
+			) {
+				upsert_body_bone(frame, limited);
+				frame.metadata.notes.push("mediapipe.stability head=rotation_limited".to_string());
 			}
 			if rules.anatomical_constraints && rules.head_source_switch_blend {
 				self.apply_head_source_switch_blend(frame, quality, timestamp_ns);
@@ -1323,7 +1299,6 @@ fn head_observation_quality(pose: &NativePose, face: &NativeFace, min_confidence
 fn arms_observation_quality(
 	pose: &NativePose,
 	min_confidence: f32,
-	hands_enabled: bool,
 	hand_ik_enabled: bool,
 	left_hand: &ObservationQuality,
 	right_hand: &ObservationQuality,
@@ -1377,9 +1352,6 @@ fn arms_observation_quality(
 			return hand_ik;
 		}
 		return ObservationQuality::new(confidence * 0.45, "low_confidence");
-	}
-	if hands_enabled && left_hand.score <= 0.0 && right_hand.score <= 0.0 {
-		return ObservationQuality::new(confidence * 0.35, "pose_chain_hands_missing");
 	}
 	let left_ratio = lengths[0].min(lengths[1]) / lengths[0].max(lengths[1]);
 	let right_ratio = lengths[2].min(lengths[3]) / lengths[2].max(lengths[3]);
@@ -2392,14 +2364,6 @@ fn lost_signal_behavior(value: &str) -> LostSignalBehavior {
 	}
 }
 
-fn lost_signal_behavior_name(value: &str) -> &'static str {
-	match lost_signal_behavior(value) {
-		LostSignalBehavior::RestPose => "rest-pose",
-		LostSignalBehavior::Hold => "hold",
-		LostSignalBehavior::Drop => "drop",
-	}
-}
-
 fn lost_signal_part_behavior(rules: &MediaPipePostProcessRules, part: LostSignalPart) -> &str {
 	match part {
 		LostSignalPart::Head => non_empty_or(&rules.lost_signal_head_behavior, &rules.lost_signal_behavior),
@@ -2527,13 +2491,6 @@ fn head_confidence_from_signals(signals: &[MotionSignal]) -> f32 {
 
 fn upper_arm_local_rotation_from_signals(signals: &[MotionSignal], side: HandSide) -> Option<[f32; 4]> {
 	let target = arm_segment_direction_from_signals(signals, side.prefix(), "shoulder", "elbow")?;
-	if let Some(forearm) = arm_segment_direction_from_signals(signals, side.prefix(), "elbow", "wrist")
-		&& dot3_array(target, forearm).abs() < 0.94
-	{
-		if let Some(rotation) = quat_from_basis(side.arm_rest_axis(), [0.0, 0.0, 1.0], target, forearm) {
-			return Some(rotation);
-		}
-	}
 	Some(quat_from_to(side.arm_rest_axis(), target))
 }
 
@@ -2747,10 +2704,10 @@ fn signal_name_matches_parts(name: &str, kind: &str, side: &str, key: &str) -> b
 
 fn scalar_signal_with_confidence_from_signals(signals: &[MotionSignal], name: &str) -> Option<(f32, f32)> {
 	signals.iter().find_map(|signal| {
-		if signal.name == name {
-			if let MotionSignalValue::Scalar(value) = signal.value {
-				return Some((value.clamp(-1.0, 1.0), signal.confidence.clamp(0.0, 1.0)));
-			}
+		if signal.name == name
+			&& let MotionSignalValue::Scalar(value) = signal.value
+		{
+			return Some((value.clamp(-1.0, 1.0), signal.confidence.clamp(0.0, 1.0)));
 		}
 		None
 	})
@@ -3150,21 +3107,134 @@ fn push_arm_pose_signals(signals: &mut Vec<MotionSignal>, pose: &NativePose, con
 		return;
 	}
 	for (side, shoulder, elbow, wrist) in [("left", 11, 13, 15), ("right", 12, 14, 16)] {
-		if pose_arm_side_requires_tracked_hand(signals, side, config) {
-			continue;
-		}
 		push_arm_pose_side_signals(signals, side, pose, shoulder, elbow, wrist, config);
 	}
 }
 
-fn pose_arm_side_requires_tracked_hand(signals: &[MotionSignal], side: &str, config: &MediaPipePostProcessConfig) -> bool {
-	let present_signal = format!("hand.{side}.present");
-	config.hands_enabled
-		&& !signals.iter().any(|signal| {
-			signal.name == present_signal
-				&& matches!(signal.value, MotionSignalValue::Scalar(value) if value > 0.0)
-				&& signal.confidence >= config.min_landmark_confidence
-		})
+const LEFT_ARM_SIGNAL_NAMES: [&str; 12] = [
+	"arm.left.shoulder.x",
+	"arm.left.shoulder.y",
+	"arm.left.shoulder.z",
+	"arm.left.elbow.x",
+	"arm.left.elbow.y",
+	"arm.left.elbow.z",
+	"arm.left.wrist.x",
+	"arm.left.wrist.y",
+	"arm.left.wrist.z",
+	"arm.left.elbow.bend",
+	"arm.left.upper.angle",
+	"arm.left.lower.angle",
+];
+const RIGHT_ARM_SIGNAL_NAMES: [&str; 12] = [
+	"arm.right.shoulder.x",
+	"arm.right.shoulder.y",
+	"arm.right.shoulder.z",
+	"arm.right.elbow.x",
+	"arm.right.elbow.y",
+	"arm.right.elbow.z",
+	"arm.right.wrist.x",
+	"arm.right.wrist.y",
+	"arm.right.wrist.z",
+	"arm.right.elbow.bend",
+	"arm.right.upper.angle",
+	"arm.right.lower.angle",
+];
+const LEFT_TORSO_SIGNAL_NAMES: [&str; 6] = [
+	"torso.left.shoulder.x",
+	"torso.left.shoulder.y",
+	"torso.left.shoulder.z",
+	"torso.left.hip.x",
+	"torso.left.hip.y",
+	"torso.left.hip.z",
+];
+const RIGHT_TORSO_SIGNAL_NAMES: [&str; 6] = [
+	"torso.right.shoulder.x",
+	"torso.right.shoulder.y",
+	"torso.right.shoulder.z",
+	"torso.right.hip.x",
+	"torso.right.hip.y",
+	"torso.right.hip.z",
+];
+const LEFT_LEG_SIGNAL_NAMES: [&str; 9] = [
+	"leg.left.hip.x",
+	"leg.left.hip.y",
+	"leg.left.hip.z",
+	"leg.left.knee.x",
+	"leg.left.knee.y",
+	"leg.left.knee.z",
+	"leg.left.ankle.x",
+	"leg.left.ankle.y",
+	"leg.left.ankle.z",
+];
+const RIGHT_LEG_SIGNAL_NAMES: [&str; 9] = [
+	"leg.right.hip.x",
+	"leg.right.hip.y",
+	"leg.right.hip.z",
+	"leg.right.knee.x",
+	"leg.right.knee.y",
+	"leg.right.knee.z",
+	"leg.right.ankle.x",
+	"leg.right.ankle.y",
+	"leg.right.ankle.z",
+];
+const LEFT_FOOT_SIGNAL_NAMES: [&str; 9] = [
+	"foot.left.ankle.x",
+	"foot.left.ankle.y",
+	"foot.left.ankle.z",
+	"foot.left.heel.x",
+	"foot.left.heel.y",
+	"foot.left.heel.z",
+	"foot.left.index.x",
+	"foot.left.index.y",
+	"foot.left.index.z",
+];
+const RIGHT_FOOT_SIGNAL_NAMES: [&str; 9] = [
+	"foot.right.ankle.x",
+	"foot.right.ankle.y",
+	"foot.right.ankle.z",
+	"foot.right.heel.x",
+	"foot.right.heel.y",
+	"foot.right.heel.z",
+	"foot.right.index.x",
+	"foot.right.index.y",
+	"foot.right.index.z",
+];
+
+fn push_static_scalar_values<const N: usize>(signals: &mut Vec<MotionSignal>, names: &[&str; N], values: [f32; N], confidence: f32) {
+	for (name, value) in names.iter().zip(values) {
+		push_scalar(signals, name, value.clamp(-1.0, 1.0), confidence);
+	}
+}
+
+fn push_arm_point_signals(
+	signals: &mut Vec<MotionSignal>,
+	side: &str,
+	shoulder: Point3,
+	elbow: Point3,
+	wrist: Point3,
+	bend: f32,
+	confidence: f32,
+) {
+	let names = if side == "left" {
+		&LEFT_ARM_SIGNAL_NAMES
+	} else {
+		&RIGHT_ARM_SIGNAL_NAMES
+	};
+	let values = [
+		shoulder.x,
+		shoulder.y,
+		shoulder.z,
+		elbow.x,
+		elbow.y,
+		elbow.z,
+		wrist.x,
+		wrist.y,
+		wrist.z,
+		bend,
+		((shoulder.y - elbow.y).atan2(elbow.x - shoulder.x) / std::f32::consts::PI).clamp(-1.0, 1.0),
+		((elbow.y - wrist.y).atan2(wrist.x - elbow.x) / std::f32::consts::PI).clamp(-1.0, 1.0),
+	];
+	push_static_scalar_values(signals, names, values, confidence);
 }
 
 fn push_arm_pose_side_signals(
@@ -3190,28 +3260,7 @@ fn push_arm_pose_side_signals(
 	let wrist = pose_arm_point(pose, wrist_index, use_world);
 	let bend = arm_bend_signal(shoulder, elbow, wrist);
 
-	for (name, value) in [
-		(format!("arm.{side}.shoulder.x"), shoulder.x),
-		(format!("arm.{side}.shoulder.y"), shoulder.y),
-		(format!("arm.{side}.shoulder.z"), shoulder.z),
-		(format!("arm.{side}.elbow.x"), elbow.x),
-		(format!("arm.{side}.elbow.y"), elbow.y),
-		(format!("arm.{side}.elbow.z"), elbow.z),
-		(format!("arm.{side}.wrist.x"), wrist.x),
-		(format!("arm.{side}.wrist.y"), wrist.y),
-		(format!("arm.{side}.wrist.z"), wrist.z),
-		(format!("arm.{side}.elbow.bend"), bend),
-		(
-			format!("arm.{side}.upper.angle"),
-			((shoulder.y - elbow.y).atan2(elbow.x - shoulder.x) / std::f32::consts::PI).clamp(-1.0, 1.0),
-		),
-		(
-			format!("arm.{side}.lower.angle"),
-			((elbow.y - wrist.y).atan2(wrist.x - elbow.x) / std::f32::consts::PI).clamp(-1.0, 1.0),
-		),
-	] {
-		push_scalar_owned(signals, name, value.clamp(-1.0, 1.0), confidence);
-	}
+	push_arm_point_signals(signals, side, shoulder, elbow, wrist, bend, confidence);
 }
 
 fn pose_arm_point(pose: &NativePose, index: usize, use_world: bool) -> Point3 {
@@ -3253,16 +3302,17 @@ fn push_torso_signals(signals: &mut Vec<MotionSignal>, pose: &NativePose, config
 		let use_world = pose.world_landmark_count > hip as u32;
 		let shoulder = pose_body_point(pose, shoulder, use_world);
 		let hip = pose_body_point(pose, hip, use_world);
-		for (name, value) in [
-			(format!("torso.{side}.shoulder.x"), shoulder.x),
-			(format!("torso.{side}.shoulder.y"), shoulder.y),
-			(format!("torso.{side}.shoulder.z"), shoulder.z),
-			(format!("torso.{side}.hip.x"), hip.x),
-			(format!("torso.{side}.hip.y"), hip.y),
-			(format!("torso.{side}.hip.z"), hip.z),
-		] {
-			push_scalar_owned(signals, name, value.clamp(-1.0, 1.0), confidence);
-		}
+		let names = if side == "left" {
+			&LEFT_TORSO_SIGNAL_NAMES
+		} else {
+			&RIGHT_TORSO_SIGNAL_NAMES
+		};
+		push_static_scalar_values(
+			signals,
+			names,
+			[shoulder.x, shoulder.y, shoulder.z, hip.x, hip.y, hip.z],
+			confidence,
+		);
 	}
 }
 
@@ -3279,19 +3329,17 @@ fn push_leg_signals(signals: &mut Vec<MotionSignal>, pose: &NativePose, config: 
 		let hip = pose_body_point(pose, hip, use_world);
 		let knee = pose_body_point(pose, knee, use_world);
 		let ankle = pose_body_point(pose, ankle, use_world);
-		for (name, value) in [
-			(format!("leg.{side}.hip.x"), hip.x),
-			(format!("leg.{side}.hip.y"), hip.y),
-			(format!("leg.{side}.hip.z"), hip.z),
-			(format!("leg.{side}.knee.x"), knee.x),
-			(format!("leg.{side}.knee.y"), knee.y),
-			(format!("leg.{side}.knee.z"), knee.z),
-			(format!("leg.{side}.ankle.x"), ankle.x),
-			(format!("leg.{side}.ankle.y"), ankle.y),
-			(format!("leg.{side}.ankle.z"), ankle.z),
-		] {
-			push_scalar_owned(signals, name, value.clamp(-1.0, 1.0), confidence);
-		}
+		let names = if side == "left" {
+			&LEFT_LEG_SIGNAL_NAMES
+		} else {
+			&RIGHT_LEG_SIGNAL_NAMES
+		};
+		push_static_scalar_values(
+			signals,
+			names,
+			[hip.x, hip.y, hip.z, knee.x, knee.y, knee.z, ankle.x, ankle.y, ankle.z],
+			confidence,
+		);
 	}
 }
 
@@ -3308,19 +3356,27 @@ fn push_feet_signals(signals: &mut Vec<MotionSignal>, pose: &NativePose, config:
 		let ankle = pose_body_point(pose, ankle, use_world);
 		let heel = pose_body_point(pose, heel, use_world);
 		let foot_index = pose_body_point(pose, foot_index, use_world);
-		for (name, value) in [
-			(format!("foot.{side}.ankle.x"), ankle.x),
-			(format!("foot.{side}.ankle.y"), ankle.y),
-			(format!("foot.{side}.ankle.z"), ankle.z),
-			(format!("foot.{side}.heel.x"), heel.x),
-			(format!("foot.{side}.heel.y"), heel.y),
-			(format!("foot.{side}.heel.z"), heel.z),
-			(format!("foot.{side}.index.x"), foot_index.x),
-			(format!("foot.{side}.index.y"), foot_index.y),
-			(format!("foot.{side}.index.z"), foot_index.z),
-		] {
-			push_scalar_owned(signals, name, value.clamp(-1.0, 1.0), confidence);
-		}
+		let names = if side == "left" {
+			&LEFT_FOOT_SIGNAL_NAMES
+		} else {
+			&RIGHT_FOOT_SIGNAL_NAMES
+		};
+		push_static_scalar_values(
+			signals,
+			names,
+			[
+				ankle.x,
+				ankle.y,
+				ankle.z,
+				heel.x,
+				heel.y,
+				heel.z,
+				foot_index.x,
+				foot_index.y,
+				foot_index.z,
+			],
+			confidence,
+		);
 	}
 }
 
@@ -3382,28 +3438,7 @@ fn push_arm_ik_side_from_hand_signals(signals: &mut Vec<MotionSignal>, side: &st
 	});
 	let (elbow, bend) = solve_arm_ik(side_sign, shoulder, wrist, preferred);
 
-	for (name, value) in [
-		(format!("arm.{side}.shoulder.x"), shoulder.x),
-		(format!("arm.{side}.shoulder.y"), shoulder.y),
-		(format!("arm.{side}.shoulder.z"), shoulder.z),
-		(format!("arm.{side}.elbow.x"), elbow.x),
-		(format!("arm.{side}.elbow.y"), elbow.y),
-		(format!("arm.{side}.elbow.z"), elbow.z),
-		(format!("arm.{side}.wrist.x"), wrist.x),
-		(format!("arm.{side}.wrist.y"), wrist.y),
-		(format!("arm.{side}.wrist.z"), wrist.z),
-		(format!("arm.{side}.elbow.bend"), bend),
-		(
-			format!("arm.{side}.upper.angle"),
-			((shoulder.y - elbow.y).atan2(elbow.x - shoulder.x) / std::f32::consts::PI).clamp(-1.0, 1.0),
-		),
-		(
-			format!("arm.{side}.lower.angle"),
-			((elbow.y - wrist.y).atan2(wrist.x - elbow.x) / std::f32::consts::PI).clamp(-1.0, 1.0),
-		),
-	] {
-		push_scalar_owned(signals, name, value.clamp(-1.0, 1.0), confidence);
-	}
+	push_arm_point_signals(signals, side, shoulder, elbow, wrist, bend, confidence);
 }
 
 fn landmark_confidence<const N: usize>(landmarks: [un_motion_mediapipe_native::NativeLandmark; N]) -> f32 {
@@ -3446,45 +3481,6 @@ fn average_confidence(signals: &[MotionSignal]) -> f32 {
 	} else {
 		signals.iter().map(|signal| signal.confidence).sum::<f32>() / signals.len() as f32
 	}
-}
-
-fn post_process_rules_summary(rules: &MediaPipePostProcessRules) -> String {
-	let entries = [
-		("anatomical_constraints", rules.anatomical_constraints),
-		("hold_lost_landmarks", rules.hold_lost_landmarks),
-		("ease_recovery", rules.ease_recovery),
-		("limit_rotation_jumps", rules.limit_rotation_jumps),
-		("head_source_switch_blend", rules.head_source_switch_blend),
-		("head_from_pose", rules.head_from_pose),
-		("head_from_face_matrix", rules.head_from_face_matrix),
-		("head_reconcile", rules.head_reconcile),
-		("neutral_eye_fallback", rules.neutral_eye_fallback),
-		("hand_camera_target", rules.hand_camera_target),
-		("hand_orientation", rules.hand_orientation),
-		("finger_derived", rules.finger_derived),
-		("arm_from_pose", rules.arm_from_pose),
-		("arm_ik_from_hands", rules.arm_ik_from_hands),
-		("crossed_hand_heuristic", rules.crossed_hand_heuristic),
-		("coordinate_correction", rules.coordinate_correction),
-		("final_clamp", rules.final_clamp),
-	];
-	let mut out = String::with_capacity(360);
-	for (index, (name, enabled)) in entries.into_iter().enumerate() {
-		if index > 0 {
-			out.push(',');
-		}
-		out.push_str(name);
-		out.push(':');
-		out.push_str(if enabled { "on" } else { "off" });
-	}
-	let _ = write!(
-		out,
-		",lost_signal_behavior:{},lost_signal_rest_pose_blend:{:.2},lost_signal_hold_seconds:{:.1}",
-		lost_signal_behavior_name(&rules.lost_signal_behavior),
-		rules.lost_signal_rest_pose_blend.clamp(0.0, 1.0),
-		rules.lost_signal_hold_seconds.clamp(0.0, 30.0)
-	);
-	out
 }
 
 fn apply_tracking_transforms(signals: Vec<MotionSignal>, config: &MediaPipePostProcessConfig) -> Vec<MotionSignal> {
@@ -5025,6 +5021,36 @@ mod tests {
 	}
 
 	#[test]
+	fn native_pose_world_output_keeps_arm_signals_when_hand_tracking_is_enabled_but_missing() {
+		let input = ImageFrame::new_rgb8(7, 123, "file:test", 1, 1, vec![0, 0, 0]).unwrap();
+		let mut native = NativeMediaPipeOutput::default();
+		native.pose.landmark_count = 17;
+		native.pose.world_landmark_count = 17;
+		for index in [11, 12, 13, 14, 15, 16] {
+			native.pose.landmarks[index] = lm3(0.5, 0.5, 0.0);
+		}
+		native.pose.world_landmarks[11] = lm3(0.20, -0.40, -0.04);
+		native.pose.world_landmarks[13] = lm3(0.28, -0.20, -0.10);
+		native.pose.world_landmarks[15] = lm3(0.39, -0.30, -0.26);
+		native.pose.world_landmarks[12] = lm3(-0.10, -0.40, -0.04);
+		native.pose.world_landmarks[14] = lm3(-0.14, -0.21, -0.13);
+		native.pose.world_landmarks[16] = lm3(-0.08, -0.36, -0.31);
+
+		let frame = MediaPipePostProcessor::new(MediaPipePostProcessConfig {
+			hands_enabled: true,
+			arms_ik_enabled: true,
+			..MediaPipePostProcessConfig::default()
+		})
+		.process_native_output(&input, &native);
+
+		assert!(frame.signals.iter().all(|signal| signal.name != "hand.left.present"));
+		assert_signal_near(&frame.signals, "arm.left.shoulder.x", -0.20);
+		assert_signal_near(&frame.signals, "arm.right.shoulder.x", 0.10);
+		assert!(body_has_bone(&frame, HumanoidBone::LeftUpperArm));
+		assert!(body_has_bone(&frame, HumanoidBone::RightUpperArm));
+	}
+
+	#[test]
 	fn native_pose_world_output_emits_torso_legs_and_feet_when_enabled() {
 		let input = ImageFrame::new_rgb8(7, 123, "file:test", 1, 1, vec![0, 0, 0]).unwrap();
 		let mut native = NativeMediaPipeOutput::default();
@@ -5149,6 +5175,14 @@ mod tests {
 		let frame = MediaPipePostProcessor::default().process_native_output(&input, &native);
 		assert!(frame.signals.is_empty());
 		assert_eq!(frame.sources[0].state, TrackingState::Lost);
+		assert_eq!(frame.metadata.notes.len(), 1);
+		assert!(frame.metadata.notes[0].starts_with("mediapipe.quality "));
+	}
+
+	#[test]
+	fn raw_passthrough_omits_redundant_per_frame_diagnostics() {
+		let frame = MediaPipePostProcessor::default().native_raw_passthrough_frame(7, 123, &NativeMediaPipeOutput::default());
+		assert!(frame.metadata.notes.is_empty());
 	}
 
 	#[test]
@@ -5197,7 +5231,7 @@ mod tests {
 	}
 
 	#[test]
-	fn pose_arm_output_neutralizes_when_hands_are_missing() {
+	fn pose_arm_output_stays_live_when_hands_are_missing() {
 		let input = ImageFrame::new_rgb8(7, 123, "file:test", 320, 240, vec![0; 320 * 240 * 3]).unwrap();
 		let mut native = NativeMediaPipeOutput {
 			pose: NativePose {
@@ -5221,38 +5255,29 @@ mod tests {
 
 		let frame = MediaPipePostProcessor::default().process_native_output(&input, &native);
 
-		for (bone, expected) in [
-			(
-				HumanoidBone::LeftUpperArm,
-				rest_pose_upper_arm_rotation(HandSide::Left, MediaPipePostProcessRules::default().lost_signal_rest_pose_blend),
-			),
-			(HumanoidBone::LeftLowerArm, IDENTITY_QUAT_ARRAY),
-			(HumanoidBone::LeftHand, IDENTITY_QUAT_ARRAY),
-			(
-				HumanoidBone::RightUpperArm,
-				rest_pose_upper_arm_rotation(HandSide::Right, MediaPipePostProcessRules::default().lost_signal_rest_pose_blend),
-			),
-			(HumanoidBone::RightLowerArm, IDENTITY_QUAT_ARRAY),
-			(HumanoidBone::RightHand, IDENTITY_QUAT_ARRAY),
+		for bone in [
+			HumanoidBone::LeftUpperArm,
+			HumanoidBone::LeftLowerArm,
+			HumanoidBone::RightUpperArm,
+			HumanoidBone::RightLowerArm,
 		] {
-			let sample = body_bone(&frame, bone).expect("rest-pose arm/hand bone");
+			let sample = body_bone(&frame, bone).expect("pose arm bone");
 			assert_eq!(sample.state, SampleState::Valid);
-			let rotation = sample.transform.rotation.expect("rest-pose rotation");
-			assert_quat_near(&rotation, expected, 1e-5);
+			assert!(sample.transform.rotation.is_some());
 		}
 		assert!(
 			frame
 				.metadata
 				.notes
 				.iter()
-				.any(|note| note.contains("arms=") && note.contains("pose_chain_hands_missing"))
+				.any(|note| note.contains("arms=") && note.contains("pose_chain"))
 		);
 		assert!(
 			frame
 				.metadata
 				.notes
 				.iter()
-				.any(|note| note == "mediapipe.stability left_arm=rest_pose_hands_missing")
+				.all(|note| !note.contains("rest_pose_hands_missing") && !note.contains("hold_hands_missing"))
 		);
 	}
 
@@ -5361,7 +5386,7 @@ mod tests {
 	}
 
 	#[test]
-	fn upper_arm_uses_forearm_direction_as_elbow_bend_plane() {
+	fn upper_arm_uses_shoulder_to_elbow_direction_without_forearm_twist() {
 		let signals = vec![
 			scalar("arm.left.shoulder.x", 0.0, 1.0),
 			scalar("arm.left.shoulder.y", 0.0, 1.0),
@@ -5376,8 +5401,8 @@ mod tests {
 
 		let upper = upper_arm_local_rotation_from_signals(&signals, HandSide::Left).expect("upper arm rotation");
 		assert!(
-			upper[0].abs() > 0.6,
-			"upper arm should carry elbow bend-plane twist instead of leaving it undefined: {upper:?}"
+			upper[0].abs() < 0.05 && upper[2].abs() < 0.05,
+			"upper arm must not inherit forearm-derived axial twist: {upper:?}"
 		);
 	}
 
@@ -5922,32 +5947,5 @@ mod tests {
 			.map(|(value, _confidence)| value)
 			.unwrap_or_else(|| panic!("missing signal {name}"));
 		assert!((value - expected).abs() < 0.0001, "signal {name} expected {expected}, got {value}");
-	}
-
-	fn assert_quat_near(actual: &Quatf, expected: [f32; 4], epsilon: f32) {
-		assert!(
-			(actual.x - expected[0]).abs() <= epsilon,
-			"quat x expected {}, got {}",
-			expected[0],
-			actual.x
-		);
-		assert!(
-			(actual.y - expected[1]).abs() <= epsilon,
-			"quat y expected {}, got {}",
-			expected[1],
-			actual.y
-		);
-		assert!(
-			(actual.z - expected[2]).abs() <= epsilon,
-			"quat z expected {}, got {}",
-			expected[2],
-			actual.z
-		);
-		assert!(
-			(actual.w - expected[3]).abs() <= epsilon,
-			"quat w expected {}, got {}",
-			expected[3],
-			actual.w
-		);
 	}
 }

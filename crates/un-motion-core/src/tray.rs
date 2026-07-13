@@ -46,7 +46,7 @@ mod windows_tray {
 	use std::os::windows::io::AsRawHandle;
 	use std::path::Path;
 	use std::process::Child;
-	use std::sync::Arc;
+	use std::rc::Rc;
 	use std::thread;
 	use std::time::{Duration, Instant};
 
@@ -79,7 +79,7 @@ mod windows_tray {
 		config.validate()?;
 		let open_exe = options.open_exe.clone();
 		let bind_addr = config.bind_addr;
-		let open_job = Arc::new(OpenProcessJob::new()?);
+		let open_job = Rc::new(OpenProcessJob::new()?);
 		let tooltip = options.tooltip.clone().unwrap_or_else(|| "UNMotion Core".to_string());
 		let open_label = options
 			.open_menu_label

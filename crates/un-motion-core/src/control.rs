@@ -7,8 +7,9 @@ use std::sync::{
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow, bail};
+use arc_swap::ArcSwapOption;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, broadcast};
 use un_motion_frame::UNMotionFrame;
 use un_motion_runtime::RuntimeSnapshot;
 
@@ -16,7 +17,9 @@ use un_motion_profile_schema::{
 	CoreProfile, CoreProfileDocument, CoreProfileDocumentStore, document_from_profiles, document_profiles, normalize_profile_document,
 };
 
-use crate::runtime_host::{CoreRuntimeHost, CoreRuntimeStatusUpdate, NeutralCalibrationPose, core_runtime_config_from_document};
+use crate::runtime_host::{
+	CoreRuntimeHandle, CoreRuntimeHost, CoreRuntimeStatusUpdate, NeutralCalibrationPose, core_runtime_config_from_document,
+};
 
 pub const DEFAULT_API_WORKER_THREADS: usize = 2;
 
@@ -208,12 +211,27 @@ struct CoreMutableState {
 }
 
 #[derive(Debug)]
+struct PendingRuntimeStatus {
+	generation: u64,
+	update: CoreRuntimeStatusUpdate,
+}
+
+#[derive(Debug)]
 struct CoreControlInner {
 	state: RwLock<CoreMutableState>,
+	mutation: AsyncMutex<()>,
 	profile_store: Option<CoreProfileDocumentStore>,
 	runtime_host: Mutex<Option<CoreRuntimeHost>>,
+	pending_runtime_status: ArcSwapOption<PendingRuntimeStatus>,
+	runtime_status_apply: AsyncMutex<()>,
+	runtime_generation: AtomicU64,
 	events: broadcast::Sender<CoreEvent>,
 	next_event_sequence: AtomicU64,
+}
+
+struct RuntimeStopOutcome {
+	was_running: bool,
+	error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -238,7 +256,7 @@ impl CoreControlState {
 
 	pub fn from_workspace() -> anyhow::Result<Self> {
 		let store = CoreProfileDocumentStore::from_workspace();
-		Ok(Self::from_profile_document(store.load(), Some(store)))
+		Ok(Self::from_profile_document(store.load()?, Some(store)))
 	}
 
 	pub fn from_profile_document(profile_document: CoreProfileDocument, profile_store: Option<CoreProfileDocumentStore>) -> Self {
@@ -254,8 +272,12 @@ impl CoreControlState {
 					profile_document,
 					runtime_snapshot: None,
 				}),
+				mutation: AsyncMutex::new(()),
 				profile_store,
 				runtime_host: Mutex::new(None),
+				pending_runtime_status: ArcSwapOption::empty(),
+				runtime_status_apply: AsyncMutex::new(()),
+				runtime_generation: AtomicU64::new(0),
 				events,
 				next_event_sequence: AtomicU64::new(1),
 			}),
@@ -263,6 +285,7 @@ impl CoreControlState {
 	}
 
 	pub async fn snapshot(&self) -> CoreSnapshot {
+		self.apply_pending_runtime_status().await;
 		let state = self.inner.state.read().await;
 		CoreSnapshot {
 			status: state.status.clone(),
@@ -284,12 +307,18 @@ impl CoreControlState {
 	}
 
 	pub async fn set_profile_document(&self, profile_document: CoreProfileDocument) -> anyhow::Result<CoreProfileDocument> {
+		let _mutation = self.inner.mutation.lock().await;
+		self.set_profile_document_locked(profile_document).await
+	}
+
+	async fn set_profile_document_locked(&self, profile_document: CoreProfileDocument) -> anyhow::Result<CoreProfileDocument> {
 		let normalized = if let Some(store) = &self.inner.profile_store {
 			store.save(profile_document)?
 		} else {
 			normalize_profile_document(profile_document)
 		};
-		let was_running = self.stop_runtime_host();
+		let stop = self.stop_runtime_host().await;
+		let was_running = stop.was_running;
 		{
 			let mut state = self.inner.state.write().await;
 			state.profiles = document_profiles(&normalized);
@@ -315,6 +344,7 @@ impl CoreControlState {
 		&self,
 		profile_document: CoreProfileDocument,
 	) -> anyhow::Result<CoreProfileDocument> {
+		let _mutation = self.inner.mutation.lock().await;
 		let (current_active_profile_id, old_active_profile) = {
 			let state = self.inner.state.read().await;
 			let active_profile_id = state.status.active_profile_id.clone();
@@ -339,7 +369,7 @@ impl CoreControlState {
 		let should_restart =
 			was_running && (normalized.selected_profile_id != current_active_profile_id || old_active_profile != new_active_profile);
 		if should_restart {
-			self.stop_runtime_host();
+			let _ = self.stop_runtime_host().await;
 		}
 		{
 			let mut state = self.inner.state.write().await;
@@ -363,6 +393,7 @@ impl CoreControlState {
 	}
 
 	pub async fn start_runtime(&self) -> RuntimeStatus {
+		let _mutation = self.inner.mutation.lock().await;
 		if self.runtime_host_is_running() {
 			return self.status().await;
 		}
@@ -374,10 +405,17 @@ impl CoreControlState {
 		if self.runtime_host_is_running() {
 			return self.status().await;
 		}
+		self.clear_pending_runtime_status().await;
+		self.inner.runtime_generation.fetch_add(1, Ordering::AcqRel);
 		let status_callback = self.runtime_status_callback();
-		let host = match core_runtime_config_from_document(&document).and_then(|config| CoreRuntimeHost::spawn(config, status_callback)) {
+		let host = match core_runtime_config_from_document(&document) {
+			Ok(config) => run_blocking_runtime_operation(move || CoreRuntimeHost::spawn(config, status_callback)).await,
+			Err(error) => Err(error),
+		};
+		let host = match host {
 			Ok(host) => host,
 			Err(error) => {
+				self.inner.runtime_generation.fetch_add(1, Ordering::AcqRel);
 				let status = {
 					let mut state = self.inner.state.write().await;
 					state.status.running = false;
@@ -390,12 +428,20 @@ impl CoreControlState {
 				return status;
 			}
 		};
-		if let Ok(mut current) = self.inner.runtime_host.lock() {
+		let install_result = {
+			let mut current = self.runtime_host_lock();
 			if current.is_some() {
-				let _ = host.join();
-				return self.status().await;
+				Err(host)
+			} else {
+				*current = Some(host);
+				Ok(())
 			}
-			*current = Some(host);
+		};
+		if let Err(rejected_host) = install_result {
+			if let Some(error) = join_runtime_host(rejected_host).await {
+				tracing::error!(error = %error, "rejected runtime host failed to stop");
+			}
+			return self.status().await;
 		}
 		let status = {
 			let mut state = self.inner.state.write().await;
@@ -411,11 +457,12 @@ impl CoreControlState {
 	}
 
 	pub async fn stop_runtime(&self) -> RuntimeStatus {
-		self.stop_runtime_host();
+		let _mutation = self.inner.mutation.lock().await;
+		let stop = self.stop_runtime_host().await;
 		let status = {
 			let mut state = self.inner.state.write().await;
 			state.status.running = false;
-			state.status.health = "stopped".to_string();
+			state.status.health = stop.error.map_or_else(|| "stopped".to_string(), |error| format!("failed: {error}"));
 			state.runtime_snapshot = None;
 			state.status.updated_at_ms = now_unix_ms();
 			state.status.clone()
@@ -425,13 +472,10 @@ impl CoreControlState {
 	}
 
 	pub async fn calibrate_neutral(&self, valid_sample_count: usize, pose: Option<&str>) -> anyhow::Result<CoreProfileDocument> {
+		let _mutation = self.inner.mutation.lock().await;
 		let pose = NeutralCalibrationPose::parse(pose)?;
-		let result = {
-			let host = self.inner.runtime_host.lock().map_err(|_| anyhow!("runtime host lock poisoned"))?;
-			host.as_ref()
-				.context("runtime is not running")?
-				.calibrate_neutral(valid_sample_count, pose)?
-		};
+		let handle = self.runtime_handle()?;
+		let result = run_blocking_runtime_operation(move || handle.calibrate_neutral(valid_sample_count, pose)).await?;
 		let document = {
 			let state = self.inner.state.read().await;
 			let mut document = state.profile_document.clone();
@@ -448,10 +492,11 @@ impl CoreControlState {
 			modifier.neutral_calibration_pose = Some(pose.as_profile_value().to_string());
 			document
 		};
-		self.set_profile_document(document).await
+		self.set_profile_document_locked(document).await
 	}
 
 	pub async fn clear_neutral_calibration(&self) -> anyhow::Result<CoreProfileDocument> {
+		let _mutation = self.inner.mutation.lock().await;
 		let document = {
 			let state = self.inner.state.read().await;
 			let mut document = state.profile_document.clone();
@@ -468,16 +513,13 @@ impl CoreControlState {
 			modifier.neutral_calibration_pose = None;
 			document
 		};
-		self.set_profile_document(document).await
+		self.set_profile_document_locked(document).await
 	}
 
 	pub async fn build_face_pose_model(&self, valid_sample_count: usize) -> anyhow::Result<CoreProfileDocument> {
-		let result = {
-			let host = self.inner.runtime_host.lock().map_err(|_| anyhow!("runtime host lock poisoned"))?;
-			host.as_ref()
-				.context("runtime is not running")?
-				.build_face_pose_model(valid_sample_count)?
-		};
+		let _mutation = self.inner.mutation.lock().await;
+		let handle = self.runtime_handle()?;
+		let result = run_blocking_runtime_operation(move || handle.build_face_pose_model(valid_sample_count)).await?;
 		let document = {
 			let state = self.inner.state.read().await;
 			let mut document = state.profile_document.clone();
@@ -498,12 +540,12 @@ impl CoreControlState {
 			});
 			document
 		};
-		self.set_profile_document(document).await
+		self.set_profile_document_locked(document).await
 	}
 
 	pub async fn capture_unmotion_frame(&self) -> anyhow::Result<UNMotionFrame> {
-		let host = self.inner.runtime_host.lock().map_err(|_| anyhow!("runtime host lock poisoned"))?;
-		host.as_ref().context("runtime is not running")?.capture_unmotion_frame()
+		let handle = self.runtime_handle()?;
+		run_blocking_runtime_operation(move || handle.capture_unmotion_frame()).await
 	}
 
 	pub async fn capture_analysis_extras(
@@ -512,13 +554,12 @@ impl CoreControlState {
 		duration_ms: u64,
 	) -> anyhow::Result<Vec<serde_json::Value>> {
 		let duration = std::time::Duration::from_millis(duration_ms.clamp(100, 3000));
-		let host = self.inner.runtime_host.lock().map_err(|_| anyhow!("runtime host lock poisoned"))?;
-		host.as_ref()
-			.context("runtime is not running")?
-			.capture_analysis_extras(output_dir, duration)
+		let handle = self.runtime_handle()?;
+		run_blocking_runtime_operation(move || handle.capture_analysis_extras(output_dir, duration)).await
 	}
 
 	pub async fn set_active_profile(&self, profile_id: &str) -> anyhow::Result<RuntimeStatus> {
+		let _mutation = self.inner.mutation.lock().await;
 		// Idempotency: 既に同じ profile が active で runtime が running なら
 		// 何もせず現在の status を返す。これは Supervisor が `launch_capturer` の
 		// healthz 後に unconditional で `PUT /api/profiles/active` を呼ぶ運用
@@ -546,7 +587,8 @@ impl CoreControlState {
 		} else {
 			normalize_profile_document(document)
 		};
-		let was_running = self.stop_runtime_host();
+		let stop = self.stop_runtime_host().await;
+		let was_running = stop.was_running;
 		let status = {
 			let mut state = self.inner.state.write().await;
 			state.profiles = document_profiles(&normalized);
@@ -592,37 +634,112 @@ impl CoreControlState {
 	}
 
 	fn runtime_host_is_running(&self) -> bool {
-		self.inner.runtime_host.lock().map(|host| host.is_some()).unwrap_or(false)
+		self.runtime_host_lock().is_some()
 	}
 
-	fn stop_runtime_host(&self) -> bool {
-		let host = self.inner.runtime_host.lock().ok().and_then(|mut host| host.take());
+	fn runtime_handle(&self) -> anyhow::Result<CoreRuntimeHandle> {
+		let host = self.runtime_host_lock();
+		Ok(host.as_ref().context("runtime is not running")?.handle())
+	}
+
+	fn runtime_host_lock(&self) -> std::sync::MutexGuard<'_, Option<CoreRuntimeHost>> {
+		self.inner.runtime_host.lock().unwrap_or_else(|poisoned| {
+			tracing::error!("recovering poisoned runtime host lock");
+			poisoned.into_inner()
+		})
+	}
+
+	async fn stop_runtime_host(&self) -> RuntimeStopOutcome {
+		self.inner.runtime_generation.fetch_add(1, Ordering::AcqRel);
+		let _apply = self.inner.runtime_status_apply.lock().await;
+		let host = self.runtime_host_lock().take();
 		if let Some(host) = host {
-			let _ = host.join();
-			true
+			let error = join_runtime_host(host).await;
+			if let Some(error) = &error {
+				tracing::error!(error = %error, "runtime host failed to stop");
+			}
+			self.inner.pending_runtime_status.store(None);
+			RuntimeStopOutcome { was_running: true, error }
 		} else {
-			false
+			RuntimeStopOutcome {
+				was_running: false,
+				error: None,
+			}
 		}
 	}
 
 	fn runtime_status_callback(&self) -> std::sync::Arc<dyn Fn(CoreRuntimeStatusUpdate) + Send + Sync + 'static> {
 		let inner = Arc::downgrade(&self.inner);
+		let generation = self.inner.runtime_generation.load(Ordering::Acquire);
 		Arc::new(move |update| {
 			let Some(inner) = inner.upgrade() else {
 				return;
 			};
-			let mut state = inner.state.blocking_write();
-			if state.status.active_profile_id != update.active_profile_id {
-				return;
+			if inner.runtime_generation.load(Ordering::Acquire) == generation {
+				inner
+					.pending_runtime_status
+					.store(Some(Arc::new(PendingRuntimeStatus { generation, update })));
 			}
-			state.status.running = update.running;
-			state.status.health = update.health;
-			state.status.frame_count = update.frame_count;
-			state.status.packet_count = update.packet_count;
-			state.runtime_snapshot = update.runtime_snapshot;
-			state.status.updated_at_ms = now_unix_ms();
 		})
 	}
+
+	async fn apply_pending_runtime_status(&self) {
+		let _apply = self.inner.runtime_status_apply.lock().await;
+		let Some(update) = self.inner.pending_runtime_status.swap(None) else {
+			return;
+		};
+		if self.inner.runtime_generation.load(Ordering::Acquire) != update.generation {
+			return;
+		}
+		let mut state = self.inner.state.write().await;
+		if state.status.active_profile_id != update.update.active_profile_id {
+			return;
+		}
+		state.status.running = update.update.running;
+		state.status.health.clone_from(&update.update.health);
+		state.status.frame_count = update.update.frame_count;
+		state.status.packet_count = update.update.packet_count;
+		state.runtime_snapshot.clone_from(&update.update.runtime_snapshot);
+		state.status.updated_at_ms = now_unix_ms();
+	}
+
+	async fn clear_pending_runtime_status(&self) {
+		let _apply = self.inner.runtime_status_apply.lock().await;
+		self.inner.pending_runtime_status.store(None);
+	}
+}
+
+async fn join_runtime_host(host: CoreRuntimeHost) -> Option<String> {
+	match tokio::task::spawn_blocking(move || host.join()).await {
+		Ok(result) => runtime_thread_join_error(result),
+		Err(error) => Some(format!("runtime join task failed: {error}")),
+	}
+}
+
+fn runtime_thread_join_error(result: std::thread::Result<()>) -> Option<String> {
+	result
+		.err()
+		.map(|payload| format!("runtime thread panicked: {}", panic_payload_message(payload.as_ref())))
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+	if let Some(message) = payload.downcast_ref::<String>() {
+		message
+	} else if let Some(message) = payload.downcast_ref::<&'static str>() {
+		message
+	} else {
+		"non-string panic payload"
+	}
+}
+
+async fn run_blocking_runtime_operation<T, F>(operation: F) -> anyhow::Result<T>
+where
+	T: Send + 'static,
+	F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+	tokio::task::spawn_blocking(operation)
+		.await
+		.map_err(|error| anyhow!("blocking runtime operation task failed: {error}"))?
 }
 
 fn now_unix_ms() -> u64 {
@@ -636,6 +753,177 @@ fn now_unix_ms() -> u64 {
 mod tests {
 	use super::*;
 	use un_motion_profile_schema::CoreProfileDocumentProfile;
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn blocking_runtime_operations_do_not_stall_async_tasks() {
+		let operation = tokio::spawn(async {
+			run_blocking_runtime_operation(|| {
+				std::thread::sleep(std::time::Duration::from_millis(50));
+				Ok(42)
+			})
+			.await
+		});
+		tokio::task::yield_now().await;
+
+		tokio::time::timeout(
+			std::time::Duration::from_millis(20),
+			tokio::time::sleep(std::time::Duration::from_millis(1)),
+		)
+		.await
+		.expect("async timer must remain responsive");
+		assert_eq!(operation.await.expect("operation task").expect("blocking operation"), 42);
+	}
+
+	#[tokio::test]
+	async fn runtime_status_callback_does_not_wait_for_state_lock() {
+		let state = CoreControlState::default();
+		let callback = state.runtime_status_callback();
+		let state_guard = state.inner.state.write().await;
+		callback(CoreRuntimeStatusUpdate {
+			active_profile_id: "default".to_string(),
+			running: true,
+			health: "running".to_string(),
+			frame_count: 12,
+			packet_count: 34,
+			runtime_snapshot: None,
+		});
+		assert!(state.inner.pending_runtime_status.load().is_some());
+		drop(state_guard);
+
+		let status = state.status().await;
+		assert!(status.running);
+		assert_eq!(status.frame_count, 12);
+		assert_eq!(status.packet_count, 34);
+	}
+
+	#[tokio::test]
+	async fn runtime_status_consumers_apply_the_latest_update_serially() {
+		let state = CoreControlState::default();
+		let callback = state.runtime_status_callback();
+		let apply = state.inner.runtime_status_apply.lock().await;
+		callback(CoreRuntimeStatusUpdate {
+			active_profile_id: "default".to_string(),
+			running: true,
+			health: "first".to_string(),
+			frame_count: 1,
+			packet_count: 1,
+			runtime_snapshot: None,
+		});
+		let status_state = state.clone();
+		let mut status_task = tokio::spawn(async move { status_state.status().await });
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(20), &mut status_task)
+				.await
+				.is_err()
+		);
+		callback(CoreRuntimeStatusUpdate {
+			active_profile_id: "default".to_string(),
+			running: true,
+			health: "latest".to_string(),
+			frame_count: 2,
+			packet_count: 2,
+			runtime_snapshot: None,
+		});
+		drop(apply);
+
+		let status = status_task.await.expect("status task");
+		assert_eq!(status.health, "latest");
+		assert_eq!(status.frame_count, 2);
+	}
+
+	#[tokio::test]
+	async fn stale_runtime_status_callbacks_are_rejected() {
+		let state = CoreControlState::default();
+		let callback = state.runtime_status_callback();
+		state.inner.runtime_generation.fetch_add(1, Ordering::AcqRel);
+		callback(CoreRuntimeStatusUpdate {
+			active_profile_id: "default".to_string(),
+			running: true,
+			health: "stale".to_string(),
+			frame_count: 99,
+			packet_count: 99,
+			runtime_snapshot: None,
+		});
+
+		assert!(state.inner.pending_runtime_status.load().is_none());
+		assert!(!state.status().await.running);
+	}
+
+	#[test]
+	fn runtime_thread_join_errors_preserve_panic_messages() {
+		assert_eq!(runtime_thread_join_error(Ok(())), None);
+		assert_eq!(
+			runtime_thread_join_error(Err(Box::new("runtime failure"))),
+			Some("runtime thread panicked: runtime failure".to_string())
+		);
+		assert_eq!(
+			runtime_thread_join_error(Err(Box::new(42_u32))),
+			Some("runtime thread panicked: non-string panic payload".to_string())
+		);
+	}
+
+	#[tokio::test]
+	async fn poisoned_runtime_host_lock_remains_recoverable() {
+		let state = CoreControlState::default();
+		let inner = state.inner.clone();
+		let panic = std::thread::spawn(move || {
+			let _host = inner.runtime_host.lock().expect("runtime host lock");
+			panic!("poison runtime host lock");
+		})
+		.join();
+		assert!(panic.is_err());
+
+		assert!(!state.runtime_host_is_running());
+		assert!(state.runtime_handle().is_err());
+		let stop = state.stop_runtime_host().await;
+		assert!(!stop.was_running);
+		assert!(stop.error.is_none());
+	}
+
+	#[tokio::test]
+	async fn profile_mutations_wait_for_the_shared_operation_gate() {
+		let state = CoreControlState::default();
+		let document = state.profile_document().await;
+		let gate = state.inner.mutation.lock().await;
+		let task_state = state.clone();
+		let mut task = tokio::spawn(async move { task_state.set_profile_document(document).await });
+
+		assert!(tokio::time::timeout(std::time::Duration::from_millis(20), &mut task).await.is_err());
+		drop(gate);
+		task.await.expect("mutation task").expect("profile mutation");
+	}
+
+	#[tokio::test]
+	async fn calibration_operations_wait_for_the_shared_operation_gate() {
+		let state = CoreControlState::default();
+		let gate = state.inner.mutation.lock().await;
+		let calibration_state = state.clone();
+		let mut calibration = tokio::spawn(async move { calibration_state.calibrate_neutral(1, None).await });
+		let model_state = state.clone();
+		let mut model = tokio::spawn(async move { model_state.build_face_pose_model(1).await });
+		let clear_state = state.clone();
+		let mut clear = tokio::spawn(async move { clear_state.clear_neutral_calibration().await });
+
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(20), &mut calibration)
+				.await
+				.is_err()
+		);
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(20), &mut model)
+				.await
+				.is_err()
+		);
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(20), &mut clear)
+				.await
+				.is_err()
+		);
+		drop(gate);
+		assert!(calibration.await.expect("calibration task").is_err());
+		assert!(model.await.expect("model task").is_err());
+		clear.await.expect("clear task").expect("clear calibration");
+	}
 
 	#[tokio::test]
 	async fn start_stop_updates_status_and_emits_events() {
