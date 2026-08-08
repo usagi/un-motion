@@ -2912,12 +2912,52 @@ dd {
 }
 
 .unmfz-lan-toggle {
-	justify-self: start;
+	display: grid;
+	grid-template-columns: auto minmax(0, 1fr);
+	align-items: center;
+	gap: 10px;
+	width: min(100%, 42rem);
+	min-height: 48px;
+	padding: 8px 10px;
+	border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
+	border-radius: 6px;
+	background: color-mix(in srgb, var(--panel-subtle) 58%, transparent);
+	color: var(--text);
+	cursor: pointer;
+}
+
+.unmfz-lan-toggle:hover,
+.unmfz-lan-toggle:focus-within {
+	border-color: color-mix(in srgb, var(--accent-cool) 42%, var(--border));
+	background: color-mix(in srgb, var(--accent-cool) 7%, var(--panel-subtle));
+}
+
+.unmfz-lan-toggle > input[type="checkbox"] {
+	align-self: center;
+	margin: 0;
+}
+
+.unmfz-lan-toggle-copy {
+	display: grid;
+	gap: 2px;
+	min-width: 0;
+}
+
+.unmfz-lan-toggle-copy strong {
+	font-size: 13px;
+	font-weight: 650;
+	line-height: 1.35;
+}
+
+.unmfz-lan-toggle-copy small {
+	color: var(--text-muted);
+	font-size: 12px;
+	line-height: 1.4;
 }
 
 .unmfz-lan-fields {
 	display: grid;
-	grid-template-columns: minmax(160px, 220px) minmax(220px, 1fr);
+	grid-template-columns: minmax(160px, 220px) minmax(220px, 320px);
 	gap: 12px;
 	align-items: end;
 }
@@ -2925,15 +2965,24 @@ dd {
 .unmfz-connect-address {
 	display: grid;
 	gap: 5px;
+	align-self: stretch;
 	min-width: 0;
+	padding: 0 2px;
 }
 
 .unmfz-connect-address > span {
-	color: var(--text-muted);
+	color: var(--muted);
 	font-size: 12px;
 }
 
 .unmfz-connect-address code {
+	display: flex;
+	align-items: center;
+	min-height: 32px;
+	padding: 0 2px;
+	color: var(--text);
+	font-size: 13px;
+	font-weight: 400;
 	overflow-wrap: anywhere;
 }
 

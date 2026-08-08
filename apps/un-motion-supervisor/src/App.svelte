@@ -4501,7 +4501,7 @@
 											/>
 											<span>{$_("profiles.editor.unmfz_publisher")}</span>
 										</label>
-										<label class="checkbox-line unmfz-lan-toggle">
+										<label class="unmfz-lan-toggle">
 											<input
 												type="checkbox"
 												checked={profileDetail.runtime.zenohLanEnabled ?? false}
@@ -4511,7 +4511,10 @@
 														(event.currentTarget as HTMLInputElement).checked
 													)}
 											/>
-											<span>{$_("profiles.editor.unmfz_lan_direct")}</span>
+											<span class="unmfz-lan-toggle-copy">
+												<strong>{$_("profiles.editor.unmfz_lan_direct")}</strong>
+												<small>{$_("profiles.editor.unmfz_lan_description")}</small>
+											</span>
 										</label>
 										{#if profileDetail.runtime.zenohLanEnabled}
 											<div class="unmfz-lan-fields">
@@ -4530,7 +4533,7 @@
 															)}
 													/>
 												</label>
-												<div class="unmfz-connect-address" role="status">
+												<div class="unmfz-connect-address" role="note">
 													<span>{$_("profiles.editor.connect_address")}</span>
 													<code
 														>{profileDetail.runtime.zenohLanConnectAddress ??
@@ -4543,7 +4546,7 @@
 											<summary>{$_("profiles.editor.advanced_settings")}</summary>
 											<div class="section-grid output-channel-fields">
 												<label
-													data-hint="Key expression: Zenoh上の送信先キーです。UNAvatar側と一致している必要があります。通常はun-motion/frameのままで使います。"
+													data-hint="Key expression: Zenoh上の送信先キーです。接続するUNMF/Z対応アプリ側と一致している必要があります。通常はun-motion/frameのままで使います。"
 												>
 													<span>{$_("profiles.editor.key_expression")}</span>
 													<input

@@ -118,7 +118,7 @@ multicast scoutingを利用できないLANに限り、profileの「LAN内の別P
 有効にすると、`runtime_selection.zenohLanPort`（既定39542）で固定TCP待受を開始する。
 この設定は明示的に有効化した場合だけ適用され、既存profileの可変port・自動探索動作を変更しない。
 
-UNAvatarなど別PCのSubscriberでは、Supervisorに表示されたIPv4アドレスとportを
+UNAvatarやUNVETなど別PCの対応Subscriberでは、Supervisorに表示されたIPv4アドレスとportを
 アドレス指定接続へ入力する。固定待受はLAN向けであり、インターネットへのport転送を想定しない。
 
 - `TopicMode::Frame`: 1 key に集約する。
