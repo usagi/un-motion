@@ -14,6 +14,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+/// UNMF/ZのLAN直接接続で使用する既定TCP port。
+pub const DEFAULT_UNMFZ_TCP_PORT: u16 = 47_447;
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileRuntimeSettings {
@@ -344,7 +347,7 @@ mod tests {
 			zenoh_enabled: Some(true),
 			zenoh_key_expr: Some("un-motion/frame".to_string()),
 			zenoh_lan_enabled: Some(true),
-			zenoh_lan_port: Some(39542),
+			zenoh_lan_port: Some(DEFAULT_UNMFZ_TCP_PORT),
 			media_pipe_delegate: Some("xnnpack".to_string()),
 			media_pipe_num_threads: Some(2),
 			media_pipe_holistic_flow_limiter_enabled: Some(true),
@@ -366,7 +369,7 @@ mod tests {
 		assert!(text.contains("fps = 90"));
 		assert!(text.contains("zenohEnabled = true"));
 		assert!(text.contains("zenohLanEnabled = true"));
-		assert!(text.contains("zenohLanPort = 39542"));
+		assert!(text.contains("zenohLanPort = 47447"));
 		assert!(text.contains("mediaPipeDelegate = \"xnnpack\""));
 		assert!(text.contains("mediaPipeNumThreads = 2"));
 		assert!(text.contains("mediaPipeHolisticFlowLimiterMaxInFlight = 2"));
@@ -378,7 +381,7 @@ mod tests {
 		assert_eq!(parsed.fps, Some(90));
 		assert_eq!(parsed.zenoh_enabled, Some(true));
 		assert_eq!(parsed.zenoh_lan_enabled, Some(true));
-		assert_eq!(parsed.zenoh_lan_port, Some(39542));
+		assert_eq!(parsed.zenoh_lan_port, Some(DEFAULT_UNMFZ_TCP_PORT));
 		assert_eq!(parsed.media_pipe_delegate.as_deref(), Some("xnnpack"));
 		assert_eq!(parsed.media_pipe_num_threads, Some(2));
 		assert_eq!(parsed.media_pipe_holistic_flow_limiter_enabled, Some(true));

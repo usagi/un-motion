@@ -43,8 +43,8 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent};
 use un_motion_profile_schema::{
-	CoreProfileDocument, CoreProfileDocumentProfile, CoreProfileDocumentStore, ProfileModifierSettings, ProfilePipelineComponents,
-	ProfileRuntimeSettings, profile_engine_summary,
+	CoreProfileDocument, CoreProfileDocumentProfile, CoreProfileDocumentStore, DEFAULT_UNMFZ_TCP_PORT, ProfileModifierSettings,
+	ProfilePipelineComponents, ProfileRuntimeSettings, profile_engine_summary,
 };
 
 /// メインウィンドウのラベル。UN Avatar Supervisor の規約に合わせる。
@@ -1998,7 +1998,7 @@ fn new_profile_runtime_defaults() -> ProfileRuntimeSettings {
 		zenoh_topic_mode: Some("frame".to_string()),
 		zenoh_producer: Some("un-motion-capturer".to_string()),
 		zenoh_lan_enabled: Some(false),
-		zenoh_lan_port: Some(39542),
+		zenoh_lan_port: Some(DEFAULT_UNMFZ_TCP_PORT),
 		media_pipe_delegate: Some("xnnpack".to_string()),
 		media_pipe_num_threads: Some(2),
 		media_pipe_holistic_flow_limiter_enabled: Some(true),
@@ -3101,7 +3101,7 @@ fn zenoh_lan_connect_address(settings: &ProfileRuntimeSettings) -> Option<String
 	if !settings.zenoh_lan_enabled.unwrap_or(false) {
 		return None;
 	}
-	let port = settings.zenoh_lan_port.filter(|port| *port > 0).unwrap_or(39542);
+	let port = settings.zenoh_lan_port.filter(|port| *port > 0).unwrap_or(DEFAULT_UNMFZ_TCP_PORT);
 	primary_lan_ipv4().map(|address| format!("{address}:{port}"))
 }
 
@@ -4318,7 +4318,7 @@ mod tests {
 		assert_eq!(runtime.zenoh_key_expr.as_deref(), Some("un-motion/frame"));
 		assert_eq!(runtime.zenoh_topic_mode.as_deref(), Some("frame"));
 		assert_eq!(runtime.zenoh_lan_enabled, Some(false));
-		assert_eq!(runtime.zenoh_lan_port, Some(39542));
+		assert_eq!(runtime.zenoh_lan_port, Some(DEFAULT_UNMFZ_TCP_PORT));
 		assert_eq!(runtime.vmc_enabled, Some(false));
 		assert_eq!(runtime.vrc_osc_enabled, Some(false));
 		assert_eq!(runtime.vrc_osc_target_addr.as_deref(), Some("127.0.0.1:9000"));

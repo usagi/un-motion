@@ -114,9 +114,11 @@ Capturer は runtime mux / fusion state を持ちません。複雑な合成、�
 UNMotionFrame/Zenoh (UNMF/Z) 出力は `un-motion/frame/v1` を既定 key とします。`runtime_selection.zenohTopicMode` で次の 3 モードを切り替えます。
 
 接続は既定でZenohの自動探索を使う。同一PCを含む通常利用では追加設定を必要としない。
-multicast scoutingを利用できないLANに限り、profileの「LAN内の別PCから直接接続を許可」を
-有効にすると、`runtime_selection.zenohLanPort`（既定39542）で固定TCP待受を開始する。
+multicast scoutingを利用できないLANに限り、profileの「LAN接続」を有効にすると、
+`runtime_selection.zenohLanPort`（UNMF/Z既定`47447`）で固定TCP待受を開始する。
 この設定は明示的に有効化した場合だけ適用され、既存profileの可変port・自動探索動作を変更しない。
+各Capturerは独立したZenoh participantとして単独動作できるため、同じPCで複数CapturerのLAN待受を
+有効にする場合は`47447`、`47448`のように異なるportを割り当てる。同じportのbind失敗は起動エラーとして扱う。
 
 UNAvatarやUNVETなど別PCの対応Subscriberでは、Supervisorに表示されたIPv4アドレスとportを
 アドレス指定接続へ入力する。固定待受はLAN向けであり、インターネットへのport転送を想定しない。

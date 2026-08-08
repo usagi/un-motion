@@ -4525,7 +4525,7 @@
 														min="1"
 														max="65535"
 														step="1"
-														value={profileDetail.runtime.zenohLanPort ?? 39542}
+												value={profileDetail.runtime.zenohLanPort ?? 47447}
 														onchange={(event) =>
 															void updateProfileField(
 																"runtime_selection.zenoh_lan_port",
@@ -4537,7 +4537,7 @@
 													<span>{$_("profiles.editor.connect_address")}</span>
 													<code
 														>{profileDetail.runtime.zenohLanConnectAddress ??
-															`IPv4:${profileDetail.runtime.zenohLanPort ?? 39542}`}</code
+													`IPv4:${profileDetail.runtime.zenohLanPort ?? 47447}`}</code
 													>
 												</div>
 											</div>

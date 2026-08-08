@@ -537,8 +537,8 @@ mod tests {
 		let automatic = ZenohOutputConfig::new("un-motion/frame");
 		assert_eq!(automatic.listen_endpoint, None);
 
-		let lan = automatic.with_listen_endpoint("tcp/0.0.0.0:39542");
-		assert_eq!(lan.listen_endpoint.as_deref(), Some("tcp/0.0.0.0:39542"));
+		let lan = automatic.with_listen_endpoint("tcp/0.0.0.0:47447");
+		assert_eq!(lan.listen_endpoint.as_deref(), Some("tcp/0.0.0.0:47447"));
 	}
 
 	#[test]

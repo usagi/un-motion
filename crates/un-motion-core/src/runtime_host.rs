@@ -15,8 +15,8 @@ use anyhow::{Context, anyhow, bail};
 use un_motion_frame::UNMotionFrame;
 use un_motion_frame_zenoh::TopicMode;
 use un_motion_profile_schema::{
-	CoreProfileDocument, CoreProfileDocumentProfile, CoreProfileDocumentSource, ProfileMediaPipeAdvancedSettings, ProfileModifierSettings,
-	ProfilePipelineComponents, ProfileRuntimeSettings,
+	CoreProfileDocument, CoreProfileDocumentProfile, CoreProfileDocumentSource, DEFAULT_UNMFZ_TCP_PORT, ProfileMediaPipeAdvancedSettings,
+	ProfileModifierSettings, ProfilePipelineComponents, ProfileRuntimeSettings,
 };
 use un_motion_runtime::{
 	LatestMotionFrame, LatestMotionFrameStreamWorkerHandle, MirrorMode, ModifierConfig, ModifierPipeline, MotionFrameStreamConfig,
@@ -633,7 +633,12 @@ fn parse_zenoh_output_config(runtime: Option<&ProfileRuntimeSettings>, profile_i
 		.or_else(|| Some("un-motion-core".to_string()));
 	let listen_endpoint = runtime
 		.filter(|settings| settings.zenoh_lan_enabled.unwrap_or(false))
-		.map(|settings| format!("tcp/0.0.0.0:{}", settings.zenoh_lan_port.filter(|port| *port > 0).unwrap_or(39542)));
+		.map(|settings| {
+			format!(
+				"tcp/0.0.0.0:{}",
+				settings.zenoh_lan_port.filter(|port| *port > 0).unwrap_or(DEFAULT_UNMFZ_TCP_PORT)
+			)
+		});
 	let modifier = modifier_config_from_runtime(runtime);
 	Some(CoreZenohOutputConfig {
 		base_key_expr,

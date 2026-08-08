@@ -23,7 +23,9 @@ pub use profile_document::{
 	CoreProfileDocument, CoreProfileDocumentProfile, CoreProfileDocumentSource, CoreProfileDocumentStore, document_from_profiles,
 	document_profiles, normalize_profile_document, profile_engine_summary, resolve_workspace_conf_path,
 };
-pub use profile_settings::{ProfileMediaPipeAdvancedSettings, ProfileModifierSettings, ProfilePipelineComponents, ProfileRuntimeSettings};
+pub use profile_settings::{
+	DEFAULT_UNMFZ_TCP_PORT, ProfileMediaPipeAdvancedSettings, ProfileModifierSettings, ProfilePipelineComponents, ProfileRuntimeSettings,
+};
 
 use serde::{Deserialize, Serialize};
 
