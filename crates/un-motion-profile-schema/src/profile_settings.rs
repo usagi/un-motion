@@ -43,6 +43,13 @@ pub struct ProfileRuntimeSettings {
 	pub zenoh_stream_id: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub zenoh_producer: Option<String>,
+	/// LAN内のSubscriberが明示TCP接続できる固定listen endpointを有効にする。
+	/// 未指定またはfalseならZenoh既定の自動探索・可変portだけを使う。
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub zenoh_lan_enabled: Option<bool>,
+	/// `zenoh_lan_enabled` がtrueのときに全IPv4 interfaceで待ち受けるTCP port。
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub zenoh_lan_port: Option<u16>,
 	/// Engine Type 識別子。GUI の "Engine" dropdown で選択される一級項目。
 	/// 認識される値: `"mediapipe-native"` / `"vmc"` / `"ifacialmocap"`。
 	/// 未指定時は default (`mediapipe-native`) として扱う。
@@ -336,6 +343,8 @@ mod tests {
 			fps: Some(90),
 			zenoh_enabled: Some(true),
 			zenoh_key_expr: Some("un-motion/frame".to_string()),
+			zenoh_lan_enabled: Some(true),
+			zenoh_lan_port: Some(39542),
 			media_pipe_delegate: Some("xnnpack".to_string()),
 			media_pipe_num_threads: Some(2),
 			media_pipe_holistic_flow_limiter_enabled: Some(true),
@@ -356,6 +365,8 @@ mod tests {
 		let text = toml::to_string_pretty(&settings).expect("serialize");
 		assert!(text.contains("fps = 90"));
 		assert!(text.contains("zenohEnabled = true"));
+		assert!(text.contains("zenohLanEnabled = true"));
+		assert!(text.contains("zenohLanPort = 39542"));
 		assert!(text.contains("mediaPipeDelegate = \"xnnpack\""));
 		assert!(text.contains("mediaPipeNumThreads = 2"));
 		assert!(text.contains("mediaPipeHolisticFlowLimiterMaxInFlight = 2"));
@@ -366,6 +377,8 @@ mod tests {
 		let parsed: ProfileRuntimeSettings = toml::from_str(&text).expect("parse toml");
 		assert_eq!(parsed.fps, Some(90));
 		assert_eq!(parsed.zenoh_enabled, Some(true));
+		assert_eq!(parsed.zenoh_lan_enabled, Some(true));
+		assert_eq!(parsed.zenoh_lan_port, Some(39542));
 		assert_eq!(parsed.media_pipe_delegate.as_deref(), Some("xnnpack"));
 		assert_eq!(parsed.media_pipe_num_threads, Some(2));
 		assert_eq!(parsed.media_pipe_holistic_flow_limiter_enabled, Some(true));

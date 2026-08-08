@@ -2911,6 +2911,54 @@ dd {
 	grid-template-columns: repeat(2, minmax(180px, 1fr));
 }
 
+.unmfz-lan-toggle {
+	justify-self: start;
+}
+
+.unmfz-lan-fields {
+	display: grid;
+	grid-template-columns: minmax(160px, 220px) minmax(220px, 1fr);
+	gap: 12px;
+	align-items: end;
+}
+
+.unmfz-connect-address {
+	display: grid;
+	gap: 5px;
+	min-width: 0;
+}
+
+.unmfz-connect-address > span {
+	color: var(--text-muted);
+	font-size: 12px;
+}
+
+.unmfz-connect-address code {
+	overflow-wrap: anywhere;
+}
+
+.output-channel-advanced {
+	display: grid;
+	gap: 10px;
+}
+
+.output-channel-advanced summary {
+	cursor: pointer;
+	color: var(--text-muted);
+	font-size: 12px;
+	font-weight: 600;
+}
+
+.output-channel-advanced[open] summary {
+	margin-bottom: 10px;
+}
+
+@media (max-width: 720px) {
+	.unmfz-lan-fields {
+		grid-template-columns: minmax(0, 1fr);
+	}
+}
+
 .modifier-filter-grid {
 	display: grid;
 	grid-template-columns: repeat(2, minmax(7rem, 1fr));

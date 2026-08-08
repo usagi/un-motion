@@ -45,6 +45,9 @@ let profiles: ProfileDetail[] = [
 			zenohTopicMode: "frame",
 			zenohStreamId: null,
 			zenohProducer: "un-motion-capturer",
+			zenohLanEnabled: false,
+			zenohLanPort: 39542,
+			zenohLanConnectAddress: null,
 			engine: "mediapipe-native",
 			device: "cam0:Preview Camera",
 			resolution: "1280x720",
@@ -127,6 +130,9 @@ let profiles: ProfileDetail[] = [
 			zenohTopicMode: "by-stream-id",
 			zenohStreamId: "vmc-receive",
 			zenohProducer: "un-motion-capturer",
+			zenohLanEnabled: true,
+			zenohLanPort: 39542,
+			zenohLanConnectAddress: "192.168.1.20:39542",
 			vmcReceiveListenAddr: "0.0.0.0:39539",
 			ifacialmocapReceiveListenAddr: "0.0.0.0:49983",
 			modifierHeadEnabled: true,
@@ -249,8 +255,20 @@ export function installDevIpcMock(): void {
 				return activeProfileId;
 			case "get_profile_detail":
 				return findProfile(args.profileId);
-			case "update_profile_field":
-				return findProfile(args.profileId);
+			case "update_profile_field": {
+				const profile = findProfile(args.profileId);
+				if (args.field === "runtime_selection.zenoh_lan_enabled") {
+					profile.runtime.zenohLanEnabled = Boolean(args.value);
+					profile.runtime.zenohLanConnectAddress = args.value
+						? `192.168.1.20:${Number(profile.runtime.zenohLanPort ?? 39542)}`
+						: null;
+				}
+				if (args.field === "runtime_selection.zenoh_lan_port") {
+					profile.runtime.zenohLanPort = Number(args.value);
+					profile.runtime.zenohLanConnectAddress = `192.168.1.20:${Number(args.value)}`;
+				}
+				return profile;
+			}
 			case "create_profile":
 			case "duplicate_profile":
 				return profiles[0];

@@ -136,6 +136,9 @@
 		zenohTopicMode: string | null;
 		zenohStreamId: string | null;
 		zenohProducer: string | null;
+		zenohLanEnabled: boolean | null;
+		zenohLanPort: number | null;
+		zenohLanConnectAddress: string | null;
 		engine: string | null;
 		device: string | null;
 		resolution: string | null;
@@ -952,18 +955,18 @@
 					invoke<CapturerLogChunk>("capturer_logs", {
 						id: capturer.id,
 						afterIndex: capturerLogCursors.get(capturer.id) ?? 0,
-					}).catch(() => null),
-				),
+					}).catch(() => null)
+				)
 			);
-			const chunksById = new Map(chunks.filter((chunk): chunk is CapturerLogChunk => chunk !== null).map((chunk) => [chunk.id, chunk]));
+			const chunksById = new Map(
+				chunks.filter((chunk): chunk is CapturerLogChunk => chunk !== null).map((chunk) => [chunk.id, chunk])
+			);
 			capturers = capturers.map((capturer) => {
 				const chunk = chunksById.get(capturer.id);
 				if (!chunk) return capturer;
 				const previousIndex = capturerLogCursors.get(capturer.id) ?? 0;
 				capturerLogCursors.set(capturer.id, chunk.nextIndex);
-				const stderrTail = previousIndex < chunk.baseIndex
-					? chunk.lines
-					: [...capturer.stderrTail, ...chunk.lines].slice(-800);
+				const stderrTail = previousIndex < chunk.baseIndex ? chunk.lines : [...capturer.stderrTail, ...chunk.lines].slice(-800);
 				return { ...capturer, stderrTail };
 			});
 		})().finally(() => {
@@ -2430,7 +2433,7 @@
 		const activeCapturers = capturers.filter((capturer) => capturer.state === "running" || capturer.state === "starting");
 		refreshRuntimeStatusesPromise = (async () => {
 			const results = await Promise.allSettled(
-				activeCapturers.map((capturer) => invoke<CapturerRuntimeStatus>("capturer_runtime_status", { id: capturer.id })),
+				activeCapturers.map((capturer) => invoke<CapturerRuntimeStatus>("capturer_runtime_status", { id: capturer.id }))
 			);
 			if (generation !== capturerListGeneration) return;
 			const updates: Record<number, CapturerRuntimeStatus> = {};
@@ -4498,71 +4501,112 @@
 											/>
 											<span>{$_("profiles.editor.unmfz_publisher")}</span>
 										</label>
-										<div class="section-grid output-channel-fields">
-											<label
-												data-hint="Key expression: Zenoh上の送信先キーです。UNAvatar側と一致している必要があります。通常はun-motion/frameのままで使います。"
-											>
-												<span>{$_("profiles.editor.key_expression")}</span>
-												<input
-													type="text"
-													value={profileDetail.runtime.zenohKeyExpr ?? ""}
-													placeholder="un-motion/frame"
-													onchange={(event) =>
-														void updateProfileField(
-															"runtime_selection.zenoh_key_expr",
-															emptyStringToNull((event.currentTarget as HTMLInputElement).value)
-														)}
-												/>
-											</label>
-											<label
-												data-hint="Topic mode: 複数ストリームを扱うときのキー分け方法です。通常はframe、複数入力を分けたい場合はsourceやstream id単位を選びます。"
-											>
-												<span>{$_("profiles.editor.topic_mode")}</span>
-												<select
-													value={profileDetail.runtime.zenohTopicMode ?? ""}
-													onchange={(event) =>
-														void updateProfileField(
-															"runtime_selection.zenoh_topic_mode",
-															emptyStringToNull((event.currentTarget as HTMLSelectElement).value)
-														)}
+										<label class="checkbox-line unmfz-lan-toggle">
+											<input
+												type="checkbox"
+												checked={profileDetail.runtime.zenohLanEnabled ?? false}
+												onchange={(event) =>
+													void updateProfileField(
+														"runtime_selection.zenoh_lan_enabled",
+														(event.currentTarget as HTMLInputElement).checked
+													)}
+											/>
+											<span>{$_("profiles.editor.unmfz_lan_direct")}</span>
+										</label>
+										{#if profileDetail.runtime.zenohLanEnabled}
+											<div class="unmfz-lan-fields">
+												<label>
+													<span>{$_("profiles.editor.listen_port")}</span>
+													<input
+														type="number"
+														min="1"
+														max="65535"
+														step="1"
+														value={profileDetail.runtime.zenohLanPort ?? 39542}
+														onchange={(event) =>
+															void updateProfileField(
+																"runtime_selection.zenoh_lan_port",
+																Number((event.currentTarget as HTMLInputElement).value)
+															)}
+													/>
+												</label>
+												<div class="unmfz-connect-address" role="status">
+													<span>{$_("profiles.editor.connect_address")}</span>
+													<code
+														>{profileDetail.runtime.zenohLanConnectAddress ??
+															`IPv4:${profileDetail.runtime.zenohLanPort ?? 39542}`}</code
+													>
+												</div>
+											</div>
+										{/if}
+										<details class="output-channel-advanced">
+											<summary>{$_("profiles.editor.advanced_settings")}</summary>
+											<div class="section-grid output-channel-fields">
+												<label
+													data-hint="Key expression: Zenoh上の送信先キーです。UNAvatar側と一致している必要があります。通常はun-motion/frameのままで使います。"
 												>
-													<option value="">frame (default)</option>
-													<option value="frame">frame</option>
-													<option value="by-primary-source">by-primary-source</option>
-													<option value="by-stream-id">by-stream-id</option>
-												</select>
-											</label>
-											<label
-												data-hint="Stream ID: このプロファイルの出力を識別する名前です。未指定ならプロファイルIDを使います。複数Capturer運用で区別したいときに設定します。"
-											>
-												<span>{$_("profiles.editor.stream_id")}</span>
-												<input
-													type="text"
-													value={profileDetail.runtime.zenohStreamId ?? ""}
-													placeholder="(profile id)"
-													onchange={(event) =>
-														void updateProfileField(
-															"runtime_selection.zenoh_stream_id",
-															emptyStringToNull((event.currentTarget as HTMLInputElement).value)
-														)}
-												/>
-											</label>
-											<label
-												data-hint="Producer: 送信元アプリ名としてUNMF/Zに載せるラベルです。通常はun-motion-capturerのままで構いません。"
-											>
-												<span>{$_("profiles.editor.producer_label")}</span>
-												<input
-													type="text"
-													value={profileDetail.runtime.zenohProducer ?? ""}
-													placeholder="un-motion-capturer"
-													onchange={(event) =>
-														void updateProfileField(
-															"runtime_selection.zenoh_producer",
-															emptyStringToNull((event.currentTarget as HTMLInputElement).value)
-														)}
-												/>
-											</label>
-										</div>
+													<span>{$_("profiles.editor.key_expression")}</span>
+													<input
+														type="text"
+														value={profileDetail.runtime.zenohKeyExpr ?? ""}
+														placeholder="un-motion/frame"
+														onchange={(event) =>
+															void updateProfileField(
+																"runtime_selection.zenoh_key_expr",
+																emptyStringToNull((event.currentTarget as HTMLInputElement).value)
+															)}
+													/>
+												</label>
+												<label
+													data-hint="Topic mode: 複数ストリームを扱うときのキー分け方法です。通常はframe、複数入力を分けたい場合はsourceやstream id単位を選びます。"
+												>
+													<span>{$_("profiles.editor.topic_mode")}</span>
+													<select
+														value={profileDetail.runtime.zenohTopicMode ?? ""}
+														onchange={(event) =>
+															void updateProfileField(
+																"runtime_selection.zenoh_topic_mode",
+																emptyStringToNull((event.currentTarget as HTMLSelectElement).value)
+															)}
+													>
+														<option value="">frame (default)</option>
+														<option value="frame">frame</option>
+														<option value="by-primary-source">by-primary-source</option>
+														<option value="by-stream-id">by-stream-id</option>
+													</select>
+												</label>
+												<label
+													data-hint="Stream ID: このプロファイルの出力を識別する名前です。未指定ならプロファイルIDを使います。複数Capturer運用で区別したいときに設定します。"
+												>
+													<span>{$_("profiles.editor.stream_id")}</span>
+													<input
+														type="text"
+														value={profileDetail.runtime.zenohStreamId ?? ""}
+														placeholder="(profile id)"
+														onchange={(event) =>
+															void updateProfileField(
+																"runtime_selection.zenoh_stream_id",
+																emptyStringToNull((event.currentTarget as HTMLInputElement).value)
+															)}
+													/>
+												</label>
+												<label
+													data-hint="Producer: 送信元アプリ名としてUNMF/Zに載せるラベルです。通常はun-motion-capturerのままで構いません。"
+												>
+													<span>{$_("profiles.editor.producer_label")}</span>
+													<input
+														type="text"
+														value={profileDetail.runtime.zenohProducer ?? ""}
+														placeholder="un-motion-capturer"
+														onchange={(event) =>
+															void updateProfileField(
+																"runtime_selection.zenoh_producer",
+																emptyStringToNull((event.currentTarget as HTMLInputElement).value)
+															)}
+													/>
+												</label>
+											</div>
+										</details>
 									</div>
 
 									<div class="subgroup">

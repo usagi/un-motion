@@ -1997,6 +1997,8 @@ fn new_profile_runtime_defaults() -> ProfileRuntimeSettings {
 		zenoh_key_expr: Some("un-motion/frame".to_string()),
 		zenoh_topic_mode: Some("frame".to_string()),
 		zenoh_producer: Some("un-motion-capturer".to_string()),
+		zenoh_lan_enabled: Some(false),
+		zenoh_lan_port: Some(39542),
 		media_pipe_delegate: Some("xnnpack".to_string()),
 		media_pipe_num_threads: Some(2),
 		media_pipe_holistic_flow_limiter_enabled: Some(true),
@@ -2889,6 +2891,9 @@ pub struct ProfileRuntimeView {
 	pub zenoh_topic_mode: Option<String>,
 	pub zenoh_stream_id: Option<String>,
 	pub zenoh_producer: Option<String>,
+	pub zenoh_lan_enabled: Option<bool>,
+	pub zenoh_lan_port: Option<u16>,
+	pub zenoh_lan_connect_address: Option<String>,
 	pub engine: Option<String>,
 	pub device: Option<String>,
 	pub resolution: Option<String>,
@@ -3028,6 +3033,9 @@ impl From<&ProfileRuntimeSettings> for ProfileRuntimeView {
 			zenoh_topic_mode: settings.zenoh_topic_mode.clone(),
 			zenoh_stream_id: settings.zenoh_stream_id.clone(),
 			zenoh_producer: settings.zenoh_producer.clone(),
+			zenoh_lan_enabled: settings.zenoh_lan_enabled,
+			zenoh_lan_port: settings.zenoh_lan_port,
+			zenoh_lan_connect_address: zenoh_lan_connect_address(settings),
 			engine: settings.engine.clone(),
 			device: settings.device.clone(),
 			resolution: settings.resolution.clone(),
@@ -3086,6 +3094,23 @@ impl From<&ProfileRuntimeSettings> for ProfileRuntimeView {
 			modifier_lost_signal_arms_hold_seconds: post_process_rules.and_then(|rules| rules.lost_signal_arms_hold_seconds),
 			modifier_lost_signal_recovery_seconds: post_process_rules.and_then(|rules| rules.lost_signal_recovery_seconds),
 		}
+	}
+}
+
+fn zenoh_lan_connect_address(settings: &ProfileRuntimeSettings) -> Option<String> {
+	if !settings.zenoh_lan_enabled.unwrap_or(false) {
+		return None;
+	}
+	let port = settings.zenoh_lan_port.filter(|port| *port > 0).unwrap_or(39542);
+	primary_lan_ipv4().map(|address| format!("{address}:{port}"))
+}
+
+fn primary_lan_ipv4() -> Option<std::net::Ipv4Addr> {
+	let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+	socket.connect("192.0.2.1:9").ok()?;
+	match socket.local_addr().ok()?.ip() {
+		std::net::IpAddr::V4(address) if !address.is_loopback() && !address.is_unspecified() => Some(address),
+		_ => None,
 	}
 }
 
@@ -3234,6 +3259,8 @@ fn apply_runtime_field(runtime: &mut ProfileRuntimeSettings, field: &str, value:
 		"zenoh_topic_mode" => runtime.zenoh_topic_mode = opt_string(&value, field)?,
 		"zenoh_stream_id" => runtime.zenoh_stream_id = opt_string(&value, field)?,
 		"zenoh_producer" => runtime.zenoh_producer = opt_string(&value, field)?,
+		"zenoh_lan_enabled" => runtime.zenoh_lan_enabled = opt_bool(&value, field)?,
+		"zenoh_lan_port" => runtime.zenoh_lan_port = opt_u16(&value, field)?,
 		"engine" => runtime.engine = opt_string(&value, field)?,
 		"device" => runtime.device = opt_string(&value, field)?,
 		"resolution" => runtime.resolution = opt_string(&value, field)?,
@@ -3429,6 +3456,19 @@ fn opt_u32(value: &serde_json::Value, field: &str) -> Result<Option<u32>, String
 		return Ok(Some(n as u32));
 	}
 	Err(format!("field `{field}` must be a non-negative integer or null"))
+}
+
+fn opt_u16(value: &serde_json::Value, field: &str) -> Result<Option<u16>, String> {
+	if value.is_null() {
+		return Ok(None);
+	}
+	if let Some(n) = value.as_u64() {
+		if n == 0 || n > u16::MAX as u64 {
+			return Err(format!("field `{field}` must be between 1 and {}", u16::MAX));
+		}
+		return Ok(Some(n as u16));
+	}
+	Err(format!("field `{field}` must be a positive integer or null"))
 }
 
 fn opt_u64(value: &serde_json::Value, field: &str) -> Result<Option<u64>, String> {
@@ -4277,6 +4317,8 @@ mod tests {
 		assert_eq!(runtime.zenoh_enabled, Some(true));
 		assert_eq!(runtime.zenoh_key_expr.as_deref(), Some("un-motion/frame"));
 		assert_eq!(runtime.zenoh_topic_mode.as_deref(), Some("frame"));
+		assert_eq!(runtime.zenoh_lan_enabled, Some(false));
+		assert_eq!(runtime.zenoh_lan_port, Some(39542));
 		assert_eq!(runtime.vmc_enabled, Some(false));
 		assert_eq!(runtime.vrc_osc_enabled, Some(false));
 		assert_eq!(runtime.vrc_osc_target_addr.as_deref(), Some("127.0.0.1:9000"));
@@ -4342,6 +4384,8 @@ mod tests {
 		apply_profile_field(&mut profile, "runtime_selection.fps", json!(60)).unwrap();
 		apply_profile_field(&mut profile, "runtime_selection.zenoh_enabled", json!(true)).unwrap();
 		apply_profile_field(&mut profile, "runtime_selection.zenoh_key_expr", json!("un-motion/frame")).unwrap();
+		apply_profile_field(&mut profile, "runtime_selection.zenoh_lan_enabled", json!(true)).unwrap();
+		apply_profile_field(&mut profile, "runtime_selection.zenoh_lan_port", json!(45678)).unwrap();
 		apply_profile_field(&mut profile, "runtime_selection.media_pipe_delegate", json!("cpu")).unwrap();
 		apply_profile_field(&mut profile, "runtime_selection.media_pipe_num_threads", json!(2)).unwrap();
 		apply_profile_field(
@@ -4366,6 +4410,8 @@ mod tests {
 		assert_eq!(runtime.fps, Some(60));
 		assert_eq!(runtime.zenoh_enabled, Some(true));
 		assert_eq!(runtime.zenoh_key_expr.as_deref(), Some("un-motion/frame"));
+		assert_eq!(runtime.zenoh_lan_enabled, Some(true));
+		assert_eq!(runtime.zenoh_lan_port, Some(45678));
 		assert_eq!(runtime.media_pipe_delegate.as_deref(), Some("cpu"));
 		assert_eq!(runtime.media_pipe_num_threads, Some(2));
 		assert_eq!(runtime.media_pipe_holistic_flow_limiter_enabled, Some(false));
@@ -4376,6 +4422,8 @@ mod tests {
 		apply_profile_field(&mut profile, "runtime_selection.fps", json!(null)).unwrap();
 		apply_profile_field(&mut profile, "runtime_selection.zenoh_enabled", json!(null)).unwrap();
 		apply_profile_field(&mut profile, "runtime_selection.zenoh_key_expr", json!(null)).unwrap();
+		apply_profile_field(&mut profile, "runtime_selection.zenoh_lan_enabled", json!(null)).unwrap();
+		apply_profile_field(&mut profile, "runtime_selection.zenoh_lan_port", json!(null)).unwrap();
 		apply_profile_field(&mut profile, "runtime_selection.media_pipe_delegate", json!(null)).unwrap();
 		apply_profile_field(&mut profile, "runtime_selection.media_pipe_num_threads", json!(null)).unwrap();
 		apply_profile_field(

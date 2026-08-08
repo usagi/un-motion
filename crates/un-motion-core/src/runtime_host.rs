@@ -88,6 +88,7 @@ pub(crate) struct CoreZenohOutputConfig {
 	pub topic_mode: CoreZenohTopicMode,
 	pub stream_id: Option<String>,
 	pub producer: Option<String>,
+	pub listen_endpoint: Option<String>,
 	/// Profile の `runtime_selection.modifier.*_enabled` から派生する Modifier 設定。
 	/// VMC/UDP と UNMF/Z は同じ `UNMotionFrame` に同じ Modifier を適用する。
 	pub modifier: ModifierConfig,
@@ -630,12 +631,16 @@ fn parse_zenoh_output_config(runtime: Option<&ProfileRuntimeSettings>, profile_i
 	let producer = runtime
 		.and_then(|r| r.zenoh_producer.clone())
 		.or_else(|| Some("un-motion-core".to_string()));
+	let listen_endpoint = runtime
+		.filter(|settings| settings.zenoh_lan_enabled.unwrap_or(false))
+		.map(|settings| format!("tcp/0.0.0.0:{}", settings.zenoh_lan_port.filter(|port| *port > 0).unwrap_or(39542)));
 	let modifier = modifier_config_from_runtime(runtime);
 	Some(CoreZenohOutputConfig {
 		base_key_expr,
 		topic_mode,
 		stream_id,
 		producer,
+		listen_endpoint,
 		modifier,
 	})
 }
@@ -1980,6 +1985,9 @@ impl CoreRuntimeWorkers {
 				if let Some(producer) = &zenoh.producer {
 					zenoh_config = zenoh_config.with_producer(producer.clone());
 				}
+				if let Some(endpoint) = &zenoh.listen_endpoint {
+					zenoh_config = zenoh_config.with_listen_endpoint(endpoint.clone());
+				}
 				let expected_dt_ns = (1_000_000_000_u64).checked_div(config.fps as u64).unwrap_or(0);
 				if expected_dt_ns > 0 {
 					zenoh_config = zenoh_config.with_expected_dt_ns(expected_dt_ns);
@@ -2256,6 +2264,28 @@ mod tests {
 	use un_motion_frame::{ExpressionSample, FaceMotion, SampleState, TrackingState, UNMotionFrame};
 	use un_motion_profile_schema::{CoreProfileDocument, CoreProfileDocumentProfile};
 	use un_motion_runtime::{LatestMotionFrame, LatestMotionFrameSlot, StreamHealth, stream_state_from_unmotion_frame};
+
+	#[test]
+	fn zenoh_output_keeps_default_session_when_lan_listen_is_disabled() {
+		let settings = ProfileRuntimeSettings {
+			zenoh_enabled: Some(true),
+			..Default::default()
+		};
+		let config = parse_zenoh_output_config(Some(&settings), "default").expect("Zenoh output");
+		assert_eq!(config.listen_endpoint, None);
+	}
+
+	#[test]
+	fn zenoh_output_uses_fixed_ipv4_listener_when_lan_listen_is_enabled() {
+		let settings = ProfileRuntimeSettings {
+			zenoh_enabled: Some(true),
+			zenoh_lan_enabled: Some(true),
+			zenoh_lan_port: Some(45678),
+			..Default::default()
+		};
+		let config = parse_zenoh_output_config(Some(&settings), "default").expect("Zenoh output");
+		assert_eq!(config.listen_endpoint.as_deref(), Some("tcp/0.0.0.0:45678"));
+	}
 
 	#[test]
 	fn runtime_control_channel_is_bounded() {

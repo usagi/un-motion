@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 use un_motion_frame::{
 	CoordinateSpace, HumanoidBone, LengthUnit, MotionSourceInfo, MotionSourceKind, TimestampBasis, TrackingState, UNMotionFrame,
 };
-use un_motion_frame_zenoh::{Publisher, TopicMode, ZenohSessionBackend, ZenohTopicStrategy};
+use un_motion_frame_zenoh::{Publisher, TopicMode, ZenohSessionBackend, ZenohSessionConfig, ZenohTopicStrategy};
 
 use crate::OutputDisconnected;
 use crate::modifier::{ModifierConfig, ModifierPipeline};
@@ -46,6 +46,9 @@ pub struct ZenohOutputConfig {
 	pub expected_dt_ns: Option<u64>,
 	/// publisher の `producer` フィールドに詰める識別子。`None` なら未設定。
 	pub producer: Option<String>,
+	/// `None`なら従来どおりZenoh既定の可変listen endpointを使う。
+	/// LAN直接接続を明示的に有効化した場合だけ固定endpointを設定する。
+	pub listen_endpoint: Option<String>,
 	/// Capturer 出力段の Modifier 設定 (Engine 非依存の bone subset filter)。
 	/// 既定 (`ModifierConfig::default()`) は pass-through (全カテゴリ ON) なので、
 	/// 既存の Capturer は何も変更せずに従来通り動作する。
@@ -60,6 +63,7 @@ impl ZenohOutputConfig {
 			stream_id: None,
 			expected_dt_ns: None,
 			producer: None,
+			listen_endpoint: None,
 			modifier: ModifierConfig::default(),
 		}
 	}
@@ -81,6 +85,11 @@ impl ZenohOutputConfig {
 
 	pub fn with_producer(mut self, producer: impl Into<String>) -> Self {
 		self.producer = Some(producer.into());
+		self
+	}
+
+	pub fn with_listen_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+		self.listen_endpoint = Some(endpoint.into());
 		self
 	}
 
@@ -147,11 +156,15 @@ impl ZenohOutputWorker {
 			topic_mode = ?config.topic_mode,
 			stream_id = ?config.stream_id,
 			producer = ?config.producer,
+			listen_endpoint = ?config.listen_endpoint,
 			"opening Zenoh session for UNMotionFrame publisher (default features = zenoh-transport)",
 		);
-		let backend = ZenohSessionBackend::open_default()
-			.map_err(|e| anyhow::anyhow!("zenoh session open failed: {e}"))
-			.context("Zenoh session open")?;
+		let backend = match &config.listen_endpoint {
+			Some(endpoint) => ZenohSessionBackend::open(&ZenohSessionConfig::default().with_listen_endpoint(endpoint.clone())),
+			None => ZenohSessionBackend::open_default(),
+		}
+		.map_err(|e| anyhow::anyhow!("zenoh session open failed: {e}"))
+		.context("Zenoh session open")?;
 		let publisher = Publisher::new(backend).with_strategy(config.topic_strategy());
 		info!(
 			target: "un_motion_runtime::zenoh_output",
@@ -518,6 +531,15 @@ pub fn vmc_bone_name_to_humanoid_bone(name: &str) -> Option<HumanoidBone> {
 mod tests {
 	use super::*;
 	use un_motion_frame::{MotionSignal, MotionSignalValue, SampleState};
+
+	#[test]
+	fn listen_endpoint_is_opt_in() {
+		let automatic = ZenohOutputConfig::new("un-motion/frame");
+		assert_eq!(automatic.listen_endpoint, None);
+
+		let lan = automatic.with_listen_endpoint("tcp/0.0.0.0:39542");
+		assert_eq!(lan.listen_endpoint.as_deref(), Some("tcp/0.0.0.0:39542"));
+	}
 
 	#[test]
 	fn signal_enrich_does_not_synthesize_vmc_body_for_zenoh() {
