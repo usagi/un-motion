@@ -83,3 +83,20 @@ code { font: .91em/1.5 Consolas, "Cascadia Mono", monospace; overflow-wrap: anyw
 .connections { display:flex; gap:.55rem 1.1rem; flex-wrap:wrap; list-style:none; padding:0; margin:1.3rem 0 0; }
 .connections li { font-size:.86rem; font-weight:650; color:#ccdbed; }
 .connections li::before { content:""; display:inline-block; width:.36rem; height:.36rem; margin-right:.45rem; background:#86baff; border-radius:50%; vertical-align:middle; }
+
+.capabilities { padding-block: clamp(3rem, 6vw, 6rem); }
+.capabilities h2 { font-size: clamp(1.65rem, 3.2vw, 3rem); }
+.capture { display: grid; grid-template-columns: 1fr 1.1fr; align-items: center; gap: clamp(1.5rem, 4vw, 4rem); margin-block: 2rem; }
+.capture h3 { font-size: clamp(1.4rem, 2.4vw, 2rem); }
+.capture p, .feature-list p { margin-top: .7rem; }
+.capture img { display: block; width: 100%; border: 1px solid #3a506c; border-radius: .45rem; }
+.capture figcaption { color: var(--muted); margin-top: .4rem; font-size: .8rem; }
+.feature-list { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 2rem 3rem; }
+.feature-list article { border-top: 1px solid #476383; padding-top: 1.1rem; }
+.pose-example { margin-top: .8rem; }
+.pose-example summary { color: #aaceff; cursor: pointer; width: fit-content; }
+.pose-example .pose { margin-top: .8rem; border-radius: .5rem; box-shadow: none; }
+.first-run ol { padding-left: 1.4rem; }
+.first-run li { margin-block: .7rem; }
+.first-run a { color: #b8d9ff; }
+@media(max-width:680px) { .capture, .feature-list { grid-template-columns: 1fr; } }
