@@ -25,14 +25,14 @@
 <section class="shell capabilities" id="features" aria-labelledby="features-heading">
   <div class="capture">
     <div><h2 id="features-heading">カメラ1台で、どこまで動く？</h2>
-      <p>デスクに座っていても、まばたき、首をかしげる動き、コントローラーから離して振った手までアバターへ。立ち姿を映せば胴体・脚・足も推定できます。Supervisorの部位表示で、カメラが今どこを捉えているかを確認できます。</p>
+      <p>コントローラーから片手を離して、チャットに手を振る。カメラに全身を映せば、腕だけでなく胴体・脚・足まで動かせます。</p>
     </div>
-    <figure><a href="media/supervisor.webp"><img loading="lazy" src="media/supervisor.webp" alt="Supervisorの設定画面。右側に体の各部位の状態とキャリブレーションの見本が並ぶ"></a><figcaption>Supervisorの部位表示とキャリブレーション</figcaption></figure>
+    <figure><a href="media/supervisor.webp"><img loading="lazy" src="media/supervisor.webp" alt="Supervisorの設定画面。右側に体の各部位の状態とキャリブレーションの見本が並ぶ"></a><figcaption>どの部位を捉えているか、Supervisorで確認</figcaption></figure>
   </div>
   <section class="performance" aria-labelledby="performance-title">
     <div><h3 id="performance-title">ゲームと同じPCで動かすために。</h3>
-      <p>カメラ映像の推論にはCPU向けに最適化したXNNPACKを使用。ゲームや描画と並行して動かすことを考え、推論スレッド数を変えて、入力の動きをどれだけ取りこぼさずに送れるかを測定しました。</p>
-      <p>送信のタイミングが遅れたときは、過ぎた送信回を飛ばして最新の未送信姿勢を選びます。手を下ろしたあとに、一拍遅れて手が上がるような追いかけ再生を避けるためです。</p>
+      <p>カメラの推論はCPUが担当。90 fps設定のカメラで頭・顔・手・腕・胴体を追ったとき、推論2スレッドで入力に近い速さまで動きを送れました。</p>
+      <p>処理が遅れたときは最新の姿勢から送信を再開。手を下ろしたあとに、古い手振りが遅れて届くのを防ぎます。</p>
     </div>
     <figure class="timing"><figcaption>CPU推論で送れたモーション <small>開発時の実機測定</small></figcaption>
       <p class="reading"><strong>88.01</strong> fps</p>
@@ -45,14 +45,18 @@
     </figure>
   </section>
   <div class="feature-list">
-    <article><h3>顔用と体用、2つの入力を同時に使う</h3><p>たとえば表情用にはiFacialMocap入力、手と体用にはWebカメラ入力のプロファイルを作ります。両方のCapturerを同時に起動し、それぞれが担当する部位を送信。手持ちのVMCトラッカーから受けた動きにも、同じ部位選択や補正をかけられます。</p></article>
-    <article><h3>揺れや見失った瞬間を整える</h3><p>静止した手の震えは抑えたい。でも、勢いよく手を振った瞬間には追従してほしい。One Euroフィルターは動く速さに応じて補正の強さを変えます。手が一瞬隠れたときの姿勢保持や、顔の向きを自分に合わせる個人補正も選べます。</p>
+    <article class="routing"><h3>いつもの顔トラッカーに、手と体を足す。</h3>
+      <dl class="routes"><div><dt>iFacialMocap</dt><dd>顔・表情</dd></div><div><dt>Webカメラ</dt><dd>手・体</dd></div></dl>
+      <p>入力ごとに担当部位を選び、2つのプロファイルを同時起動。VMCで受け取った動きにも補正をかけられます。</p>
+    </article>
+    <article><h3>手を止めたときは静かに。<br>振ったときは、すばやく。</h3>
+      <p>One Euroフィルターは動きの速さに合わせて揺れを抑えます。一瞬隠れた手の姿勢を保つ時間や、自分の顔の向きに合わせた補正も調整できます。</p>
       <details class="pose-example"><summary>キャリブレーションの参考ポーズを見る</summary><figure class="pose"><fieldset><legend>キャリブレーションの参考ポーズ</legend>
 <input type="radio" name="pose" id="pose-u" checked><label for="pose-u">U ポーズ</label><input type="radio" name="pose" id="pose-t"><label for="pose-t">T ポーズ</label><input type="radio" name="pose" id="pose-i"><label for="pose-i">I ポーズ</label>
 <div class="portrait"><img class="u" src="media/u.webp" alt="両ひじを曲げ、頭の横に手を上げたUポーズ"><img class="t" src="media/t.webp" alt="手のひらを正面に向け、両腕を水平に伸ばしたTポーズ"><img class="i" src="media/i.webp" alt="腕を自然に下ろして立ったIポーズ"></div></fieldset></figure></details>
     </article>
-    <article><h3>同じ動きで設定を比べる</h3><p>録画した動画を入力にしてループさせれば、同じ身振りで補正の効き方を比べられます（動画入力にはFFmpeg・ffprobeを使用）。気になった姿勢は1フレーム、短い動きは1秒・3秒のSnapshotとして記録できます。</p></article>
-    <article><h3>配信アバターやVRChatへ送る</h3><p><a href="https://usagi.github.io/un-avatar/">U.N. Avatar</a>には同じPCからUNMF/Zで接続。LAN内の別PCへ送ったり、VMC/UDP対応アプリへ出力したりできます。VRChatにはOSCでVRCFT互換の顔パラメーターを送れます。</p></article>
+    <article><h3>同じ手振りで、補正を見比べる。</h3><p>録画した動画を入力にしてループさせれば、同じ身振りで補正の効き方を比べられます（動画入力にはFFmpeg・ffprobeを使用）。気になった姿勢は1フレーム、短い動きは1秒・3秒のSnapshotとして記録できます。</p></article>
+    <article><h3>どこへ動きを送る？</h3><p><a href="https://usagi.github.io/un-avatar/">U.N. Avatar</a>には同じPCからUNMF/Zで接続。LAN内の別PCへ送ったり、VMC/UDP対応アプリへ出力したりできます。VRChatにはOSCでVRCFT互換の顔パラメーターを送れます。</p></article>
   </div>
 </section>
 <section class="start" id="start"><div class="shell first-run"><div><h2>最初のモーションを送る</h2><ol><li>Windows用の配布ZIPをすべて展開し、<code>un-motion-supervisor.exe</code> を起動。</li><li>「プロファイルと稼働」で、使いたいカメラと送信先を設定。</li><li>「このプロファイルを起動」。同じPCのU.N. AvatarはUNMF/Zの「Auto（同じPC）」で動きを受け取れます。</li></ol><a href="https://github.com/usagi/un-motion/blob/main/docs/operation-guide.md">接続ガイドと対応環境 ↗</a></div></div></section>

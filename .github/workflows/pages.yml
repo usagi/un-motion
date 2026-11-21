@@ -20,6 +20,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
+      - name: Bind the stylesheet URL to its contents
+        run: |
+          hash=$(sha256sum web/style.css | cut -d' ' -f1)
+          sed -i "s|href=\"style.css\"|href=\"style.css?v=$hash\"|" web/index.html
+          grep -Fq "style.css?v=$hash" web/index.html
       - uses: actions/upload-pages-artifact@v3
         with:
           path: web
