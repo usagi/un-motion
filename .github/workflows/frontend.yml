@@ -1,0 +1,27 @@
+name: Supervisor frontend
+
+on:
+  push:
+    branches: [main, init]
+  pull_request:
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps/un-motion-supervisor
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/un-motion-supervisor/package-lock.json
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Check frontend
+        run: npm run check
+      - name: Run frontend unit regressions
+        run: npm run test:unit

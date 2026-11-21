@@ -349,6 +349,37 @@ impl CoreProfileDocumentStore {
 	pub fn save(&self, document: CoreProfileDocument) -> anyhow::Result<CoreProfileDocument> {
 		let _store_lock = self.acquire_store_lock()?;
 		self.recover_profile_transaction()?;
+		self.save_unlocked(document)
+	}
+
+	/// Keep cooperating writers serialized across read, edit and publication.
+	pub fn update(&self, edit: impl FnOnce(&mut CoreProfileDocument) -> anyhow::Result<()>) -> anyhow::Result<CoreProfileDocument> {
+		let _store_lock = self.acquire_store_lock()?;
+		self.recover_profile_transaction()?;
+		let mut document = self.load_unlocked()?;
+		let previous = document.clone();
+		edit(&mut document)?;
+		if document == previous { return Ok(document); }
+		self.save_unlocked(document)
+	}
+
+	/// Selection is metadata only. Avoid a multi-file transaction whose recovery
+	/// could publish a selection after its caller was told that saving failed.
+	pub fn set_selected_profile_id(&self, profile_id: &str) -> anyhow::Result<()> {
+		let _store_lock = self.acquire_store_lock()?;
+		self.recover_profile_transaction()?;
+		let document = self.load_unlocked()?;
+		let selected = profile_id.trim();
+		if !selected.is_empty() && !document.profiles.iter().any(|profile| profile.id == selected) {
+			bail!("profile not found: {selected}");
+		}
+		if document.selected_profile_id == selected { return Ok(()); }
+		let raw = format_profile_metadata(&self.conf_path, selected,
+			&document.profiles.iter().map(|profile| profile.id.clone()).collect::<Vec<_>>())?;
+		atomic_write(&self.conf_path, raw.as_bytes())
+	}
+
+	fn save_unlocked(&self, document: CoreProfileDocument) -> anyhow::Result<CoreProfileDocument> {
 		validate_profile_document_limits(&document)?;
 		let normalized = normalize_profile_document(document);
 		let root = self.store_root();
@@ -463,6 +494,11 @@ impl CoreProfileDocumentStore {
 				fs::rename(&next_profiles, &self.profiles_dir)
 					.with_context(|| format!("failed to recover profiles {}", self.profiles_dir.display()))?;
 			} else if previous_profiles.exists() {
+				// The staged profiles are unavailable: restore the old set with
+				// its existing metadata, never publish the new set's selection.
+				// Remove staged metadata before rename so an interrupted rollback
+				// cannot be mistaken for a completed forward swap on the next load.
+				remove_path_if_exists(&next_conf)?;
 				fs::rename(&previous_profiles, &self.profiles_dir)
 					.with_context(|| format!("failed to restore profiles {}", self.profiles_dir.display()))?;
 			}
@@ -685,7 +721,8 @@ fn default_profiles() -> Vec<CoreProfileDocumentProfile> {
 	vec![CoreProfileDocumentProfile {
 		id: default_selected_profile_id(),
 		name: "Default".to_string(),
-		created_at: current_timestamp_compact(),
+		// This is a virtual fallback, not a newly created persisted profile.
+		created_at: "unknown".to_string(),
 		note: "UNMotion Default".to_string(),
 		icon_path: None,
 		group: String::new(),
@@ -783,7 +820,7 @@ fn unique_profile_file_names(profiles: &[CoreProfileDocumentProfile]) -> Vec<Str
 			if used.insert(base.clone()) {
 				return base;
 			}
-			let stem = base.strip_suffix(".toml").unwrap_or(&base);
+			let stem = base.trim_suffix(".toml");
 			for suffix in 2_u32.. {
 				let candidate = format!("{stem}-{suffix}.toml");
 				if used.insert(candidate.clone()) {
@@ -806,7 +843,9 @@ fn normalize_created_at(value: &str, path: &Path) -> String {
 			return prefix.to_string();
 		}
 	}
-	current_timestamp_compact()
+	// Reads must be deterministic: inventing the current time changes optimistic
+	// save/delete revisions even when the underlying file has not changed.
+	"unknown".to_string()
 }
 
 fn is_compact_timestamp(value: &str) -> bool {
@@ -1003,6 +1042,156 @@ mod tests {
 	use super::*;
 
 	#[test]
+	fn unknown_creation_time_stays_stable_across_reads_and_first_edit() {
+		for legacy in [false, true] {
+			let root = tempfile::tempdir().unwrap();
+			let store = CoreProfileDocumentStore::from_root(root.path());
+			if legacy {
+				fs::create_dir_all(store.profiles_dir()).unwrap();
+				fs::write(store.profiles_dir().join("legacy.toml"), "id = \"default\"\nname = \"Legacy\"\n").unwrap();
+			}
+			let original = store.load().unwrap();
+			std::thread::sleep(std::time::Duration::from_millis(1100));
+			let reopened = CoreProfileDocumentStore::from_root(root.path());
+			assert_eq!(reopened.load().unwrap(), original, "reading must not invent a new creation time");
+			reopened.update(|document| {
+				assert_eq!(document.profiles[0], original.profiles[0], "optimistic save sees the same profile");
+				document.profiles[0].note = "first edit".into();
+				Ok(())
+			}).unwrap();
+			assert_eq!(reopened.load().unwrap().profiles[0].note, "first edit");
+		}
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn failed_startup_selection_save_does_not_commit_on_reopen() {
+		use std::os::windows::fs::OpenOptionsExt;
+		let root = tempfile::tempdir().unwrap();
+		let store = CoreProfileDocumentStore::from_root(root.path());
+		let mut initial = CoreProfileDocument::default();
+		initial.profiles = vec![test_document_profile("a", "Alpha"), test_document_profile("b", "Beta")];
+		initial.selected_profile_id = "a".into();
+		store.save(initial).unwrap();
+		let original = store.load().unwrap();
+		let profile_bytes: Vec<_> = fs::read_dir(store.profiles_dir()).unwrap().map(|entry| {
+			let path = entry.unwrap().path(); let bytes = fs::read(&path).unwrap(); (path, bytes)
+		}).collect();
+		let before = fs::read(store.conf_path()).unwrap();
+		let held = OpenOptions::new().read(true).share_mode(1).open(store.conf_path()).unwrap();
+		assert!(store.set_selected_profile_id("b").is_err());
+		assert_eq!(fs::read(store.conf_path()).unwrap(), before);
+		drop(held);
+		let reopened = CoreProfileDocumentStore::from_root(root.path());
+		assert_eq!(reopened.load().unwrap(), original, "A failed selection save must not silently commit during recovery");
+		reopened.set_selected_profile_id("b").unwrap();
+		let saved = CoreProfileDocumentStore::from_root(root.path()).load().unwrap();
+		assert_eq!(saved.selected_profile_id, "b");
+		assert_eq!(saved.profiles, original.profiles);
+		assert_eq!(saved.profile_sources, original.profile_sources);
+		for (path, bytes) in profile_bytes { assert_eq!(fs::read(path).unwrap(), bytes); }
+		let committed = fs::read(store.conf_path()).unwrap();
+		assert!(reopened.set_selected_profile_id("missing").is_err());
+		assert_eq!(fs::read(store.conf_path()).unwrap(), committed);
+	}
+
+	#[test]
+	#[ignore = "subprocess worker for concurrent_process_updates_preserve_all_edits"]
+	fn profile_store_process_worker() {
+		let root = std::env::var_os("UNM_TEST_PROFILE_STORE_ROOT").expect("isolated store root");
+		let worker = std::env::var("UNM_TEST_PROFILE_STORE_WORKER").expect("worker id");
+		let store = CoreProfileDocumentStore::from_root(PathBuf::from(root));
+		for index in 0..12 {
+			store.update(|doc| {
+				doc.profiles[0].note.push_str(&format!("{worker}:{index};"));
+				Ok(())
+			}).expect("atomic process edit");
+		}
+	}
+
+	#[test]
+	fn concurrent_process_updates_preserve_all_edits() {
+		let root = tempfile::tempdir().expect("isolated store");
+		let store = CoreProfileDocumentStore::from_root(root.path());
+		let mut initial = CoreProfileDocument::default();
+		initial.profiles[0].note.clear();
+		store.save(initial.clone()).expect("seed store");
+		let executable = std::env::current_exe().expect("test executable");
+		let mut children: Vec<_> = ["a", "b"].into_iter().map(|worker| {
+			std::process::Command::new(&executable)
+				.args(["--exact", "profile_document::tests::profile_store_process_worker", "--ignored"])
+				.env("UNM_TEST_PROFILE_STORE_ROOT", root.path())
+				.env("UNM_TEST_PROFILE_STORE_WORKER", worker)
+				.stdout(std::process::Stdio::null())
+				.spawn().expect("spawn isolated writer")
+		}).collect();
+		let statuses: Vec<_> = children.iter_mut().map(|child| child.wait().expect("wait writer")).collect();
+		assert!(statuses.iter().all(|status| status.success()), "writer failed: {statuses:?}");
+		let saved = store.load().expect("reload after both processes exit");
+		let tokens: Vec<_> = saved.profiles[0].note.split(';').filter(|token| !token.is_empty()).collect();
+		assert_eq!(tokens.len(), 24);
+		for worker in ["a", "b"] {
+			for index in 0..12 {
+				assert_eq!(tokens.iter().filter(|token| **token == format!("{worker}:{index}")).count(), 1);
+			}
+		}
+		let mut restored = saved;
+		restored.profiles[0].note.clear();
+		assert_eq!(restored, initial, "unrelated fields changed");
+	}
+
+	#[test]
+	fn concurrent_updates_keep_both_independent_edits() {
+		let root = tempfile::tempdir().unwrap();
+		let store = CoreProfileDocumentStore::from_root(root.path());
+		store.save(CoreProfileDocument::default()).unwrap();
+		let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+		let workers: Vec<_> = [true, false].into_iter().map(|name| {
+			let store = store.clone();
+			let barrier = barrier.clone();
+			std::thread::spawn(move || {
+				barrier.wait();
+				store.update(|doc| {
+					if name { doc.profiles[0].name = "Renamed".into(); }
+					else { doc.profiles[0].note = "Other editor note".into(); }
+					Ok(())
+				}).unwrap();
+			})
+		}).collect();
+		for worker in workers { worker.join().unwrap(); }
+		let saved = store.load().unwrap();
+		assert_eq!(saved.profiles[0].name, "Renamed");
+		assert_eq!(saved.profiles[0].note, "Other editor note");
+	}
+
+	#[test]
+	fn rejected_update_does_not_publish_partial_edits() {
+		let root = tempfile::tempdir().unwrap();
+		let store = CoreProfileDocumentStore::from_root(root.path());
+		store.save(CoreProfileDocument::default()).unwrap();
+		let before = store.load().unwrap();
+		assert!(store.update(|doc| {
+			doc.profiles[0].name = "Must not persist".into();
+			bail!("invalid later field")
+		}).is_err());
+		assert_eq!(store.load().unwrap(), before);
+		assert!(!root.path().join(PROFILE_TRANSACTION_MARKER).exists());
+	}
+
+	#[test]
+	fn unchanged_update_does_not_rewrite_metadata() {
+		let root = tempfile::tempdir().unwrap();
+		let store = CoreProfileDocumentStore::from_root(root.path());
+		store.save(CoreProfileDocument::default()).unwrap();
+		let path = store.conf_path();
+		let text = format!("# keep unchanged metadata bytes\n{}", fs::read_to_string(path).unwrap());
+		fs::write(path, &text).unwrap();
+		store.update(|_| Ok(())).unwrap();
+		assert_eq!(fs::read_to_string(path).unwrap(), text);
+		assert!(!root.path().join(PROFILE_TRANSACTION_MARKER).exists());
+	}
+
+	#[test]
 	fn atomic_write_replaces_existing_file_without_leaving_temporary_files() {
 		let root = temp_root("atomic-write");
 		let path = root.join("settings.toml");
@@ -1074,7 +1263,7 @@ defaultSourceLabel = "UNMotion Default"
 id = "source-1"
 kind = "vmc-osc"
 label = "Waidayo VMC"
-host = "192.168.13.13"
+host = "192.0.2.20"
 port = 39540
 mirrorCorrectionEnabled = true
 "#,
@@ -1085,7 +1274,7 @@ mirrorCorrectionEnabled = true
 
 		assert_eq!(document.selected_profile_id, "waidayo");
 		assert_eq!(document.profiles[0].name, "Waidayo");
-		assert_eq!(document.profile_sources[0].host.as_deref(), Some("192.168.13.13"));
+		assert_eq!(document.profile_sources[0].host.as_deref(), Some("192.0.2.20"));
 		assert_eq!(document.profile_sources[0].port, Some(39540));
 		assert!(document.profile_sources[0].mirror_correction_enabled);
 	}
@@ -1172,6 +1361,54 @@ mirrorCorrectionEnabled = true
 		assert!(!next.exists());
 		assert!(!root.join(NEXT_CONF_FILE).exists());
 		assert!(!root.join(PROFILE_TRANSACTION_MARKER).exists());
+	}
+
+	#[test]
+	fn interrupted_save_boundaries_recover_a_consistent_document() {
+		for stage in 0..=5 {
+			let root = temp_root(&format!("save-boundary-{stage}"));
+			let old_conf = "[desktop]\nactive_profile_id = \"old\"\nprofile_ids = [\"old\"]\n";
+			let new_conf = "[desktop]\nactive_profile_id = \"new\"\nprofile_ids = [\"new\"]\n";
+			fs::write(root.join("conf.toml"), old_conf).unwrap();
+			fs::write(root.join("profiles/old.toml"), "id=\"old\"\nname=\"Old\"\ncreated_at=\"1\"\n").unwrap();
+			fs::create_dir(root.join(NEXT_PROFILES_DIR)).unwrap();
+			fs::write(root.join(NEXT_PROFILES_DIR).join("new.toml"), "id=\"new\"\nname=\"New\"\ncreated_at=\"2\"\n").unwrap();
+			fs::write(root.join(NEXT_CONF_FILE), new_conf).unwrap();
+			fs::write(root.join(PROFILE_TRANSACTION_MARKER), "prepared\n").unwrap();
+			if stage >= 1 { fs::rename(root.join("profiles"), root.join(PREVIOUS_PROFILES_DIR)).unwrap(); }
+			if stage >= 2 { fs::rename(root.join(NEXT_PROFILES_DIR), root.join("profiles")).unwrap(); }
+			if stage >= 3 { fs::write(root.join("conf.toml"), new_conf).unwrap(); }
+			if stage >= 4 { fs::remove_dir_all(root.join(PREVIOUS_PROFILES_DIR)).unwrap(); }
+			if stage >= 5 { fs::remove_file(root.join(NEXT_CONF_FILE)).unwrap(); }
+			let expected = if stage == 0 { "old" } else { "new" };
+			let store = CoreProfileDocumentStore::from_root(&root);
+			for _ in 0..2 {
+				let loaded = store.load().unwrap();
+				assert_eq!(loaded.selected_profile_id, expected, "stage {stage}");
+				assert_eq!(loaded.profiles.len(), 1, "stage {stage}");
+				assert_eq!(loaded.profiles[0].id, expected, "stage {stage}");
+				assert_eq!(fs::read_to_string(root.join("conf.toml")).unwrap(), if stage == 0 { old_conf } else { new_conf });
+			}
+			for name in [NEXT_PROFILES_DIR, PREVIOUS_PROFILES_DIR, NEXT_CONF_FILE, PROFILE_TRANSACTION_MARKER] {
+				assert!(!root.join(name).exists(), "stage {stage}: leftover {name}");
+			}
+		}
+	}
+
+	#[test]
+	fn store_recovery_to_previous_profiles_keeps_previous_metadata() {
+		let root = temp_root("recover-previous-without-next");
+		let old_conf = "[desktop]\nactive_profile_id = \"old\"\nprofile_ids = [\"old\"]\n";
+		fs::write(root.join("conf.toml"), old_conf).unwrap();
+		fs::write(root.join("profiles/old.toml"), "id = \"old\"\nname = \"Old\"\ncreated_at = \"1\"\n").unwrap();
+		fs::rename(root.join("profiles"), root.join(PREVIOUS_PROFILES_DIR)).unwrap();
+		fs::write(root.join(NEXT_CONF_FILE), "[desktop]\nactive_profile_id = \"new\"\nprofile_ids = [\"new\"]\n").unwrap();
+		fs::write(root.join(PROFILE_TRANSACTION_MARKER), "prepared\n").unwrap();
+		let loaded = CoreProfileDocumentStore::from_root(&root).load().unwrap();
+		assert_eq!(fs::read_to_string(root.join("conf.toml")).unwrap(), old_conf);
+		assert_eq!(loaded.selected_profile_id, "old");
+		assert_eq!(loaded.profiles.len(), 1);
+		assert_eq!(loaded.profiles[0].id, "old");
 	}
 
 	#[test]

@@ -1199,7 +1199,7 @@ fn parse_core_external_ifacialmocap_smoke_args(raw_args: Vec<OsString>) -> Resul
 			"--label" => label = next_value(&mut iter, "--label")?.to_string_lossy().to_string(),
 			"--help" | "-h" => {
 				eprintln!(
-					"usage: cargo xtask core external-ifacialmocap-smoke --listen 192.168.13.13:49983 [--target 127.0.0.1:39551] [--observe 127.0.0.1:39571] [--label ifacialmocap-to-vseeface] [--timeout-ms 30000] [--keep-temp]"
+					"usage: cargo xtask core external-ifacialmocap-smoke --listen 192.0.2.20:49983 [--target 127.0.0.1:39551] [--observe 127.0.0.1:39571] [--label ifacialmocap-to-vseeface] [--timeout-ms 30000] [--keep-temp]"
 				);
 				std::process::exit(0);
 			}
@@ -1209,7 +1209,7 @@ fn parse_core_external_ifacialmocap_smoke_args(raw_args: Vec<OsString>) -> Resul
 	if timeout.is_zero() {
 		bail!("--timeout-ms must be greater than 0");
 	}
-	let listen_addr = listen_addr.context("--listen is required, for example --listen 192.168.13.13:49983")?;
+	let listen_addr = listen_addr.context("--listen is required, for example --listen 192.0.2.20:49983")?;
 	if label.trim().is_empty() {
 		bail!("--label must not be empty");
 	}
@@ -1817,31 +1817,30 @@ fn make_release_package(repo: &Path, raw_args: Vec<OsString>) -> Result<()> {
 	let package_name = format!("un-motion-{file_version}");
 	let output_dir = absolutize(repo, &args.output_dir);
 	let output_zip = output_dir.join(format!("{package_name}.zip"));
-	let staging_root = repo.join("target/release/package");
+	let release_dir = absolutize(repo, &args.target_dir).join("release");
+	let staging_root = release_dir.join("package");
 	let staging_dir = staging_root.join(&package_name);
 
 	if !args.skip_build {
-		build::build_binaries(repo, true)?;
+		build::build_binaries_in(repo, true, Some(&args.target_dir))?;
 	}
+	build::verify_normal_build(&release_dir)?;
 
 	fs::create_dir_all(&output_dir).with_context(|| format!("failed to create {}", output_dir.display()))?;
-	if output_zip.exists() {
-		fs::remove_file(&output_zip).with_context(|| format!("failed to replace {}", output_zip.display()))?;
-	}
 	if staging_dir.exists() {
 		fs::remove_dir_all(&staging_dir).with_context(|| format!("failed to clean {}", staging_dir.display()))?;
 	}
 	fs::create_dir_all(&staging_dir).with_context(|| format!("failed to create {}", staging_dir.display()))?;
 
-	let core_exe = repo.join(format!("target/release/un-motion-core{}", env::consts::EXE_SUFFIX));
+	let core_exe = release_dir.join(format!("un-motion-core{}", env::consts::EXE_SUFFIX));
 	if !core_exe.exists() {
 		bail!("release core executable was not produced: {}", core_exe.display());
 	}
-	let supervisor_exe = repo.join(format!("target/release/un-motion-supervisor{}", env::consts::EXE_SUFFIX));
+	let supervisor_exe = release_dir.join(format!("un-motion-supervisor{}", env::consts::EXE_SUFFIX));
 	if !supervisor_exe.exists() {
 		bail!("release supervisor executable was not produced: {}", supervisor_exe.display());
 	}
-	let capturer_exe = repo.join(format!("target/release/un-motion-capturer{}", env::consts::EXE_SUFFIX));
+	let capturer_exe = release_dir.join(format!("un-motion-capturer{}", env::consts::EXE_SUFFIX));
 	if !capturer_exe.exists() {
 		bail!("release capturer executable was not produced: {}", capturer_exe.display());
 	}
@@ -1857,6 +1856,8 @@ fn make_release_package(repo: &Path, raw_args: Vec<OsString>) -> Result<()> {
 		&capturer_exe,
 		&staging_dir.join(format!("un-motion-capturer{}", env::consts::EXE_SUFFIX)),
 	)?;
+	copy_release_file(&release_dir.join(build::NORMAL_BUILD_RECEIPT), &staging_dir.join(build::NORMAL_BUILD_RECEIPT))?;
+	build::verify_normal_build(&staging_dir)?;
 	for artifact in &native_artifacts {
 		copy_release_file(&artifact.source, &staging_dir.join(&artifact.package_path))?;
 	}
@@ -1864,6 +1865,7 @@ fn make_release_package(repo: &Path, raw_args: Vec<OsString>) -> Result<()> {
 		copy_release_file(&artifact.source, &staging_dir.join(&artifact.package_path))?;
 	}
 	copy_release_file(&repo.join("README.md"), &staging_dir.join("README.md"))?;
+	stage_release_docs(repo, &staging_dir)?;
 	copy_release_file(&repo.join("LICENSE"), &staging_dir.join("LICENSE"))?;
 	copy_release_file(&repo.join("THIRD_PARTY_NOTICES.md"), &staging_dir.join("THIRD_PARTY_NOTICES.md"))?;
 	copy_release_dir(&repo.join("LICENSES"), &staging_dir.join("LICENSES"))?;
@@ -1883,11 +1885,7 @@ fn make_release_package(repo: &Path, raw_args: Vec<OsString>) -> Result<()> {
 	fs::write(staging_dir.join("PACKAGE.txt"), manifest)
 		.with_context(|| format!("failed to write {}", staging_dir.join("PACKAGE.txt").display()))?;
 
-	let file = File::create(&output_zip).with_context(|| format!("failed to create {}", output_zip.display()))?;
-	let mut zip = zip::ZipWriter::new(file);
-	let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-	add_dir_to_zip(&mut zip, options, &staging_root, &staging_dir)?;
-	zip.finish().context("failed to finish release package zip")?;
+	create_release_archive(&staging_root, &staging_dir, &output_zip)?;
 
 	if !args.keep_staging {
 		fs::remove_dir_all(&staging_dir).with_context(|| format!("failed to remove {}", staging_dir.display()))?;
@@ -1903,6 +1901,39 @@ fn make_release_package(repo: &Path, raw_args: Vec<OsString>) -> Result<()> {
 	println!("- Path: {}", output_zip.display());
 	println!("- Size: {size} bytes");
 	println!("PACKAGE_PATH={}", output_zip.display());
+	Ok(())
+}
+
+const RELEASE_PACKAGE_DOCS: &[&str] = &[
+	"assets/brand/un-motion-artwork-supervisor.png",
+	"docs/update-and-recovery.md",
+	"docs/architecture.md",
+	"docs/capturer-pipeline.md",
+	"docs/vrc-osc-output.md",
+	"docs/release-readiness.md",
+	"docs/media-pipe-native-requirements.md",
+	"docs/development-guidelines.md",
+	"docs/xtask.md",
+	// Linked from the bundled xtask guide.
+	"docs/research-video-sources.md",
+];
+
+fn stage_release_docs(repo: &Path, staging: &Path) -> Result<()> {
+	for relative in RELEASE_PACKAGE_DOCS {
+		copy_release_file(&repo.join(relative), &staging.join(relative))?;
+	}
+	Ok(())
+}
+
+fn create_release_archive(staging_root: &Path, staging_dir: &Path, output: &Path) -> Result<()> {
+	let parent=output.parent().context("release ZIP needs a parent directory")?;
+	fs::create_dir_all(parent)?;
+	let temporary=tempfile::NamedTempFile::new_in(parent)?;
+	let mut writer=zip::ZipWriter::new(temporary.reopen()?);
+	let options=zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+	add_dir_to_zip(&mut writer,options,staging_root,staging_dir)?;
+	writer.finish().context("failed to finish release ZIP")?.sync_all()?;
+	temporary.persist(output).map_err(|error|anyhow::anyhow!("failed to replace release ZIP: {}",error.error))?;
 	Ok(())
 }
 
@@ -3019,6 +3050,7 @@ fn path_slash(path: &Path) -> String {
 struct MakeReleasePackageArgs {
 	version: Option<String>,
 	output_dir: PathBuf,
+	target_dir: PathBuf,
 	skip_build: bool,
 	keep_staging: bool,
 }
@@ -3026,6 +3058,7 @@ struct MakeReleasePackageArgs {
 fn parse_make_release_package_args(raw_args: Vec<OsString>) -> Result<MakeReleasePackageArgs> {
 	let mut version = None;
 	let mut output_dir = PathBuf::from("release-packages");
+	let mut target_dir = PathBuf::from("target");
 	let mut skip_build = false;
 	let mut keep_staging = false;
 	let mut iter = raw_args.into_iter();
@@ -3033,11 +3066,12 @@ fn parse_make_release_package_args(raw_args: Vec<OsString>) -> Result<MakeReleas
 		match arg.to_string_lossy().as_ref() {
 			"--version" => version = Some(next_value(&mut iter, "--version")?.to_string_lossy().into_owned()),
 			"--output-dir" => output_dir = PathBuf::from(next_value(&mut iter, "--output-dir")?),
+			"--target-dir" => target_dir = PathBuf::from(next_value(&mut iter, "--target-dir")?),
 			"--skip-build" => skip_build = true,
 			"--keep-staging" => keep_staging = true,
 			"--help" | "-h" => {
 				eprintln!(
-					"usage: cargo xtask make-release-package [--version 1.2.3.beta-1] [--output-dir release-packages] [--skip-build] [--keep-staging]"
+					"usage: cargo xtask make-release-package [--version 1.2.3.beta-1] [--output-dir release-packages] [--target-dir PATH] [--skip-build] [--keep-staging]"
 				);
 				std::process::exit(0);
 			}
@@ -3047,6 +3081,7 @@ fn parse_make_release_package_args(raw_args: Vec<OsString>) -> Result<MakeReleas
 	Ok(MakeReleasePackageArgs {
 		version,
 		output_dir,
+		target_dir,
 		skip_build,
 		keep_staging,
 	})
@@ -3211,7 +3246,7 @@ fn verify(repo: &Path, args: Vec<OsString>) -> Result<()> {
 	}
 
 	if !skip_frontend {
-		run(repo.join("apps/un-motion-supervisor"), "npm", ["run", "build"])?;
+		build::build_normal_frontend(repo)?;
 	}
 	if !skip_rust {
 		run(repo, "cargo", ["fmt", "--all", "--", "--check"])?;
@@ -7583,7 +7618,7 @@ fn print_usage() {
   cargo xtask core external-vmc-smoke --listen 127.0.0.1:39550 --target 127.0.0.1:39551 --observe 127.0.0.1:39571
   cargo xtask core external-vmc-stability --listen 127.0.0.1:39560 --duration-ms 5000 [--output report.json]
   cargo xtask core external-vmc-compare --listen 127.0.0.1:39560 --duration-ms 5000 [--label wmc]
-  cargo xtask core external-ifacialmocap-smoke --listen 192.168.13.13:49983 --target 127.0.0.1:39551 --observe 127.0.0.1:39571
+  cargo xtask core external-ifacialmocap-smoke --listen 192.0.2.20:49983 --target 127.0.0.1:39551 --observe 127.0.0.1:39571
   cargo xtask make-release-package [--version 1.2.3.beta-1] [--output-dir release-packages] [--skip-build] [--keep-staging]
   cargo xtask license-report [--output target/license-report/THIRD_PARTY_DEPENDENCIES.md]
   cargo xtask verify [--skip-frontend] [--skip-rust]
@@ -7604,6 +7639,60 @@ fn print_usage() {
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn release_package_selects_one_explicit_build_directory() {
+		let args = parse_make_release_package_args(vec!["--target-dir".into(), "target/candidate with spaces".into(), "--skip-build".into()]).unwrap();
+		assert_eq!(args.target_dir, PathBuf::from("target/candidate with spaces"));
+		assert!(args.skip_build);
+		assert_eq!(parse_make_release_package_args(vec![]).unwrap().target_dir, PathBuf::from("target"));
+		assert!(parse_make_release_package_args(vec!["--target-dir".into()]).is_err());
+	}
+	#[test]
+	fn release_docs_are_archived_and_missing_doc_fails() {
+		let root = tempfile::tempdir().unwrap();
+		let source = root.path().join("source");
+		let staging = root.path().join("package");
+		for relative in RELEASE_PACKAGE_DOCS {
+			let file = source.join(relative);
+			std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+			std::fs::write(file, relative.as_bytes()).unwrap();
+		}
+		stage_release_docs(&source, &staging).unwrap();
+		let output = root.path().join("release.zip");
+		create_release_archive(root.path(), &staging, &output).unwrap();
+		let mut archive = zip::ZipArchive::new(std::fs::File::open(output).unwrap()).unwrap();
+		for relative in RELEASE_PACKAGE_DOCS {
+			let mut text = String::new();
+			std::io::Read::read_to_string(&mut archive.by_name(&format!("package/{relative}")).unwrap(), &mut text).unwrap();
+			assert_eq!(text, *relative);
+		}
+		std::fs::remove_file(source.join(RELEASE_PACKAGE_DOCS[0])).unwrap();
+		assert!(stage_release_docs(&source, &staging).is_err());
+	}
+
+	#[test]
+	fn release_archive_failure_preserves_previous_zip() {
+		let root=tempfile::tempdir().unwrap();
+		let output=root.path().join("release.zip");
+		std::fs::write(&output,b"previous package").unwrap();
+		let staging=root.path().join("package");
+		assert!(super::create_release_archive(root.path(),&staging,&output).is_err());
+		assert_eq!(std::fs::read(&output).unwrap(),b"previous package");
+		std::fs::create_dir(&staging).unwrap();
+		std::fs::write(staging.join("README.txt"),b"new package").unwrap();
+		#[cfg(windows)] {
+			use std::os::windows::fs::OpenOptionsExt;
+			let locked=std::fs::OpenOptions::new().read(true).share_mode(0).open(staging.join("README.txt")).unwrap();
+			assert!(super::create_release_archive(root.path(),&staging,&output).is_err());
+			assert_eq!(std::fs::read(&output).unwrap(),b"previous package");
+			drop(locked);
+		}
+		super::create_release_archive(root.path(),&staging,&output).unwrap();
+		let mut archive=zip::ZipArchive::new(std::fs::File::open(&output).unwrap()).unwrap();
+		let mut text=String::new();
+		std::io::Read::read_to_string(&mut archive.by_name("package/README.txt").unwrap(),&mut text).unwrap();
+		assert_eq!(text,"new package");
+	}
 	use super::*;
 
 	#[test]
@@ -7723,7 +7812,7 @@ mod tests {
 	fn parse_core_external_ifacialmocap_smoke_args_accepts_live_bench_addresses() {
 		let args = parse_core_external_ifacialmocap_smoke_args(vec![
 			"--listen".into(),
-			"192.168.13.13:49983".into(),
+			"192.0.2.20:49983".into(),
 			"--target".into(),
 			"127.0.0.1:39551".into(),
 			"--observe".into(),
@@ -7735,7 +7824,7 @@ mod tests {
 		])
 		.unwrap();
 
-		assert_eq!(args.listen_addr.to_string(), "192.168.13.13:49983");
+		assert_eq!(args.listen_addr.to_string(), "192.0.2.20:49983");
 		assert_eq!(args.target_addr.to_string(), "127.0.0.1:39551");
 		assert_eq!(args.observe_addr.to_string(), "127.0.0.1:39571");
 		assert_eq!(args.label, "ifacialmocap-to-vseeface");
@@ -7949,12 +8038,12 @@ mod tests {
 		let workspace = r#"new_local_repository(
     name = "windows_opencv",
     build_file = "@//third_party:opencv_windows.BUILD",
-    path = "C:/Users/the/tmp/UNMotion/third_party/opencv/opencv/build",
+    path = "C:/work/UNMotion/third_party/opencv/opencv/build",
 )
 "#;
-		let patched = patch_windows_opencv_repository_path(workspace, "C:/Users/the/tmp/un-motion/third_party/opencv/opencv/build");
+		let patched = patch_windows_opencv_repository_path(workspace, "C:/work/un-motion/third_party/opencv/opencv/build");
 
-		assert!(patched.contains(r#"path = "C:/Users/the/tmp/un-motion/third_party/opencv/opencv/build","#));
+		assert!(patched.contains(r#"path = "C:/work/un-motion/third_party/opencv/opencv/build","#));
 		assert!(!patched.contains("UNMotion/third_party"));
 	}
 

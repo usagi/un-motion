@@ -1,4 +1,5 @@
 [package]
+rust-version = "1.100"
 name = "un-motion-profile-schema"
 description = "UN Motion: profile (TOML) schema + I/O のみを提供する軽量 crate。Capturer/Core/Supervisor が共有する。"
 version.workspace = true

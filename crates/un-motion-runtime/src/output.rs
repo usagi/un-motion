@@ -46,8 +46,12 @@ impl<T> LatestFrameSlot<T> {
 	}
 
 	pub(crate) fn replace(&self, value: T) -> Result<(), OutputDisconnected> {
-		*self.inner.lock().map_err(|_| OutputDisconnected)? = Some(value);
-		Ok(())
+		self.replace_with_status(value).map(|_| ())
+	}
+
+	/// True only when an unconsumed frame was replaced, not when a notification is full.
+	pub(crate) fn replace_with_status(&self, value: T) -> Result<bool, OutputDisconnected> {
+		Ok(self.inner.lock().map_err(|_| OutputDisconnected)?.replace(value).is_some())
 	}
 
 	pub(crate) fn take(&self) -> Option<T> {

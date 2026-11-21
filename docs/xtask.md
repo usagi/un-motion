@@ -12,6 +12,8 @@ product binary ではないが repository 内で再現したい script、実験�
 - third-party source checkout や生成 native binary は、明示的な配布判断がない限り repository に入れません。
 - Native MediaPipe 関連の fetch / build / probe orchestration は `xtask` に置けますが、checkout、model、Bazelisk、DLL は ignored local artifact のままにします。
 
+`build`・通常の `make-release-package`・frontendを省略しない `verify` は `VITE_UN_DESIGN_PREVIEW=0` でSupervisorの通常UIを生成します。`frontend build` は比較用も扱う開発経路です。`build --release` が成功すると、Core・Capturer・SupervisorのSHA-256を `target/release/un-motion-build.json` に記録します。`make-release-package` は `--skip-build` の有無にかかわらず、元EXEと梱包用コピーを記録と照合します。記録がない旧ビルドや、記録後にEXEを差し替えた場合は `cargo xtask build --release` から作り直してください。記録は機能検証や最新ソースとの一致を証明するものではありません。通常のリリースビルドでは、固定の配布元と出力先が食い違わないよう `TAURI_CONFIG`、`CARGO_TARGET_DIR`、`CARGO_BUILD_TARGET` の指定を受け付けません。
+
 ## command 一覧
 
 ```sh
@@ -29,7 +31,7 @@ cargo xtask core lifecycle-smoke
 cargo xtask core vmc-smoke
 cargo xtask core vmc-mirror-smoke
 cargo xtask core external-vmc-smoke --listen 127.0.0.1:39550 --target 127.0.0.1:39551 --observe 127.0.0.1:39571 --label warudo-to-vseeface
-cargo xtask core external-ifacialmocap-smoke --listen 192.168.13.13:49983 --target 127.0.0.1:39551 --observe 127.0.0.1:39571 --label ifacialmocap-to-vseeface
+cargo xtask core external-ifacialmocap-smoke --listen 192.0.2.20:49983 --target 127.0.0.1:39551 --observe 127.0.0.1:39571 --label ifacialmocap-to-vseeface
 cargo xtask make-release-package
 cargo xtask make-release-package --version 1.2.3.beta-1
 cargo xtask make-release-package --version 1.2.3.beta-1 --skip-build --keep-staging
@@ -57,6 +59,8 @@ cargo xtask vmc stability-summary --dir target/vmc-captures/runs/stability --out
 `build` は Supervisor frontend を build してから、`un-motion-core`、`un-motion-capturer`、`un-motion-supervisor` を同じ Cargo profile で build します。`--release` を付けると release profile を使います。
 
 ## release package
+
+常用の `target/release` を更新せずに候補を作る場合は、`cargo xtask make-release-package --target-dir target/public-candidate --output-dir target/candidate-packages --version 1.3.0.rc-1` を使います。Core・Capturer・Supervisorのビルド先、通常UIの照合記録、梱包元、作業用フォルダーが同じ指定先に揃います。先にビルドする場合も `cargo xtask build --release --target-dir target/public-candidate` を使い、梱包時には同じ `--target-dir` と `--skip-build` を指定してください。既定の出力先は従来どおりです。Supervisorのfrontend生成先は共通のため、別候補との同時ビルドは行わないでください。
 
 `make-release-package` は zip artifact を ignored path の `release-packages/` に書きます。portable package は一度 `target/release/package/` に stage してから zip 化します。
 
@@ -108,10 +112,10 @@ packaged または release build 済み core binary を確認する場合は `--
 ```sh
 cargo xtask core external-vmc-smoke --listen 127.0.0.1:39550 --target 127.0.0.1:39551 --observe 127.0.0.1:39571 --label warudo-to-vseeface
 cargo xtask core external-vmc-smoke --listen 127.0.0.1:39560 --target 127.0.0.1:39551 --observe 127.0.0.1:39571 --label wmc-to-vseeface
-cargo xtask core external-vmc-smoke --listen 192.168.13.13:39540 --target 127.0.0.1:39551 --observe 127.0.0.1:39571 --label waidayo-to-vseeface --mirror
+cargo xtask core external-vmc-smoke --listen 192.0.2.20:39540 --target 127.0.0.1:39551 --observe 127.0.0.1:39571 --label waidayo-to-vseeface --mirror
 cargo xtask core external-vmc-stability --listen 127.0.0.1:39560 --duration-ms 5000 --label unmotion-wmc --output target/vmc-captures/runs/stability/unmotion-wmc.json
 cargo xtask core external-vmc-compare --listen 127.0.0.1:39560 --duration-ms 5000 --label wmc
-cargo xtask core external-ifacialmocap-smoke --listen 192.168.13.13:49983 --target 127.0.0.1:39551 --observe 127.0.0.1:39571 --label ifacialmocap-to-vseeface
+cargo xtask core external-ifacialmocap-smoke --listen 192.0.2.20:49983 --target 127.0.0.1:39551 --observe 127.0.0.1:39571 --label ifacialmocap-to-vseeface
 ```
 
 `core external-vmc-stability` は isolated core output を tool-owned UDP port に送り、標準の `vmc stability` JSON report を出します。VSeeFace など receiver 側 smoothing や再出力を測定経路から外したい時に使います。

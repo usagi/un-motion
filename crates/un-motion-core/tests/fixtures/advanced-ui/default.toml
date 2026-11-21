@@ -1,0 +1,24 @@
+id = "default"
+name = "Default"
+createdAt = "unknown"
+note = "UNMotion Default"
+group = ""
+defaultSourceEnabled = true
+defaultSourceLabel = "UNMotion Default"
+sources = []
+
+[runtimeSelection]
+engine = "mediapipe-native"
+
+[runtimeSelection.modifier.postProcessRules]
+holdLostLandmarks = false
+
+[pipelineComponents]
+postProcess = "none"
+inputFfmpegPath = "D:/reviewed/ffmpeg.exe"
+inputResizeEnabled = true
+inputResizeAxis = "height"
+inputResizeReference = 720
+inputResizeWidth = 1280
+inputResizeHeight = 720
+inputResizePreserveAspect = false

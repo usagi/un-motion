@@ -1,4 +1,5 @@
 [package]
+rust-version = "1.100"
 name = "un-motion-capturer"
 description = "UN Motion Capturer プロセス: MediaPipe Native / iFacialMocap 等の入力ソースを UNMotionFrame v1.1 (Zenoh) と VMC で配信する"
 version.workspace = true

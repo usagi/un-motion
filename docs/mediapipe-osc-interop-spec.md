@@ -14,7 +14,7 @@ Waidayo の **Send Motion** は product input として使いません。この 
 
 ### Sub Send Motion
 
-Windows firewall prompt を許可した後、`192.168.13.13:39540` で観測しました。
+Windows firewall prompt を許可した後、`192.0.2.20:39540` で観測しました。
 
 - `frames=4800`
 - `vmc_frames=4800`

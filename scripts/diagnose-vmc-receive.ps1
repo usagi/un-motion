@@ -20,9 +20,9 @@
 #
 # 使い方:
 #   * Supervisor から Waidayo profile で Capturer を Launch (Capturer が
-#     192.168.13.13:39540 で listen 中の状態にする)
+#     192.0.2.20:39540 で listen 中の状態にする)
 #   * 別 PowerShell (Administrator 必要) で:
-#       pwsh -File scripts\diagnose-vmc-receive.ps1 -ListenAddr 192.168.13.13:39540
+#       pwsh -File scripts\diagnose-vmc-receive.ps1 -ListenAddr 192.0.2.20:39540
 #   * 表示される指示に従って Capturer 側 stderr を確認
 # ============================================================================
 
@@ -31,7 +31,7 @@ param(
 	# Capturer が bind している IP:Port。Waidayo profile の
 	# `vmcReceiveListenAddr` と一致させる。
 	[Parameter()]
-	[string]$ListenAddr = "192.168.13.13:39540",
+	[string]$ListenAddr = "127.0.0.1:39540",
 	# pktmon の監視時間 (秒)。Waidayo を実機で動かしながら NIC まで届くかを
 	# 観測する場合、ここを長めにとる。
 	[Parameter()]

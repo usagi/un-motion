@@ -1,0 +1,58 @@
+id = "new-profile"
+name = "New Profile"
+createdAt = "20261021T190247Z"
+note = ""
+group = ""
+defaultSourceEnabled = true
+defaultSourceLabel = "Default"
+sources = []
+
+[runtimeSelection]
+vmcEnabled = false
+vrcOscEnabled = false
+vrcOscTargetAddr = "127.0.0.1:9000"
+vrcOscSendOnlyWhenVrchatRunning = true
+vrcOscProcessPollIntervalSecs = 10
+vrcOscParameterPrefix = "FT"
+zenohEnabled = true
+zenohKeyExpr = "un-motion/frame"
+zenohTopicMode = "frame"
+zenohProducer = "un-motion-capturer"
+zenohLanEnabled = false
+zenohLanPort = 47447
+engine = "mediapipe-native"
+mediaPipeDelegate = "xnnpack"
+mediaPipeNumThreads = 2
+mediaPipeHolisticFlowLimiterEnabled = true
+mediaPipeHolisticFlowLimiterMaxInFlight = 1
+mediaPipeHolisticFlowLimiterMaxInQueue = 1
+
+[runtimeSelection.modifier]
+headEnabled = true
+faceEnabled = true
+handsEnabled = true
+armsIkEnabled = true
+torsoEnabled = true
+legsEnabled = false
+feetEnabled = false
+torsoPitchScale = 1.0
+smoothingEmaEnabled = false
+smoothingEmaAlpha = 0.699999988079071
+smoothingOneEuroEnabled = true
+smoothingConfidenceAdaptiveCutoff = true
+adaptiveMinCutoffHz = 1.0
+adaptiveBeta = 0.11999999731779099
+adaptiveDerivativeCutoffHz = 1.0
+
+[runtimeSelection.modifier.postProcessRules]
+holdLostLandmarks = false
+
+[pipelineComponents]
+postProcess = "none"
+inputFfmpegPath = "D:/profile-1/ffmpeg.exe"
+inputResizeEnabled = true
+inputResizeAxis = "height"
+inputResizeReference = 721
+inputResizeWidth = 1281
+inputResizeHeight = 721
+inputResizePreserveAspect = false

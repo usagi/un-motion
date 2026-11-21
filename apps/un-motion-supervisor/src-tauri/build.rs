@@ -143,13 +143,18 @@ fn sidecar_capturer_path(profile_dir: &Path) -> PathBuf {
 		.join(format!("un-motion-capturer-{millis}{}", exe_suffix()))
 }
 
+#[path = "../../../build_support/output_dir.rs"]
+mod build_output_dir;
+
 fn cargo_profile_dir() -> PathBuf {
-	// OUT_DIR = target/<profile>/build/<crate>-<hash>/out → ../../.. が target/<profile>
-	let mut path = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
-	for _ in 0..3 {
-		path = path.parent().expect("OUT_DIR ancestor under target/<profile>").to_path_buf();
-	}
-	path
+    println!("cargo:rerun-if-env-changed=UN_BUILD_PROFILE_DIR");
+    println!("cargo:rerun-if-changed=../../../build_support/output_dir.rs");
+    if let Some(path) = std::env::var_os("UN_BUILD_PROFILE_DIR") {
+        return PathBuf::from(path);
+    }
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    build_output_dir::profile_dir_from_out_dir(&out)
+        .expect("unknown Cargo output layout; set UN_BUILD_PROFILE_DIR to the executable directory")
 }
 
 fn exe_name(name: &str) -> String {
@@ -188,7 +193,7 @@ fn build_frontend(frontend_dir: &Path) {
 		"Running `npm run build` for un-motion-supervisor frontend ({})",
 		frontend_dir.display()
 	);
-	let status = Command::new(npm).current_dir(frontend_dir).args(["run", "build"]).status();
+	let status = Command::new(npm).current_dir(frontend_dir).env("VITE_UN_DESIGN_PREVIEW", "0").args(["run", "build"]).status();
 	match status {
 		Ok(status) if !status.success() => panic!("`npm run build` failed for supervisor frontend"),
 		Ok(_) => {}

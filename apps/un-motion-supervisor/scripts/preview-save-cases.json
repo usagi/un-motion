@@ -1,0 +1,366 @@
+[
+  {
+    "field": "name",
+    "value": " sample "
+  },
+  {
+    "field": "note",
+    "value": " sample "
+  },
+  {
+    "field": "icon_path",
+    "value": " sample "
+  },
+  {
+    "field": "group",
+    "value": " sample "
+  },
+  {
+    "field": "runtime_selection.fps",
+    "value": 7
+  },
+  {
+    "field": "runtime_selection.vmc_enabled",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.vmc_target_addr",
+    "value": " sample "
+  },
+  {
+    "field": "runtime_selection.vrc_osc_enabled",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.vrc_osc_target_addr",
+    "value": " sample "
+  },
+  {
+    "field": "runtime_selection.vrc_osc_send_only_when_vrchat_running",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.vrc_osc_process_poll_interval_secs",
+    "value": 7
+  },
+  {
+    "field": "runtime_selection.vrc_osc_parameter_prefix",
+    "value": " sample "
+  },
+  {
+    "field": "runtime_selection.zenoh_enabled",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.zenoh_key_expr",
+    "value": " sample "
+  },
+  {
+    "field": "runtime_selection.zenoh_topic_mode",
+    "value": " sample "
+  },
+  {
+    "field": "runtime_selection.zenoh_stream_id",
+    "value": " sample "
+  },
+  {
+    "field": "runtime_selection.zenoh_producer",
+    "value": " sample "
+  },
+  {
+    "field": "runtime_selection.zenoh_lan_enabled",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.zenoh_lan_port",
+    "value": 7
+  },
+  {
+    "field": "runtime_selection.engine",
+    "value": " sample "
+  },
+  {
+    "field": "runtime_selection.device",
+    "value": " sample "
+  },
+  {
+    "field": "runtime_selection.resolution",
+    "value": " sample "
+  },
+  {
+    "field": "runtime_selection.media_pipe_running_mode",
+    "value": " sample "
+  },
+  {
+    "field": "runtime_selection.media_pipe_holistic_enabled",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.media_pipe_delegate",
+    "value": " sample "
+  },
+  {
+    "field": "runtime_selection.media_pipe_num_threads",
+    "value": 7
+  },
+  {
+    "field": "runtime_selection.media_pipe_holistic_flow_limiter_enabled",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.media_pipe_holistic_flow_limiter_max_in_flight",
+    "value": 7
+  },
+  {
+    "field": "runtime_selection.media_pipe_holistic_flow_limiter_max_in_queue",
+    "value": 7
+  },
+  {
+    "field": "runtime_selection.vmc_receive_listen_addr",
+    "value": " sample "
+  },
+  {
+    "field": "runtime_selection.ifacialmocap_receive_listen_addr",
+    "value": " sample "
+  },
+  {
+    "field": "runtime_selection.modifier.head_enabled",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.modifier.face_enabled",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.modifier.hands_enabled",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.modifier.arms_ik_enabled",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.modifier.torso_enabled",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.modifier.legs_enabled",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.modifier.feet_enabled",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.modifier.torso_pitch_scale",
+    "value": 0.3
+  },
+  {
+    "field": "runtime_selection.modifier.mirror_mode",
+    "value": " sample "
+  },
+  {
+    "field": "runtime_selection.modifier.eye_open_bias",
+    "value": 0.3
+  },
+  {
+    "field": "runtime_selection.modifier.smoothing_preset",
+    "value": " sample "
+  },
+  {
+    "field": "runtime_selection.modifier.smoothing_ema_enabled",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.modifier.smoothing_ema_alpha",
+    "value": 0.3
+  },
+  {
+    "field": "runtime_selection.modifier.smoothing_one_euro_enabled",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.modifier.smoothing_confidence_adaptive_cutoff",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.modifier.adaptive_min_cutoff_hz",
+    "value": 0.3
+  },
+  {
+    "field": "runtime_selection.modifier.adaptive_beta",
+    "value": 0.3
+  },
+  {
+    "field": "runtime_selection.modifier.adaptive_derivative_cutoff_hz",
+    "value": 0.3
+  },
+  {
+    "field": "runtime_selection.modifier.face_pose_model.enabled",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.modifier.face_pose_model.neutral_nose_drop_eye_mouth",
+    "value": 0.3
+  },
+  {
+    "field": "runtime_selection.modifier.face_pose_model.sample_count",
+    "value": 7
+  },
+  {
+    "field": "runtime_selection.modifier.face_pose_model.median_abs_yaw",
+    "value": 0.3
+  },
+  {
+    "field": "runtime_selection.modifier.face_pose_model.median_abs_roll",
+    "value": 0.3
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.anatomical_constraints",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.hold_lost_landmarks",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.ease_recovery",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.limit_rotation_jumps",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.head_source_switch_blend",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.head_from_face_matrix",
+    "value": true
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_behavior",
+    "value": " sample "
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_rest_pose_blend",
+    "value": 0.3
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_hold_seconds",
+    "value": 0.3
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_head_behavior",
+    "value": " sample "
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_head_rest_pose_blend",
+    "value": 0.3
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_head_hold_seconds",
+    "value": 0.3
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_hands_behavior",
+    "value": " sample "
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_hands_rest_pose_blend",
+    "value": 0.3
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_hands_hold_seconds",
+    "value": 0.3
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_arms_behavior",
+    "value": " sample "
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_arms_rest_pose_blend",
+    "value": 0.3
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_arms_hold_seconds",
+    "value": 0.3
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_recovery_seconds",
+    "value": 0.3
+  },
+  {
+    "field": "pipeline_components.input",
+    "value": " sample "
+  },
+  {
+    "field": "pipeline_components.post_process",
+    "value": " sample "
+  },
+  {
+    "field": "pipeline_components.input_path",
+    "value": " sample "
+  },
+  {
+    "field": "pipeline_components.input_fps",
+    "value": 7
+  },
+  {
+    "field": "pipeline_components.input_width",
+    "value": 7
+  },
+  {
+    "field": "pipeline_components.input_height",
+    "value": 7
+  },
+  {
+    "field": "pipeline_components.input_pixel_format",
+    "value": " sample "
+  },
+  {
+    "field": "pipeline_components.input_repeat",
+    "value": true
+  },
+  {
+    "field": "pipeline_components.input_ffmpeg_path",
+    "value": " sample "
+  },
+  {
+    "field": "pipeline_components.input_denoise_mode",
+    "value": " sample "
+  },
+  {
+    "field": "pipeline_components.input_denoise_temporal_iir_hz",
+    "value": 0.3
+  },
+  {
+    "field": "pipeline_components.input_resize_enabled",
+    "value": true
+  },
+  {
+    "field": "pipeline_components.input_resize_axis",
+    "value": " sample "
+  },
+  {
+    "field": "pipeline_components.input_resize_reference",
+    "value": 7
+  },
+  {
+    "field": "pipeline_components.input_resize_width",
+    "value": 7
+  },
+  {
+    "field": "pipeline_components.input_resize_height",
+    "value": 7
+  },
+  {
+    "field": "pipeline_components.input_resize_preserve_aspect",
+    "value": true
+  },
+  {
+    "field": "pipeline_components.input_resize_pad_color",
+    "value": " sample "
+  }
+]

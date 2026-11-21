@@ -1,0 +1,1239 @@
+[
+  {
+    "field": "name",
+    "value": "Roundtrip Alpha",
+    "serialized_path": [
+      "name"
+    ],
+    "optional": false,
+    "view_path": [
+      "name"
+    ]
+  },
+  {
+    "field": "note",
+    "value": "複数プロファイル保存確認",
+    "serialized_path": [
+      "note"
+    ],
+    "optional": false,
+    "view_path": [
+      "note"
+    ]
+  },
+  {
+    "field": "icon_path",
+    "value": "C:/isolated/avatar.png",
+    "serialized_path": [
+      "iconPath"
+    ],
+    "optional": true,
+    "view_path": [
+      "iconPath"
+    ]
+  },
+  {
+    "field": "group",
+    "value": "Roundtrip",
+    "serialized_path": [
+      "group"
+    ],
+    "optional": false,
+    "view_path": [
+      "group"
+    ]
+  },
+  {
+    "field": "runtime_selection.fps",
+    "value": 60,
+    "serialized_path": [
+      "runtimeSelection",
+      "fps"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "fps"
+    ]
+  },
+  {
+    "field": "runtime_selection.vmc_enabled",
+    "value": false,
+    "serialized_path": [
+      "runtimeSelection",
+      "vmcEnabled"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "vmcEnabled"
+    ]
+  },
+  {
+    "field": "runtime_selection.vmc_target_addr",
+    "value": "127.0.0.1:39539",
+    "serialized_path": [
+      "runtimeSelection",
+      "vmcTargetAddr"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "vmcTargetAddr"
+    ]
+  },
+  {
+    "field": "runtime_selection.vrc_osc_enabled",
+    "value": false,
+    "serialized_path": [
+      "runtimeSelection",
+      "vrcOscEnabled"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "vrcOscEnabled"
+    ]
+  },
+  {
+    "field": "runtime_selection.vrc_osc_target_addr",
+    "value": "127.0.0.1:9000",
+    "serialized_path": [
+      "runtimeSelection",
+      "vrcOscTargetAddr"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "vrcOscTargetAddr"
+    ]
+  },
+  {
+    "field": "runtime_selection.vrc_osc_send_only_when_vrchat_running",
+    "value": false,
+    "serialized_path": [
+      "runtimeSelection",
+      "vrcOscSendOnlyWhenVrchatRunning"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "vrcOscSendOnlyWhenVrchatRunning"
+    ]
+  },
+  {
+    "field": "runtime_selection.vrc_osc_process_poll_interval_secs",
+    "value": 3,
+    "serialized_path": [
+      "runtimeSelection",
+      "vrcOscProcessPollIntervalSecs"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "vrcOscProcessPollIntervalSecs"
+    ]
+  },
+  {
+    "field": "runtime_selection.vrc_osc_parameter_prefix",
+    "value": "/avatar/parameters/",
+    "serialized_path": [
+      "runtimeSelection",
+      "vrcOscParameterPrefix"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "vrcOscParameterPrefix"
+    ]
+  },
+  {
+    "field": "runtime_selection.zenoh_enabled",
+    "value": true,
+    "serialized_path": [
+      "runtimeSelection",
+      "zenohEnabled"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "zenohEnabled"
+    ]
+  },
+  {
+    "field": "runtime_selection.zenoh_key_expr",
+    "value": "un-motion/frame",
+    "serialized_path": [
+      "runtimeSelection",
+      "zenohKeyExpr"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "zenohKeyExpr"
+    ]
+  },
+  {
+    "field": "runtime_selection.zenoh_topic_mode",
+    "value": "shared",
+    "serialized_path": [
+      "runtimeSelection",
+      "zenohTopicMode"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "zenohTopicMode"
+    ]
+  },
+  {
+    "field": "runtime_selection.zenoh_stream_id",
+    "value": "roundtrip",
+    "serialized_path": [
+      "runtimeSelection",
+      "zenohStreamId"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "zenohStreamId"
+    ]
+  },
+  {
+    "field": "runtime_selection.zenoh_producer",
+    "value": "UNMotion",
+    "serialized_path": [
+      "runtimeSelection",
+      "zenohProducer"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "zenohProducer"
+    ]
+  },
+  {
+    "field": "runtime_selection.zenoh_lan_enabled",
+    "value": false,
+    "serialized_path": [
+      "runtimeSelection",
+      "zenohLanEnabled"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "zenohLanEnabled"
+    ]
+  },
+  {
+    "field": "runtime_selection.zenoh_lan_port",
+    "value": 47447,
+    "serialized_path": [
+      "runtimeSelection",
+      "zenohLanPort"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "zenohLanPort"
+    ]
+  },
+  {
+    "field": "runtime_selection.engine",
+    "value": "mediapipe-native",
+    "serialized_path": [
+      "runtimeSelection",
+      "engine"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "engine"
+    ]
+  },
+  {
+    "field": "runtime_selection.device",
+    "value": "0",
+    "serialized_path": [
+      "runtimeSelection",
+      "device"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "device"
+    ]
+  },
+  {
+    "field": "runtime_selection.resolution",
+    "value": "640x480",
+    "serialized_path": [
+      "runtimeSelection",
+      "resolution"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "resolution"
+    ]
+  },
+  {
+    "field": "runtime_selection.media_pipe_running_mode",
+    "value": "live-stream",
+    "serialized_path": [
+      "runtimeSelection",
+      "mediaPipeRunningMode"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "mediaPipeRunningMode"
+    ]
+  },
+  {
+    "field": "runtime_selection.media_pipe_holistic_enabled",
+    "value": false,
+    "serialized_path": [
+      "runtimeSelection",
+      "mediaPipeHolisticEnabled"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "mediaPipeHolisticEnabled"
+    ]
+  },
+  {
+    "field": "runtime_selection.media_pipe_delegate",
+    "value": "cpu",
+    "serialized_path": [
+      "runtimeSelection",
+      "mediaPipeDelegate"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "mediaPipeDelegate"
+    ]
+  },
+  {
+    "field": "runtime_selection.media_pipe_num_threads",
+    "value": 3,
+    "serialized_path": [
+      "runtimeSelection",
+      "mediaPipeNumThreads"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "mediaPipeNumThreads"
+    ]
+  },
+  {
+    "field": "runtime_selection.media_pipe_holistic_flow_limiter_enabled",
+    "value": true,
+    "serialized_path": [
+      "runtimeSelection",
+      "mediaPipeHolisticFlowLimiterEnabled"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "mediaPipeHolisticFlowLimiterEnabled"
+    ]
+  },
+  {
+    "field": "runtime_selection.media_pipe_holistic_flow_limiter_max_in_flight",
+    "value": 2,
+    "serialized_path": [
+      "runtimeSelection",
+      "mediaPipeHolisticFlowLimiterMaxInFlight"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "mediaPipeHolisticFlowLimiterMaxInFlight"
+    ]
+  },
+  {
+    "field": "runtime_selection.media_pipe_holistic_flow_limiter_max_in_queue",
+    "value": 3,
+    "serialized_path": [
+      "runtimeSelection",
+      "mediaPipeHolisticFlowLimiterMaxInQueue"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "mediaPipeHolisticFlowLimiterMaxInQueue"
+    ]
+  },
+  {
+    "field": "runtime_selection.vmc_receive_listen_addr",
+    "value": "127.0.0.1:39540",
+    "serialized_path": [
+      "runtimeSelection",
+      "vmcReceiveListenAddr"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "vmcReceiveListenAddr"
+    ]
+  },
+  {
+    "field": "runtime_selection.ifacialmocap_receive_listen_addr",
+    "value": "127.0.0.1:49983",
+    "serialized_path": [
+      "runtimeSelection",
+      "ifacialmocapReceiveListenAddr"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "ifacialmocapReceiveListenAddr"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.head_enabled",
+    "value": false,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "headEnabled"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierHeadEnabled"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.face_enabled",
+    "value": true,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "faceEnabled"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierFaceEnabled"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.hands_enabled",
+    "value": false,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "handsEnabled"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierHandsEnabled"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.arms_ik_enabled",
+    "value": true,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "armsIkEnabled"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierArmsIkEnabled"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.torso_enabled",
+    "value": false,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "torsoEnabled"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierTorsoEnabled"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.legs_enabled",
+    "value": true,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "legsEnabled"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierLegsEnabled"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.feet_enabled",
+    "value": false,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "feetEnabled"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierFeetEnabled"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.torso_pitch_scale",
+    "value": 0.75,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "torsoPitchScale"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierTorsoPitchScale"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.mirror_mode",
+    "value": "off",
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "mirrorMode"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierMirrorMode"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.eye_open_bias",
+    "value": 0.5,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "eyeOpenBias"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierEyeOpenBias"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.smoothing_preset",
+    "value": "medium",
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "smoothingPreset"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierSmoothingPreset"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.smoothing_ema_enabled",
+    "value": true,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "smoothingEmaEnabled"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierSmoothingEmaEnabled"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.smoothing_ema_alpha",
+    "value": 0.5,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "smoothingEmaAlpha"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierSmoothingEmaAlpha"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.smoothing_one_euro_enabled",
+    "value": true,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "smoothingOneEuroEnabled"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierSmoothingOneEuroEnabled"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.smoothing_confidence_adaptive_cutoff",
+    "value": false,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "smoothingConfidenceAdaptiveCutoff"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierSmoothingConfidenceAdaptiveCutoff"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.adaptive_min_cutoff_hz",
+    "value": 0.5,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "adaptiveMinCutoffHz"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierAdaptiveMinCutoffHz"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.adaptive_beta",
+    "value": 0.75,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "adaptiveBeta"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierAdaptiveBeta"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.adaptive_derivative_cutoff_hz",
+    "value": 0.25,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "adaptiveDerivativeCutoffHz"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierAdaptiveDerivativeCutoffHz"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.face_pose_model.enabled",
+    "value": true,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "facePoseModel",
+      "enabled"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierFacePoseModelEnabled"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.face_pose_model.neutral_nose_drop_eye_mouth",
+    "value": 0.75,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "facePoseModel",
+      "neutralNoseDropEyeMouth"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierFacePoseModelNeutralNoseDropEyeMouth"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.face_pose_model.sample_count",
+    "value": 2,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "facePoseModel",
+      "sampleCount"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierFacePoseModelSampleCount"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.face_pose_model.median_abs_yaw",
+    "value": 0.5,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "facePoseModel",
+      "medianAbsYaw"
+    ],
+    "optional": true,
+    "view_path": null,
+    "view_note": "Stored learned-model diagnostic; absent from both HEAD and current editor DTO, not removed by UI migration."
+  },
+  {
+    "field": "runtime_selection.modifier.face_pose_model.median_abs_roll",
+    "value": 0.75,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "facePoseModel",
+      "medianAbsRoll"
+    ],
+    "optional": true,
+    "view_path": null,
+    "view_note": "Stored learned-model diagnostic; absent from both HEAD and current editor DTO, not removed by UI migration."
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.anatomical_constraints",
+    "value": true,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "postProcessRules",
+      "anatomicalConstraints"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierAnatomicalConstraints"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.hold_lost_landmarks",
+    "value": false,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "postProcessRules",
+      "holdLostLandmarks"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierHoldLostLandmarks"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.ease_recovery",
+    "value": true,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "postProcessRules",
+      "easeRecovery"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierEaseRecovery"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.limit_rotation_jumps",
+    "value": false,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "postProcessRules",
+      "limitRotationJumps"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierLimitRotationJumps"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.head_source_switch_blend",
+    "value": true,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "postProcessRules",
+      "headSourceSwitchBlend"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierHeadSourceSwitchBlend"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.head_from_face_matrix",
+    "value": false,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "postProcessRules",
+      "headFromFaceMatrix"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierHeadFromFaceMatrix"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_behavior",
+    "value": "hold",
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "postProcessRules",
+      "lostSignalBehavior"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierLostSignalBehavior"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_rest_pose_blend",
+    "value": 0.5,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "postProcessRules",
+      "lostSignalRestPoseBlend"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierLostSignalRestPoseBlend"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_hold_seconds",
+    "value": 0.75,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "postProcessRules",
+      "lostSignalHoldSeconds"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierLostSignalHoldSeconds"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_head_behavior",
+    "value": "hold",
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "postProcessRules",
+      "lostSignalHeadBehavior"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierLostSignalHeadBehavior"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_head_rest_pose_blend",
+    "value": 0.5,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "postProcessRules",
+      "lostSignalHeadRestPoseBlend"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierLostSignalHeadRestPoseBlend"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_head_hold_seconds",
+    "value": 0.75,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "postProcessRules",
+      "lostSignalHeadHoldSeconds"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierLostSignalHeadHoldSeconds"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_hands_behavior",
+    "value": "hold",
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "postProcessRules",
+      "lostSignalHandsBehavior"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierLostSignalHandsBehavior"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_hands_rest_pose_blend",
+    "value": 0.5,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "postProcessRules",
+      "lostSignalHandsRestPoseBlend"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierLostSignalHandsRestPoseBlend"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_hands_hold_seconds",
+    "value": 0.75,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "postProcessRules",
+      "lostSignalHandsHoldSeconds"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierLostSignalHandsHoldSeconds"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_arms_behavior",
+    "value": "hold",
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "postProcessRules",
+      "lostSignalArmsBehavior"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierLostSignalArmsBehavior"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_arms_rest_pose_blend",
+    "value": 0.5,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "postProcessRules",
+      "lostSignalArmsRestPoseBlend"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierLostSignalArmsRestPoseBlend"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_arms_hold_seconds",
+    "value": 0.75,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "postProcessRules",
+      "lostSignalArmsHoldSeconds"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierLostSignalArmsHoldSeconds"
+    ]
+  },
+  {
+    "field": "runtime_selection.modifier.post_process_rules.lost_signal_recovery_seconds",
+    "value": 0.25,
+    "serialized_path": [
+      "runtimeSelection",
+      "modifier",
+      "postProcessRules",
+      "lostSignalRecoverySeconds"
+    ],
+    "optional": true,
+    "view_path": [
+      "runtime",
+      "modifierLostSignalRecoverySeconds"
+    ]
+  },
+  {
+    "field": "pipeline_components.input",
+    "value": "file-video",
+    "serialized_path": [
+      "pipelineComponents",
+      "input"
+    ],
+    "optional": true,
+    "view_path": [
+      "pipeline",
+      "input"
+    ]
+  },
+  {
+    "field": "pipeline_components.post_process",
+    "value": "standard",
+    "serialized_path": [
+      "pipelineComponents",
+      "postProcess"
+    ],
+    "optional": true,
+    "view_path": [
+      "pipeline",
+      "postProcess"
+    ]
+  },
+  {
+    "field": "pipeline_components.input_path",
+    "value": "C:/isolated/input.mp4",
+    "serialized_path": [
+      "pipelineComponents",
+      "inputPath"
+    ],
+    "optional": true,
+    "view_path": [
+      "pipeline",
+      "inputPath"
+    ]
+  },
+  {
+    "field": "pipeline_components.input_fps",
+    "value": 30,
+    "serialized_path": [
+      "pipelineComponents",
+      "inputFps"
+    ],
+    "optional": true,
+    "view_path": [
+      "pipeline",
+      "inputFps"
+    ]
+  },
+  {
+    "field": "pipeline_components.input_width",
+    "value": 640,
+    "serialized_path": [
+      "pipelineComponents",
+      "inputWidth"
+    ],
+    "optional": true,
+    "view_path": [
+      "pipeline",
+      "inputWidth"
+    ]
+  },
+  {
+    "field": "pipeline_components.input_height",
+    "value": 480,
+    "serialized_path": [
+      "pipelineComponents",
+      "inputHeight"
+    ],
+    "optional": true,
+    "view_path": [
+      "pipeline",
+      "inputHeight"
+    ]
+  },
+  {
+    "field": "pipeline_components.input_pixel_format",
+    "value": "YUY2",
+    "serialized_path": [
+      "pipelineComponents",
+      "inputPixelFormat"
+    ],
+    "optional": true,
+    "view_path": [
+      "pipeline",
+      "inputPixelFormat"
+    ]
+  },
+  {
+    "field": "pipeline_components.input_repeat",
+    "value": true,
+    "serialized_path": [
+      "pipelineComponents",
+      "inputRepeat"
+    ],
+    "optional": true,
+    "view_path": [
+      "pipeline",
+      "inputRepeat"
+    ]
+  },
+  {
+    "field": "pipeline_components.input_ffmpeg_path",
+    "value": "C:/isolated/ffmpeg.exe",
+    "serialized_path": [
+      "pipelineComponents",
+      "inputFfmpegPath"
+    ],
+    "optional": true,
+    "view_path": [
+      "pipeline",
+      "inputFfmpegPath"
+    ]
+  },
+  {
+    "field": "pipeline_components.input_denoise_mode",
+    "value": "temporal-iir",
+    "serialized_path": [
+      "pipelineComponents",
+      "inputDenoiseMode"
+    ],
+    "optional": true,
+    "view_path": [
+      "pipeline",
+      "inputDenoiseMode"
+    ]
+  },
+  {
+    "field": "pipeline_components.input_denoise_temporal_iir_hz",
+    "value": 0.75,
+    "serialized_path": [
+      "pipelineComponents",
+      "inputDenoiseTemporalIirHz"
+    ],
+    "optional": true,
+    "view_path": [
+      "pipeline",
+      "inputDenoiseTemporalIirHz"
+    ]
+  },
+  {
+    "field": "pipeline_components.input_resize_enabled",
+    "value": true,
+    "serialized_path": [
+      "pipelineComponents",
+      "inputResizeEnabled"
+    ],
+    "optional": true,
+    "view_path": [
+      "pipeline",
+      "inputResizeEnabled"
+    ]
+  },
+  {
+    "field": "pipeline_components.input_resize_axis",
+    "value": "width",
+    "serialized_path": [
+      "pipelineComponents",
+      "inputResizeAxis"
+    ],
+    "optional": true,
+    "view_path": [
+      "pipeline",
+      "inputResizeAxis"
+    ]
+  },
+  {
+    "field": "pipeline_components.input_resize_reference",
+    "value": 640,
+    "serialized_path": [
+      "pipelineComponents",
+      "inputResizeReference"
+    ],
+    "optional": true,
+    "view_path": [
+      "pipeline",
+      "inputResizeReference"
+    ]
+  },
+  {
+    "field": "pipeline_components.input_resize_width",
+    "value": 320,
+    "serialized_path": [
+      "pipelineComponents",
+      "inputResizeWidth"
+    ],
+    "optional": true,
+    "view_path": [
+      "pipeline",
+      "inputResizeWidth"
+    ]
+  },
+  {
+    "field": "pipeline_components.input_resize_height",
+    "value": 240,
+    "serialized_path": [
+      "pipelineComponents",
+      "inputResizeHeight"
+    ],
+    "optional": true,
+    "view_path": [
+      "pipeline",
+      "inputResizeHeight"
+    ]
+  },
+  {
+    "field": "pipeline_components.input_resize_preserve_aspect",
+    "value": false,
+    "serialized_path": [
+      "pipelineComponents",
+      "inputResizePreserveAspect"
+    ],
+    "optional": true,
+    "view_path": [
+      "pipeline",
+      "inputResizePreserveAspect"
+    ]
+  },
+  {
+    "field": "pipeline_components.input_resize_pad_color",
+    "value": "#000000",
+    "serialized_path": [
+      "pipelineComponents",
+      "inputResizePadColor"
+    ],
+    "optional": true,
+    "view_path": [
+      "pipeline",
+      "inputResizePadColor"
+    ]
+  }
+]

@@ -915,6 +915,10 @@ fn effective_input_fps(
 	.clamp(1, MAX_FPS)
 }
 
+#[cfg(test)]
+#[path = "advanced_ui_tests.rs"]
+mod advanced_ui_tests;
+
 fn load_settings_ffmpeg_path() -> Option<String> {
 	let path = user_config_dir().join("settings.toml");
 	let raw = fs::read_to_string(path).ok()?;

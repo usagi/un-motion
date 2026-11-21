@@ -20,7 +20,7 @@ Input -> Engine(MediaPipe Native + post-process) -> UNMotionFrame -> Modifier ->
 ## v1 既定値
 
 - Webcam backend: Windows では DirectShow (`ccap-rs`) を実用上の既定にする。
-- MediaFoundation (`nokhwa`) は device 互換性と将来の Windows API 変化に備え、UI から選べる代替 backend として残す。ただし Windows のリリース品質は DirectShow を基準に判断する。
+- MediaFoundation (`nokhwa`) は機器一覧・対応形式の確認まで。映像取得からMediaPipeへの接続は未実装で、カメラ入力の代替としては使えない。既存設定と情報確認の入口は保持し、UIにも未対応と明示する。Windowsのカメラ入力はDirectShowを使う。
 - MediaPipe Native delegate: XNNPACK が既定、CPU は fallback。
 - MediaPipe Native GPU delegate: Windows v1 では未対応。Supervisor UI に出さない。
 - 新規 profile の Filter 既定: Head / Face / Hands / Arms / Torso は on、Legs / Feet は off。

@@ -92,7 +92,7 @@ Windows では `webcam-directshow` と `webcam-mediafoundation` を並行して�
 
 DirectShow (`ccap-rs`) は OBS 仮想カメラなどの DirectShow device 互換性と、解像度 / FPS / PixelFormat の明示指定を重視する現行の実用既定です。
 
-MediaFoundation (`nokhwa`) は DirectShow と互換でない device や将来の Windows SDK 変化に備える予備経路です。両者は同じ「Windows webcam」の置き換え関係ではなく、扱える device と format 報告の性質が異なります。
+MediaFoundation (`nokhwa`) は機器一覧・対応形式の確認を実装しています。映像取得からMediaPipeへの接続は未実装で、現在はDirectShowの代わりにカメラ入力として使えません。保存済み設定と情報確認の入口は保持します。
 
 非 Windows は DirectShow を使えないため `nokhwa` 系 backend を候補にします。ただし Windows リリース品質の基準は `webcam-directshow` を中心に置きます。
 

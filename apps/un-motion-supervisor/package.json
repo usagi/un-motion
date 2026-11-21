@@ -1,7 +1,7 @@
 {
   "name": "un-motion-supervisor",
   "private": true,
-  "version": "1.3.0",
+  "version": "1.4.0",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1421",
@@ -12,7 +12,8 @@
     "format": "prettier --config ../../.prettierrc.json --ignore-path ../../.prettierignore --write .",
     "format:check": "prettier --config ../../.prettierrc.json --ignore-path ../../.prettierignore --check .",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test:unit": "node --conditions=browser --test --test-concurrency=1 scripts/lost-signal-behavior.test.mjs scripts/smoothing-migration.test.mjs scripts/calibration-save-feedback.test.mjs scripts/feature-catalog.test.mjs scripts/profile-archive-preview.test.mjs scripts/profile-default-effect.test.mjs scripts/profile-delete-revision.test.mjs scripts/profile-save-queue.test.mjs scripts/profile-selection-race.test.mjs scripts/profile-sync-retention.test.mjs scripts/runtime-status-refresh.test.mjs scripts/native-command-permissions.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.0",

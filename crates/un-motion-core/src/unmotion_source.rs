@@ -678,6 +678,10 @@ where
 	})
 }
 
+#[cfg(test)]
+#[path = "advanced_image_tests.rs"]
+mod advanced_image_tests;
+
 fn file_image_input_config(config: &CoreMotionFrameStreamConfig, path: PathBuf) -> anyhow::Result<FileImageInputConfig> {
 	Ok(FileImageInputConfig {
 		source_id: format!("file-image:{}", config.profile_stream_id),

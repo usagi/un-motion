@@ -162,7 +162,7 @@ fn main() -> anyhow::Result<()> {
 		// CLI 明示指定 (テスト / ポータブル運用) は seeding せずそのまま使う。
 		let store = CoreProfileDocumentStore::from_root(root);
 		let mut document = store.load()?;
-		apply_cli_active_profile(&mut document, cli.active_profile.as_deref());
+		apply_cli_active_profile(&mut document, cli.active_profile.as_deref())?;
 		if cli.experimental_flicker_test {
 			run_experimental_flicker_test(&document)?;
 			return Ok(());
@@ -184,7 +184,7 @@ fn main() -> anyhow::Result<()> {
 			);
 		}
 		let mut document = store.load()?;
-		apply_cli_active_profile(&mut document, cli.active_profile.as_deref());
+		apply_cli_active_profile(&mut document, cli.active_profile.as_deref())?;
 		if cli.experimental_flicker_test {
 			run_experimental_flicker_test(&document)?;
 			return Ok(());
@@ -275,18 +275,15 @@ fn build_capturer_tray_options(pid: u32, supervisor_exe_hint: Option<&Path>) -> 
 	})
 }
 
-fn apply_cli_active_profile(document: &mut un_motion_core::CoreProfileDocument, active_profile: Option<&str>) {
-	let Some(active_profile) = active_profile.map(str::trim).filter(|value| !value.is_empty()) else {
-		return;
+fn apply_cli_active_profile(document: &mut un_motion_core::CoreProfileDocument, active_profile: Option<&str>) -> anyhow::Result<()> {
+	let Some(active_profile) = active_profile.map(str::trim) else {
+		return Ok(());
 	};
-	if document.profiles.iter().any(|profile| profile.id == active_profile) {
-		document.selected_profile_id = active_profile.to_string();
-	} else {
-		tracing::warn!(
-			active_profile,
-			"requested --active-profile was not found in profile document; keeping stored selected profile",
-		);
+	if active_profile.is_empty() || !document.profiles.iter().any(|profile| profile.id == active_profile) {
+		bail!("requested --active-profile {active_profile:?} was not found; refusing to start a different profile");
 	}
+	document.selected_profile_id = active_profile.to_string();
+	Ok(())
 }
 
 fn run_experimental_flicker_test(document: &CoreProfileDocument) -> anyhow::Result<()> {
@@ -298,6 +295,42 @@ fn run_experimental_flicker_test(document: &CoreProfileDocument) -> anyhow::Resu
 	let summary = measure_profile_directshow_flicker(profile)?;
 	println!("{}", serde_json::to_string_pretty(&summary)?);
 	Ok(())
+}
+
+#[cfg(test)]
+mod active_profile_tests {
+	use super::*;
+
+	#[test]
+	fn explicit_missing_or_empty_target_never_falls_back() {
+		let original = CoreProfileDocument::default();
+		for target in ["missing-profile", "", "   "] {
+			let mut document = original.clone();
+			let error = apply_cli_active_profile(&mut document, Some(target)).unwrap_err();
+			assert!(error.to_string().contains("refusing to start a different profile"));
+			assert_eq!(document, original);
+		}
+	}
+
+	#[test]
+	fn explicit_target_changes_only_process_selection() {
+		let mut document = CoreProfileDocument::default();
+		let mut second = document.profiles[0].clone();
+		second.id = "second".into();
+		document.profiles.push(second);
+		let mut expected = document.clone();
+		expected.selected_profile_id = "second".into();
+		apply_cli_active_profile(&mut document, Some(" second ")).unwrap();
+		assert_eq!(document, expected);
+	}
+
+	#[test]
+	fn omitted_target_keeps_stored_selection() {
+		let mut document = CoreProfileDocument::default();
+		let original = document.clone();
+		apply_cli_active_profile(&mut document, None).unwrap();
+		assert_eq!(document, original);
+	}
 }
 
 #[cfg(windows)]

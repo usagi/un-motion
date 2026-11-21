@@ -1,0 +1,9 @@
+[package]
+rust-version = "1.100"
+name = "unm-input-reentrancy-probe"
+version = "0.1.0"
+edition = "2024"
+[workspace]
+[dependencies]
+tao = { path = "../../third_party/tao" }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }

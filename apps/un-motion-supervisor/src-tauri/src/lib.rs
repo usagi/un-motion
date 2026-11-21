@@ -14,6 +14,7 @@
 //! * Profile 一覧 / 切替 (D4-b) は次の commit で追加。
 //! * Svelte UI 骨組み (D4-c) も次の commit で UN Avatar から移植。
 
+mod log_export;
 use std::backtrace::Backtrace;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -31,6 +32,8 @@ use std::env;
 use serde::{Deserialize, Serialize};
 
 mod i18n;
+mod close_gate;
+pub mod profile_archive;
 
 // rust-i18n の compile-time セットアップ。`locales/` 配下を権威ソースとして取り込み、
 // fallback は `ja-JP`。`backend` は `i18n::UN_I18N_STORE` の clone (共有 crate
@@ -103,6 +106,7 @@ struct SupervisorState {
 	next_id: u32,
 	capturers: BTreeMap<u32, ManagedCapturer>,
 	launching_profiles: BTreeSet<Option<String>>,
+	closing: bool,
 	http_client: reqwest::blocking::Client,
 }
 
@@ -116,8 +120,21 @@ impl SupervisorState {
 			next_id: 0,
 			capturers: BTreeMap::new(),
 			launching_profiles: BTreeSet::new(),
+			closing: false,
 			http_client,
 		}
+	}
+}
+
+// Called only on a blocking worker. Closing rejects queued/new launches and
+// waits for existing launch owners to register or clean up their children.
+fn wait_for_capturer_launches(state: &Mutex<SupervisorState>) -> Result<(), String> {
+	loop {
+		let mut guard = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
+		guard.closing = true;
+		if guard.launching_profiles.is_empty() { return Ok(()); }
+		drop(guard);
+		std::thread::sleep(Duration::from_millis(25));
 	}
 }
 
@@ -163,6 +180,9 @@ impl Default for SupervisorState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppRuntimeSettings {
+	/// Runtime-only failure state; IPC input cannot clear startup read failures.
+	#[serde(skip)]
+	startup_read_error: Option<String>,
 	/// Supervisor Console を閉じたときに動作中の Capturer をすべて停止するか。
 	/// 既定 ON が「ユーザーにとって直感的」というユーザー要望に基づく。Capturer を
 	/// 残しておきたい場合 (Capturer system tray からの起動運用) は OFF にする。
@@ -270,6 +290,7 @@ fn default_api_worker_threads() -> usize {
 impl Default for AppRuntimeSettings {
 	fn default() -> Self {
 		Self {
+			startup_read_error: None,
 			stop_capturers_on_exit: true,
 			system_tray_enabled: false,
 			minimize_to_tray: true,
@@ -330,22 +351,28 @@ fn app_settings_path() -> PathBuf {
 /// Phase E: bundled テンプレートが置かれるディレクトリ候補を探す。
 ///
 /// 1. `<exe_dir>/profiles/` (release install / portable zip 想定)
-/// 2. `<workspace_root>/profiles/` (dev: `cargo run`)
+/// 2. `<workspace_root>/profiles/` (debug builds only: `cargo run`)
 ///
 /// どちらも見つからない場合は `None` を返す。`None` のときも `default_profiles()`
 /// (= ハードコードの "Default" 1 件) フォールバックで Capturer は起動できる。
 fn bundled_template_profiles_dir() -> Option<PathBuf> {
-	if let Ok(exe) = env::current_exe()
-		&& let Some(exe_dir) = exe.parent()
-	{
+	let exe = env::current_exe().ok();
+	// A distributed build must not read the builder's ignored local profiles
+	// merely because it is tested on the same machine that compiled it.
+	let workspace = cfg!(debug_assertions).then(repo_root);
+	find_template_profiles_dir(exe.as_deref().and_then(Path::parent), workspace.as_deref())
+}
+
+fn find_template_profiles_dir(exe_dir: Option<&Path>, development_workspace: Option<&Path>) -> Option<PathBuf> {
+	if let Some(exe_dir) = exe_dir {
 		let candidate = exe_dir.join("profiles");
 		if candidate.is_dir() {
 			return Some(candidate);
 		}
 	}
-	let workspace = repo_root().join("profiles");
-	if workspace.is_dir() {
-		return Some(workspace);
+	if let Some(workspace) = development_workspace {
+		let profiles = workspace.join("profiles");
+		if profiles.is_dir() { return Some(profiles); }
 	}
 	None
 }
@@ -395,26 +422,49 @@ fn profile_path_for_id(id: &str) -> PathBuf {
 }
 
 /// `%APPDATA%\UN Motion\settings.toml` から設定を読み出す。
-/// ファイルが無い / parse 失敗の場合は既定値を返す。
+/// Missing files use defaults; unreadable existing files retain a blocking error.
 fn load_app_settings() -> AppRuntimeSettings {
-	let path = app_settings_path();
-	let Ok(raw) = fs::read_to_string(&path) else {
-		return AppRuntimeSettings::default();
+	load_app_settings_at(&app_settings_path())
+}
+
+fn load_app_settings_at(path: &Path) -> AppRuntimeSettings {
+	let result = match fs::read_to_string(path) {
+		Ok(raw) => toml::from_str(&raw).map_err(|e| e.to_string()),
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => return AppRuntimeSettings::default(),
+		Err(e) => Err(e.to_string()),
 	};
-	toml::from_str(&raw).unwrap_or_default()
+	result.unwrap_or_else(|error| AppRuntimeSettings {
+		startup_read_error: Some(format!("設定を読み込めませんでした。元ファイルは保持しています。修復またはバックアップから復元した後、UNMotionを再起動してください。 / Settings could not be loaded; repair or restore this file, then restart UNMotion: {}: {error}", path.display())),
+		..AppRuntimeSettings::default()
+	})
+}
+
+fn ensure_app_settings_loaded(settings: &AppRuntimeSettings) -> Result<(), String> {
+	match &settings.startup_read_error { Some(error) => Err(error.clone()), None => Ok(()) }
 }
 
 /// `%APPDATA%\UN Motion\settings.toml` に設定を書き出す。
 /// 親ディレクトリが無い場合は作成する。
 fn write_app_settings(settings: &AppRuntimeSettings) -> Result<(), String> {
-	let path = app_settings_path();
+	write_app_settings_at(&app_settings_path(), settings)
+}
+
+fn write_app_settings_at(path: &Path, settings: &AppRuntimeSettings) -> Result<(), String> {
+	ensure_app_settings_loaded(settings)?;
+	// Startup may fall back to defaults, but that must not destroy an unreadable
+	// existing settings file on the next unrelated UI edit.
+	match fs::read_to_string(path) {
+		Ok(raw) => { toml::from_str::<AppRuntimeSettings>(&raw).map_err(|e| format!("既存の設定ファイルを読み取れないため上書きしていません。 / Existing settings are invalid; original file preserved: {}: {e}", path.display()))?; }
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+		Err(e) => return Err(format!("既存の設定ファイルを読み取れないため上書きしていません。 / Cannot read existing settings; original file preserved: {}: {e}", path.display())),
+	}
 	if let Some(dir) = path.parent()
 		&& !dir.as_os_str().is_empty()
 	{
 		fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
 	}
 	let text = toml::to_string_pretty(settings).map_err(|e| format!("serialize settings.toml: {e}"))?;
-	un_motion_profile_schema::profile_document::atomic_write(&path, text.as_bytes()).map_err(|e| format!("write {}: {e}", path.display()))
+	un_motion_profile_schema::profile_document::atomic_write(path, text.as_bytes()).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 /// 起動中の Capturer プロセス本体。`un-motion-capturer` を spawn して `Child` を保持し、
@@ -598,24 +648,44 @@ fn capturer_logs(id: u32, after_index: Option<u64>, state: State<'_, Mutex<Super
 /// 同一プロファイルで **すでに** Starting / Running / Stopping の Capturer がある場合は
 /// 新規 spawn せず既存インスタンスを返す（UN Motion ではプロファイル単位の複数 Capturer は想定しない）。
 #[tauri::command]
-fn launch_capturer(
+async fn launch_capturer(
+	app: tauri::AppHandle,
+	profile_id: Option<String>,
+	allow_non_loopback: Option<bool>,
+) -> Result<CapturerInstance, String> {
+	// Camera/process startup and health checks must never block the native window
+	// thread. Keep the existing per-profile reservation inside the worker.
+	tauri::async_runtime::spawn_blocking(move || {
+		launch_capturer_blocking(
+			profile_id,
+			allow_non_loopback,
+			app.state::<Mutex<SupervisorState>>(),
+			app.state::<Mutex<AppRuntimeSettings>>(),
+		)
+	})
+	.await
+	.map_err(|error| format!("capturer launch worker failed: {error}"))?
+}
+
+fn launch_capturer_blocking(
 	profile_id: Option<String>,
 	allow_non_loopback: Option<bool>,
 	state: State<'_, Mutex<SupervisorState>>,
 	app_settings: State<'_, Mutex<AppRuntimeSettings>>,
 ) -> Result<CapturerInstance, String> {
+    if cfg!(feature = "isolated-review") { return Err("Capturer launch disabled in isolated review".into()); }
 	let state_handle: &Mutex<SupervisorState> = &state;
 	let api_worker_threads = app_settings
 		.lock()
 		.map(|settings| normalize_api_worker_threads(settings.api_worker_threads))
 		.unwrap_or_else(|_| default_api_worker_threads());
+	// Resolve and reserve under the same lock used by deletion. Release before slow startup.
+	let profile_guard = lock_profile_store()?;
+	let document = load_profile_document(&user_profile_store())?;
+	let resolved_profile_id = Some(resolve_launch_profile(&document, profile_id.as_deref())?);
 	let mut state = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
+	if state.closing { return Err("Supervisor is closing".into()); }
 	refresh_capturers(&mut state);
-
-	let resolved_profile_id: Option<String> = profile_id
-		.as_ref()
-		.map(|s| s.trim().to_string())
-		.and_then(|s| (!s.is_empty()).then_some(s));
 
 	let is_live = |c: &ManagedCapturer| {
 		matches!(
@@ -650,6 +720,7 @@ fn launch_capturer(
 		state: state_handle,
 		profile_id: resolved_profile_id.clone(),
 	};
+	drop(profile_guard);
 
 	let (child, bind_addr, stderr_tail, stderr_join, started_at) = {
 		let mut attempt = 0;
@@ -882,6 +953,7 @@ fn calibrate_capturer_neutral(
 	let profile_id = configured_profile_id
 		.or_else(|| fetch_capturer_active_profile_id(&http_client, bind_addr))
 		.ok_or_else(|| "active profile is unknown".to_string())?;
+	let expected_result = capturer_result_fields(&user_profile_store().load().map_err(|error| error.to_string())?, &profile_id, CapturerProfileResult::NeutralCalibration)?;
 	let url = format!("http://{bind_addr}/api/runtime/calibration/neutral");
 	let body = serde_json::json!({
 		"pose": pose.as_deref().unwrap_or("U"),
@@ -889,6 +961,7 @@ fn calibrate_capturer_neutral(
 	});
 	let response = http_client
 		.post(&url)
+		.query(&[("expectedProfileId", profile_id.as_str())])
 		.timeout(HTTP_RUNTIME_ACTION_TIMEOUT)
 		.json(&body)
 		.send()
@@ -897,14 +970,18 @@ fn calibrate_capturer_neutral(
 		return Err(response_error("POST", &url, response));
 	}
 	let envelope: ProfileDocumentEnvelope = response.json().map_err(|error| format!("decode calibration response: {error}"))?;
-	let saved = save_profile_from_capturer_selection(&profile_id, envelope.selection)
+	let saved = save_profile_from_capturer_selection(&profile_id, envelope.selection, CapturerProfileResult::NeutralCalibration, &expected_result)
 		.map_err(|error| format!("save profile after calibration: {error}"))?;
-	push_document_to_matching_capturers(&state, &saved, &profile_id);
+	let sync_report = push_document_to_matching_capturers(&state, &saved, &profile_id);
 	saved
 		.profiles
 		.iter()
 		.find(|profile| profile.id == profile_id)
-		.map(ProfileDetail::from)
+		.map(|profile| {
+			let mut detail = profile_detail_with_deletion_revision(profile, &saved);
+			detail.sync_report = Some(sync_report);
+			detail
+		})
 		.ok_or_else(|| format!("profile vanished after calibration: {profile_id}"))
 }
 
@@ -914,9 +991,11 @@ fn clear_capturer_neutral_calibration(id: u32, state: State<'_, Mutex<Supervisor
 	let profile_id = configured_profile_id
 		.or_else(|| fetch_capturer_active_profile_id(&http_client, bind_addr))
 		.ok_or_else(|| "active profile is unknown".to_string())?;
+	let expected_result = capturer_result_fields(&user_profile_store().load().map_err(|error| error.to_string())?, &profile_id, CapturerProfileResult::NeutralCalibration)?;
 	let url = format!("http://{bind_addr}/api/runtime/calibration/neutral/clear");
 	let response = http_client
 		.post(&url)
+		.query(&[("expectedProfileId", profile_id.as_str())])
 		.send()
 		.map_err(|error| format!("POST {url} failed: {error}"))?;
 	if !response.status().is_success() {
@@ -925,14 +1004,18 @@ fn clear_capturer_neutral_calibration(id: u32, state: State<'_, Mutex<Supervisor
 	let envelope: ProfileDocumentEnvelope = response
 		.json()
 		.map_err(|error| format!("decode calibration clear response: {error}"))?;
-	let saved = save_profile_from_capturer_selection(&profile_id, envelope.selection)
+	let saved = save_profile_from_capturer_selection(&profile_id, envelope.selection, CapturerProfileResult::NeutralCalibration, &expected_result)
 		.map_err(|error| format!("save profile after calibration clear: {error}"))?;
-	push_document_to_matching_capturers(&state, &saved, &profile_id);
+	let sync_report = push_document_to_matching_capturers(&state, &saved, &profile_id);
 	saved
 		.profiles
 		.iter()
 		.find(|profile| profile.id == profile_id)
-		.map(ProfileDetail::from)
+		.map(|profile| {
+			let mut detail = profile_detail_with_deletion_revision(profile, &saved);
+			detail.sync_report = Some(sync_report);
+			detail
+		})
 		.ok_or_else(|| format!("profile vanished after calibration clear: {profile_id}"))
 }
 
@@ -946,12 +1029,14 @@ fn build_capturer_face_pose_model(
 	let profile_id = configured_profile_id
 		.or_else(|| fetch_capturer_active_profile_id(&http_client, bind_addr))
 		.ok_or_else(|| "active profile is unknown".to_string())?;
+	let expected_result = capturer_result_fields(&user_profile_store().load().map_err(|error| error.to_string())?, &profile_id, CapturerProfileResult::FacePoseModel)?;
 	let url = format!("http://{bind_addr}/api/runtime/face-pose-model/build");
 	let body = serde_json::json!({
 		"validSampleCount": valid_sample_count.unwrap_or(90).clamp(1, 240),
 	});
 	let response = http_client
 		.post(&url)
+		.query(&[("expectedProfileId", profile_id.as_str())])
 		.timeout(HTTP_RUNTIME_ACTION_TIMEOUT)
 		.json(&body)
 		.send()
@@ -962,28 +1047,64 @@ fn build_capturer_face_pose_model(
 	let envelope: ProfileDocumentEnvelope = response
 		.json()
 		.map_err(|error| format!("decode face pose model response: {error}"))?;
-	let saved = save_profile_from_capturer_selection(&profile_id, envelope.selection)
+	let saved = save_profile_from_capturer_selection(&profile_id, envelope.selection, CapturerProfileResult::FacePoseModel, &expected_result)
 		.map_err(|error| format!("save profile after face pose model build: {error}"))?;
-	push_document_to_matching_capturers(&state, &saved, &profile_id);
+	let sync_report = push_document_to_matching_capturers(&state, &saved, &profile_id);
 	saved
 		.profiles
 		.iter()
 		.find(|profile| profile.id == profile_id)
-		.map(ProfileDetail::from)
+		.map(|profile| {
+			let mut detail = profile_detail_with_deletion_revision(profile, &saved);
+			detail.sync_report = Some(sync_report);
+			detail
+		})
 		.ok_or_else(|| format!("profile vanished after face pose model build: {profile_id}"))
 }
 
-fn save_profile_from_capturer_selection(profile_id: &str, capturer_document: CoreProfileDocument) -> Result<CoreProfileDocument, String> {
+#[derive(Clone, Copy)]
+enum CapturerProfileResult { NeutralCalibration, FacePoseModel }
+
+fn save_profile_from_capturer_selection(profile_id: &str, capturer_document: CoreProfileDocument, result: CapturerProfileResult, expected: &serde_json::Value) -> Result<CoreProfileDocument, String> {
 	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
-	let user_document = merge_profile_from_capturer_selection(profile_id, load_profile_document(&store)?, capturer_document)?;
-	store.save(user_document).map_err(|error| error.to_string())
+	save_capturer_result_in_store(&store, profile_id, capturer_document, result, expected)
+}
+
+fn save_capturer_result_in_store(store: &CoreProfileDocumentStore, profile_id: &str, capturer_document: CoreProfileDocument, result: CapturerProfileResult, expected: &serde_json::Value) -> Result<CoreProfileDocument, String> {
+	store.update(|doc| {
+		*doc = merge_capturer_result_checked(profile_id, doc.clone(), capturer_document, result, expected).map_err(anyhow::Error::msg)?;
+		Ok(())
+	}).map_err(|error| error.to_string())
+}
+
+// Compare only the fields owned by this measurement. A name/note edit is not a conflict.
+fn capturer_result_fields(document: &CoreProfileDocument, profile_id: &str, result: CapturerProfileResult) -> Result<serde_json::Value, String> {
+	let profile = document.profiles.iter().find(|profile| profile.id == profile_id)
+		.ok_or_else(|| format!("profile not found in user store: {profile_id}"))?;
+	let modifier = profile.runtime_selection.as_ref().and_then(|runtime| runtime.modifier.as_ref());
+	Ok(match result {
+		CapturerProfileResult::NeutralCalibration => serde_json::json!([
+			modifier.and_then(|m| m.neutral_calibration_enabled.as_ref()),
+			modifier.and_then(|m| m.neutral_calibration_rotations.as_ref()),
+			modifier.and_then(|m| m.neutral_calibration_pose.as_ref()),
+		]),
+		CapturerProfileResult::FacePoseModel => serde_json::json!(modifier.and_then(|m| m.face_pose_model.as_ref())),
+	})
+}
+
+fn merge_capturer_result_checked(profile_id: &str, current: CoreProfileDocument, incoming: CoreProfileDocument, result: CapturerProfileResult, expected: &serde_json::Value) -> Result<CoreProfileDocument, String> {
+	if &capturer_result_fields(&current, profile_id, result)? != expected {
+		return Err("profile_conflict: calibration settings changed during measurement; result was not saved. The Capturer may already have applied the measurement; reload settings before retrying.".into());
+	}
+	merge_profile_from_capturer_selection(profile_id, current, incoming, result)
 }
 
 fn merge_profile_from_capturer_selection(
 	profile_id: &str,
 	mut user_document: CoreProfileDocument,
 	capturer_document: CoreProfileDocument,
+	result: CapturerProfileResult,
 ) -> Result<CoreProfileDocument, String> {
 	let updated_profile = capturer_document
 		.profiles
@@ -995,7 +1116,17 @@ fn merge_profile_from_capturer_selection(
 		.iter_mut()
 		.find(|profile| profile.id == profile_id)
 		.ok_or_else(|| format!("profile not found in user store: {profile_id}"))?;
-	*profile = updated_profile;
+	let incoming = updated_profile.runtime_selection.and_then(|r| r.modifier)
+		.ok_or_else(|| "capturer result has no modifier settings".to_string())?;
+	let modifier = profile.runtime_selection.get_or_insert_with(Default::default).modifier.get_or_insert_with(Default::default);
+	match result {
+		CapturerProfileResult::NeutralCalibration => {
+			modifier.neutral_calibration_enabled = incoming.neutral_calibration_enabled;
+			modifier.neutral_calibration_rotations = incoming.neutral_calibration_rotations;
+			modifier.neutral_calibration_pose = incoming.neutral_calibration_pose;
+		}
+		CapturerProfileResult::FacePoseModel => modifier.face_pose_model = incoming.face_pose_model,
+	}
 	Ok(user_document)
 }
 
@@ -1030,11 +1161,8 @@ fn save_capturer_unmf_pose(
 		frames,
 		format!("un-motion-{}-{ts}.unmf.jsonl", duration.file_label()),
 		&app_settings,
-	)?;
-	if let (Some(path), Some(pending)) = (saved.as_deref(), pending_analysis.as_ref()) {
-		write_runtime_analysis_extras(path, pending, duration)?;
-	}
-	Ok(saved)
+	);
+	complete_snapshot_analysis(saved, pending_analysis, duration)
 }
 
 #[tauri::command]
@@ -1083,11 +1211,8 @@ fn save_all_capturers_unmf_pose(
 		frames,
 		format!("un-motion-{}-all-{ts}.unmf.jsonl", duration.file_label()),
 		&app_settings,
-	)?;
-	if let (Some(path), Some(pending)) = (saved.as_deref(), pending_analysis.as_ref()) {
-		write_runtime_analysis_extras(path, pending, duration)?;
-	}
-	Ok(saved)
+	);
+	complete_snapshot_analysis(saved, pending_analysis, duration)
 }
 
 fn capture_unmf_pose_from_capturer(http_client: &reqwest::blocking::Client, bind_addr: SocketAddr) -> Result<serde_json::Value, String> {
@@ -1219,14 +1344,29 @@ fn save_unmf_jsonl(
 		content.push_str(&serde_json::to_string(&frame).map_err(|error| format!("encode UNMotionFrame JSONL: {error}"))?);
 		content.push('\n');
 	}
-	fs::write(&path, content.as_bytes()).map_err(|error| format!("write UNMotionFrame JSONL: {error}"))?;
-	if snapshot_analysis_extras_enabled(app_settings) {
-		write_snapshot_analysis_sidecar(&path, &content)?;
+	write_snapshot_recording(&path, &content, snapshot_analysis_extras_enabled(app_settings), |parent| {
+		update_snapshot_save_dir(app_settings, parent)
+	})?;
+	Ok(Some(path.display().to_string()))
+}
+
+// Keep the primary recording result distinct from supplementary operations.
+fn write_snapshot_recording(
+	path: &Path,
+	content: &str,
+	analysis: bool,
+	remember_folder: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+	fs::write(path, content.as_bytes()).map_err(|error| format!("write UNMotionFrame JSONL: {error}"))?;
+	if analysis {
+		write_snapshot_analysis_sidecar(path, content)
+			.map_err(|error| format!("Motion recording saved to {}. Analysis sidecar could not be saved: {error}", path.display()))?;
 	}
 	if let Some(parent) = path.parent() {
-		update_snapshot_save_dir(app_settings, parent)?;
+		remember_folder(parent)
+			.map_err(|error| format!("Motion recording saved to {}. The last-used save folder could not be remembered: {error}", path.display()))?;
 	}
-	Ok(Some(path.display().to_string()))
+	Ok(())
 }
 
 fn snapshot_analysis_extras_enabled(app_settings: &Mutex<AppRuntimeSettings>) -> bool {
@@ -1301,6 +1441,7 @@ fn write_snapshot_analysis_sidecar(snapshot_path: &Path, frame_jsonl: &str) -> R
 }
 
 struct PendingRuntimeAnalysisExtras {
+	owned_root: PathBuf,
 	capturers: Vec<PendingCapturerAnalysisExtras>,
 }
 
@@ -1308,6 +1449,41 @@ struct PendingCapturerAnalysisExtras {
 	bind_addr: SocketAddr,
 	temp_dir: PathBuf,
 	response: serde_json::Value,
+}
+
+#[cfg(test)]
+#[path = "analysis_temp_tests.rs"]
+mod analysis_temp_tests;
+
+fn cleanup_analysis_temp(pending: &PendingRuntimeAnalysisExtras) -> Result<(), String> {
+	let root = pending.owned_root.canonicalize().map_err(|e| format!("locate temporary analysis: {e}"))?;
+	let temp = std::env::temp_dir().canonicalize().map_err(|e| format!("locate temporary directory: {e}"))?;
+	if root.parent() != Some(temp.as_path()) || !root.file_name().is_some_and(|n| n.to_string_lossy().starts_with(&format!("un-motion-analysis-extras-{}-", std::process::id()))) {
+		return Err("Refusing to remove an unexpected analysis directory".into());
+	}
+	fs::remove_dir_all(&root).map_err(|e| format!("Temporary analysis remains at {}: {e}", root.display()))
+}
+
+fn complete_snapshot_analysis(
+	saved: Result<Option<String>, String>,
+	pending: Option<PendingRuntimeAnalysisExtras>,
+	duration: SnapshotDuration,
+) -> Result<Option<String>, String> {
+	let saved = saved.map_err(|error| match &pending {
+		Some(p) => format!("{error}. Temporary analysis retained at {}", p.owned_root.display()),
+		None => error,
+	})?;
+	if let Some(pending) = pending {
+		if let Some(path) = saved.as_deref() {
+			write_runtime_analysis_extras(path, &pending, duration).map_err(|error|
+				format!("Motion recording saved to {path}. Additional runtime analysis could not be saved: {error}. Temporary analysis retained at {}", pending.owned_root.display()))?;
+		}
+		cleanup_analysis_temp(&pending).map_err(|error| match &saved {
+			Some(path) => format!("Motion recording saved to {path}. {error}"),
+			None => format!("Recording cancelled. {error}"),
+		})?;
+	}
+	Ok(saved)
 }
 
 fn capture_runtime_analysis_extras_to_temp(
@@ -1320,22 +1496,23 @@ fn capture_runtime_analysis_extras_to_temp(
 		std::process::id(),
 		std::time::SystemTime::now()
 			.duration_since(std::time::UNIX_EPOCH)
-			.map(|duration| duration.as_millis())
+			.map(|duration| duration.as_nanos())
 			.unwrap_or(0)
 	));
-	fs::create_dir_all(&base).map_err(|error| format!("create temp analysis dir: {error}"))?;
+	fs::create_dir(&base).map_err(|error| format!("create temp analysis dir: {error}"))?;
 	let mut capturers = Vec::with_capacity(targets.len());
 	for (index, bind_addr) in targets.iter().enumerate() {
 		let temp_dir = base.join(format!("capturer-{index}-{}", bind_addr.port()));
 		fs::create_dir_all(&temp_dir).map_err(|error| format!("create temp capturer analysis dir: {error}"))?;
-		let response = capture_runtime_analysis_extras(http_client, *bind_addr, &temp_dir, duration)?;
+		let response = capture_runtime_analysis_extras(http_client, *bind_addr, &temp_dir, duration)
+			.map_err(|error| format!("{error}. Temporary analysis retained at {}", base.display()))?;
 		capturers.push(PendingCapturerAnalysisExtras {
 			bind_addr: *bind_addr,
 			temp_dir,
 			response,
 		});
 	}
-	Ok(PendingRuntimeAnalysisExtras { capturers })
+	Ok(PendingRuntimeAnalysisExtras { owned_root: base, capturers })
 }
 
 fn write_runtime_analysis_extras(
@@ -1874,9 +2051,10 @@ fn update_snapshot_save_dir(app_settings: &Mutex<AppRuntimeSettings>, dir: &Path
 	if settings.snapshot_save_dir.as_deref() == Some(dir.as_str()) {
 		return Ok(());
 	}
-	settings.snapshot_save_dir = Some(dir);
-	normalize_app_settings(&mut settings);
-	write_app_settings(&settings)
+	let mut next = settings.clone();
+	next.snapshot_save_dir = Some(dir);
+	normalize_app_settings(&mut next);
+	persist_app_settings(&mut settings, next, write_app_settings).map(|_| ())
 }
 
 fn default_snapshot_save_dir() -> PathBuf {
@@ -1929,19 +2107,15 @@ fn selected_profile_id(_state: State<'_, Mutex<SupervisorState>>) -> Result<Stri
 fn set_selected_profile_id(profile_id: Option<String>, _state: State<'_, Mutex<SupervisorState>>) -> Result<(), String> {
 	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
-	let mut doc = load_profile_document(&store)?;
+	set_selected_profile_in_store(&store, profile_id)
+}
+
+fn set_selected_profile_in_store(store: &CoreProfileDocumentStore, profile_id: Option<String>) -> Result<(), String> {
 	let normalized = profile_id
 		.map(|value| value.trim().to_string())
 		.filter(|value| !value.is_empty())
 		.unwrap_or_default();
-	if !normalized.is_empty() && !doc.profiles.iter().any(|profile| profile.id == normalized) {
-		return Err(format!("profile not found: {normalized}"));
-	}
-	if doc.selected_profile_id == normalized {
-		return Ok(());
-	}
-	doc.selected_profile_id = normalized;
-	store.save(doc).map_err(|e| format!("save profile document: {e}"))?;
+	store.set_selected_profile_id(&normalized).map_err(|e| format!("save profile selection: {e}"))?;
 	Ok(())
 }
 
@@ -1951,15 +2125,19 @@ fn set_selected_profile_id(profile_id: Option<String>, _state: State<'_, Mutex<S
 #[tauri::command]
 fn create_profile(name: String, _state: State<'_, Mutex<SupervisorState>>) -> Result<ProfileDetail, String> {
 	let _profile_guard = lock_profile_store()?;
+	create_profile_in_store(&user_profile_store(), name)
+}
+
+fn create_profile_in_store(store: &CoreProfileDocumentStore, name: String) -> Result<ProfileDetail, String> {
 	let trimmed = name.trim();
 	let name = if trimmed.is_empty() {
 		"New Profile".to_string()
 	} else {
 		trimmed.to_string()
 	};
-	let store = user_profile_store();
-	let mut doc = load_profile_document(&store)?;
-	let id = next_profile_id(&doc, &name);
+	let mut id = String::new();
+	let saved = store.update(|doc| {
+	id = next_profile_id(doc, &name);
 	let new_profile = CoreProfileDocumentProfile {
 		id: id.clone(),
 		name,
@@ -1974,12 +2152,13 @@ fn create_profile(name: String, _state: State<'_, Mutex<SupervisorState>>) -> Re
 	};
 	doc.profiles.push(new_profile);
 	doc.selected_profile_id = id.clone();
-	let saved = store.save(doc).map_err(|e| format!("save profile document: {e}"))?;
+	Ok(())
+	}).map_err(|e| format!("save profile document: {e}"))?;
 	let detail = saved
 		.profiles
 		.iter()
 		.find(|profile| profile.id == id)
-		.map(ProfileDetail::from)
+		.map(|profile| profile_detail_with_deletion_revision(profile, &saved))
 		.ok_or_else(|| format!("created profile vanished after save: {id}"))?;
 	Ok(detail)
 }
@@ -2027,35 +2206,47 @@ fn new_profile_runtime_defaults() -> ProfileRuntimeSettings {
 }
 
 /// Profile を削除する。最後の 1 件も削除できる。空になったら launch default は空文字にする。
+fn resolve_launch_profile(doc: &CoreProfileDocument, requested: Option<&str>) -> Result<String, String> {
+	let id = requested.map(str::trim).filter(|id| !id.is_empty()).unwrap_or(&doc.selected_profile_id);
+	if !doc.profiles.iter().any(|profile| profile.id == id) {
+		return Err(format!("profile not found for launch: {id}"));
+	}
+	Ok(id.to_string())
+}
+
+fn profile_is_in_use(state: &SupervisorState, profile_id: &str) -> bool {
+	state.launching_profiles.contains(&Some(profile_id.to_string()))
+		|| state.launching_profiles.contains(&None)
+		|| state.capturers.values().any(|capturer| {
+			matches!(capturer.info.state, CapturerState::Starting | CapturerState::Running | CapturerState::Stopping)
+				&& (capturer.info.profile_id.as_deref() == Some(profile_id) || capturer.info.profile_id.is_none())
+		})
+}
+
 #[tauri::command]
-fn delete_profile(profile_id: String, state: State<'_, Mutex<SupervisorState>>) -> Result<(), String> {
+fn delete_profile(profile_id: String, expected_revision: Option<String>, state: State<'_, Mutex<SupervisorState>>) -> Result<(), String> {
 	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
-	let mut doc = load_profile_document(&store)?;
-	if !doc.profiles.iter().any(|profile| profile.id == profile_id) {
-		return Err(format!("profile not found: {profile_id}"));
-	}
-	let profile_in_use = state
-		.lock()
-		.map_err(|_| "supervisor state poisoned".to_string())?
-		.capturers
-		.values()
-		.any(|capturer| {
-			matches!(
-				capturer.info.state,
-				CapturerState::Starting | CapturerState::Running | CapturerState::Stopping
-			) && capturer.info.profile_id.as_deref() == Some(profile_id.as_str())
-		});
+	let profile_in_use = profile_is_in_use(&*state.lock().map_err(|_| "supervisor state poisoned".to_string())?, &profile_id);
 	if profile_in_use {
-		return Err(format!("profile is in use by a running capturer: {profile_id}"));
+		return Err(format!("profile is in use by a starting or running capturer: {profile_id}"));
 	}
-	doc.profiles.retain(|profile| profile.id != profile_id);
-	doc.profile_sources.retain(|source| source.profile_id != profile_id);
-	if doc.selected_profile_id == profile_id {
-		doc.selected_profile_id = doc.profiles.first().map(|profile| profile.id.clone()).unwrap_or_default();
-	}
-	store.save(doc).map_err(|e| format!("save profile document: {e}"))?;
-	Ok(())
+	profile_archive::delete_saved(&store, &profile_id, expected_revision.as_deref())
+}
+
+/// 削除前に保管したプロファイルの一覧。
+#[tauri::command]
+fn list_deleted_profiles() -> Result<Vec<profile_archive::ArchiveSummary>, String> {
+	let _profile_guard = lock_profile_store()?;
+	let store = user_profile_store();
+	let root = store.conf_path().parent().ok_or("profile store has no parent")?.join("deleted_profiles");
+	profile_archive::list(&root)
+}
+
+#[tauri::command]
+fn restore_deleted_profile(archive_id: String) -> Result<CoreProfileDocument, String> {
+	let _profile_guard = lock_profile_store()?;
+	profile_archive::restore_saved(&user_profile_store(), &archive_id)
 }
 
 /// Profile を複製する。新しい id / 表示名は元のものから ` copy` を付けて自動採番する。
@@ -2063,46 +2254,85 @@ fn delete_profile(profile_id: String, state: State<'_, Mutex<SupervisorState>>) 
 fn duplicate_profile(profile_id: String, _state: State<'_, Mutex<SupervisorState>>) -> Result<ProfileDetail, String> {
 	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
-	let mut doc = load_profile_document(&store)?;
+	duplicate_profile_in_store(&store, &profile_id)
+}
+
+fn duplicate_profile_in_store(store: &CoreProfileDocumentStore, profile_id: &str) -> Result<ProfileDetail, String> {
+	let mut new_id = String::new();
+	let saved = store.update(|doc| {
+		new_id = duplicate_profile_document(doc, profile_id).map_err(anyhow::Error::msg)?;
+		Ok(())
+	}).map_err(|e| format!("save profile document: {e}"))?;
+	let detail = saved
+		.profiles
+		.iter()
+		.find(|profile| profile.id == new_id)
+		.map(|profile| profile_detail_with_deletion_revision(profile, &saved))
+		.ok_or_else(|| format!("duplicated profile vanished after save: {new_id}"))?;
+	Ok(detail)
+}
+
+fn duplicate_profile_document(doc: &mut CoreProfileDocument, profile_id: &str) -> Result<String, String> {
 	let original = doc
 		.profiles
 		.iter()
 		.find(|profile| profile.id == profile_id)
 		.cloned()
 		.ok_or_else(|| format!("profile not found: {profile_id}"))?;
-	let new_name = next_profile_name(&doc, &format!("{} copy", original.name));
-	let new_id = next_profile_id(&doc, &new_name);
+	let new_name = next_profile_name(doc, &format!("{} copy", original.name));
+	let new_id = next_profile_id(doc, &new_name);
 	let duplicated = CoreProfileDocumentProfile {
 		id: new_id.clone(),
 		name: new_name,
 		created_at: String::new(),
 		..original
 	};
+	let mut used_ids = doc.profile_sources.iter().map(|source| source.id.clone()).collect::<BTreeSet<_>>();
+	let mut sources = Vec::new();
+	for original_source in doc.profile_sources.iter().filter(|source| source.profile_id == profile_id) {
+		let mut source = original_source.clone();
+		let mut index = 1usize;
+		let id = loop {
+			let candidate = format!("{new_id}-source-{index}");
+			if used_ids.insert(candidate.clone()) { break candidate; }
+			index += 1;
+		};
+		source.id = id;
+		source.profile_id = new_id.clone();
+		sources.push(source);
+	}
 	doc.profiles.push(duplicated);
-	let saved = store.save(doc).map_err(|e| format!("save profile document: {e}"))?;
-	let detail = saved
-		.profiles
-		.iter()
-		.find(|profile| profile.id == new_id)
-		.map(ProfileDetail::from)
-		.ok_or_else(|| format!("duplicated profile vanished after save: {new_id}"))?;
-	Ok(detail)
+	doc.profile_sources.extend(sources);
+	Ok(new_id)
 }
 
 #[tauri::command]
-fn reorder_profiles(profile_ids: Vec<String>, _state: State<'_, Mutex<SupervisorState>>) -> Result<Vec<ProfileSummary>, String> {
+fn reorder_profiles(profile_ids: Vec<String>, expected_ids: Vec<String>, _state: State<'_, Mutex<SupervisorState>>) -> Result<Vec<ProfileSummary>, String> {
 	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
-	let mut doc = load_profile_document(&store)?;
+	reorder_profiles_in_store(&store, &profile_ids, &expected_ids)
+}
+
+fn reorder_profiles_in_store(store: &CoreProfileDocumentStore, profile_ids: &[String], expected_ids: &[String]) -> Result<Vec<ProfileSummary>, String> {
+	let saved = store.update(|doc| {
+	if !doc.profiles.iter().map(|profile| &profile.id).eq(expected_ids.iter()) {
+		anyhow::bail!("Profile list changed. Reload the saved order before rearranging again.");
+	}
+	let requested: std::collections::HashSet<&str> = profile_ids.iter().map(String::as_str).collect();
+	if requested.len() != profile_ids.len() || profile_ids.len() != doc.profiles.len()
+		|| doc.profiles.iter().any(|profile| !requested.contains(profile.id.as_str())) {
+		anyhow::bail!("Profile list changed or contains duplicate IDs. Reload the saved order before rearranging again.");
+	}
 	let mut ordered = Vec::with_capacity(doc.profiles.len());
-	for id in &profile_ids {
+	for id in profile_ids {
 		if let Some(index) = doc.profiles.iter().position(|profile| &profile.id == id) {
 			ordered.push(doc.profiles.remove(index));
 		}
 	}
 	ordered.append(&mut doc.profiles);
 	doc.profiles = ordered;
-	let saved = store.save(doc).map_err(|e| format!("save profile document: {e}"))?;
+	Ok(())
+	}).map_err(|e| format!("save profile document: {e}"))?;
 	Ok(saved.profiles_summary())
 }
 
@@ -2114,7 +2344,7 @@ fn get_profile_detail(profile_id: String) -> Result<ProfileDetail, String> {
 	doc.profiles
 		.iter()
 		.find(|profile| profile.id == profile_id)
-		.map(ProfileDetail::from)
+		.map(|profile| profile_detail_with_deletion_revision(profile, &doc))
 		.ok_or_else(|| format!("profile not found: {profile_id}"))
 }
 
@@ -2126,27 +2356,59 @@ fn update_profile_field(
 	profile_id: String,
 	field: String,
 	value: serde_json::Value,
+	expected_revision: Option<String>,
+	state: State<'_, Mutex<SupervisorState>>,
+) -> Result<ProfileDetail, String> {
+	update_profile_fields(profile_id, vec![ProfileFieldUpdate { field, value }], expected_revision, state)
+}
+
+#[derive(serde::Deserialize)]
+struct ProfileFieldUpdate {
+	field: String,
+	value: serde_json::Value,
+}
+
+#[tauri::command]
+fn update_profile_fields(
+	profile_id: String,
+	updates: Vec<ProfileFieldUpdate>,
+	expected_revision: Option<String>,
 	state: State<'_, Mutex<SupervisorState>>,
 ) -> Result<ProfileDetail, String> {
 	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
-	let mut doc = load_profile_document(&store)?;
-	{
-		let profile = doc
-			.profiles
-			.iter_mut()
-			.find(|profile| profile.id == profile_id)
-			.ok_or_else(|| format!("profile not found: {profile_id}"))?;
-		apply_profile_field(profile, &field, value)?;
-	}
-	let saved = store.save(doc).map_err(|e| format!("save profile document: {e}"))?;
-	push_document_to_matching_capturers(&state, &saved, &profile_id);
+	let saved = save_profile_updates_checked(&store, &profile_id, updates, expected_revision.as_deref())?;
+	let sync_report = push_document_to_matching_capturers(&state, &saved, &profile_id);
 	saved
 		.profiles
 		.iter()
 		.find(|profile| profile.id == profile_id)
-		.map(ProfileDetail::from)
+		.map(|profile| profile_detail_with_deletion_revision(profile, &saved))
+		.map(|mut detail| { detail.sync_report = Some(sync_report); detail })
 		.ok_or_else(|| format!("profile vanished after save: {profile_id}"))
+}
+
+/// Caller holds the supervisor profile lock; explicit store keeps tests isolated from user settings.
+#[cfg(test)]
+fn save_profile_updates(store: &CoreProfileDocumentStore, profile_id: &str, updates: Vec<ProfileFieldUpdate>) -> Result<CoreProfileDocument, String> {
+	save_profile_updates_checked(store, profile_id, updates, None)
+}
+
+fn save_profile_updates_checked(store: &CoreProfileDocumentStore, profile_id: &str, updates: Vec<ProfileFieldUpdate>, expected_revision: Option<&str>) -> Result<CoreProfileDocument, String> {
+	if updates.is_empty() {
+		return Err("no profile updates supplied".to_string());
+	}
+	store.update(|doc| {
+		let profile = doc
+			.profiles
+			.iter_mut()
+			.find(|profile| profile.id == profile_id)
+			.ok_or_else(|| anyhow::anyhow!("profile not found: {profile_id}"))?;
+		if expected_revision.is_some_and(|expected| expected != profile_revision(profile)) {
+			anyhow::bail!("profile_conflict: profile '{profile_id}' changed since it was read; reload and review the saved values before retrying");
+		}
+		apply_profile_updates(profile, updates).map_err(anyhow::Error::msg)
+	}).map_err(|e| format!("save profile document: {e}"))
 }
 
 /// `package.json` の version を取りたいが、Phase D 初期は Cargo.toml の version をそのまま返す。
@@ -2173,6 +2435,7 @@ pub struct WebcamDeviceDto {
 /// (空配列 / Error の判別を GUI 側で扱う)。
 #[tauri::command]
 fn enumerate_webcams(backend: String) -> Result<Vec<WebcamDeviceDto>, String> {
+    if cfg!(feature = "isolated-review") { return Err("Camera enumeration disabled in isolated review".into()); }
 	#[cfg(target_os = "windows")]
 	{
 		match backend.as_str() {
@@ -2211,6 +2474,7 @@ pub struct WebcamFormatDto {
 
 #[tauri::command]
 fn enumerate_webcam_formats(backend: String, device_id_or_name: String) -> Result<Vec<WebcamFormatDto>, String> {
+    if cfg!(feature = "isolated-review") { return Err("Camera format inspection disabled in isolated review".into()); }
 	#[cfg(target_os = "windows")]
 	{
 		match backend.as_str() {
@@ -2258,22 +2522,24 @@ fn enumerate_webcam_formats(backend: String, device_id_or_name: String) -> Resul
 
 /// 動作中の Capturer をすべて停止する。CloseRequested ハンドラと Tauri command の両方
 /// から呼ばれるので、`SupervisorState` への lock 取得とエラーハンドリングをここに集約。
-fn stop_all_in_state(state: &Mutex<SupervisorState>) {
+fn stop_all_in_state(state: &Mutex<SupervisorState>) -> Result<(), String> {
 	let (http_client, mut capturers) = {
-		let Ok(mut guard) = state.lock() else { return };
+		let mut guard = state.lock().map_err(|e| format!("Capturer state unavailable: {e}"))?;
 		(guard.http_client.clone(), std::mem::take(&mut guard.capturers))
 	};
+	let mut failures = Vec::new();
 	for (id, capturer) in &mut capturers {
 		if matches!(capturer.info.state, CapturerState::Exited | CapturerState::Crashed) {
 			continue;
 		}
 		if let Err(e) = stop_managed_capturer(*id, capturer, &http_client) {
 			tracing::warn!(target: "un_motion_supervisor", capturer_id = *id, error = %e, "stop_all: stop_managed_capturer failed");
+			failures.push(format!("Capturer {id}: {e}"));
 		}
 	}
-	if let Ok(mut guard) = state.lock() {
-		guard.capturers.append(&mut capturers);
-	}
+	// Retain handles even on failure so the user can retry the affected item.
+	state.lock().map_err(|e| format!("Capturer state unavailable: {e}"))?.capturers.append(&mut capturers);
+	if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) }
 }
 
 /// AppHandle から「Supervisor Console 終了時に Capturer を全停止すべきか」を読む。
@@ -2287,21 +2553,18 @@ fn should_stop_capturers_on_exit(app_handle: &tauri::AppHandle) -> bool {
 
 #[tauri::command]
 fn get_app_settings(state: State<'_, Mutex<AppRuntimeSettings>>) -> Result<AppRuntimeSettings, String> {
-	state
-		.lock()
-		.map(|s| s.clone())
-		.map_err(|_| "app settings state poisoned".to_string())
+	let settings = state.lock().map_err(|_| "app settings state poisoned".to_string())?;
+	ensure_app_settings_loaded(&settings)?;
+	Ok(settings.clone())
 }
 
 /// `stop_capturers_on_exit` を更新して TOML に永続化する。GUI Settings タブから呼ぶ。
 #[tauri::command]
 fn set_stop_capturers_on_exit(value: bool, state: State<'_, Mutex<AppRuntimeSettings>>) -> Result<AppRuntimeSettings, String> {
 	let mut guard = state.lock().map_err(|_| "app settings state poisoned".to_string())?;
-	guard.stop_capturers_on_exit = value;
-	let snapshot = guard.clone();
-	drop(guard);
-	write_app_settings(&snapshot)?;
-	Ok(snapshot)
+	let mut next = guard.clone();
+	next.stop_capturers_on_exit = value;
+	persist_app_settings(&mut guard, next, write_app_settings)
 }
 
 /// UN Avatar Supervisor の同名 command と同じく、Svelte 側から
@@ -2315,25 +2578,50 @@ fn sync_app_settings(
 	state: State<'_, Mutex<AppRuntimeSettings>>,
 ) -> Result<AppRuntimeSettings, String> {
 	normalize_app_settings(&mut settings);
-	let old_system_tray_enabled = state.lock().map(|s| s.system_tray_enabled).unwrap_or(false);
-	let old_locale = state.lock().map(|s| s.locale.clone()).unwrap_or_default();
 	let mut guard = state.lock().map_err(|_| "app settings state poisoned".to_string())?;
-	if old_system_tray_enabled != settings.system_tray_enabled {
-		if settings.system_tray_enabled {
-			setup_tray(&app).map_err(|e| format!("setup tray: {e}"))?;
-		} else {
-			drop(app.remove_tray_by_id(TRAY_ICON_ID));
-		}
-	}
-	// locale が変わったら rust-i18n のグローバル locale を即時切り替え、tray menu
-	// などネイティブ chrome 側の `t!()` 出力が次回参照時から新言語になる。Svelte 側は
-	// 自前で `locale.set()` → loader 再実行で別途切替する。
-	if old_locale != settings.locale && !settings.locale.is_empty() {
-		crate::i18n::apply_locale(&settings.locale);
-	}
-	write_app_settings(&settings)?;
-	*guard = settings.clone();
-	Ok(settings)
+	save_app_settings_with_effects(
+		&mut guard, settings, write_app_settings,
+		|old, next| {
+			let created = !old.system_tray_enabled && next.system_tray_enabled && app.tray_by_id(TRAY_ICON_ID).is_none();
+			if created { setup_tray(&app).map_err(|e| format!("setup tray: {e}"))?; }
+			Ok(created)
+		},
+		|created| { if created { drop(app.remove_tray_by_id(TRAY_ICON_ID)); } },
+		|old, next| {
+			if old.system_tray_enabled && !next.system_tray_enabled { drop(app.remove_tray_by_id(TRAY_ICON_ID)); }
+			if old.locale != next.locale && !next.locale.is_empty() { crate::i18n::apply_locale(&next.locale); }
+		},
+	)
+}
+
+fn persist_app_settings(
+	state: &mut AppRuntimeSettings,
+	next: AppRuntimeSettings,
+	write: impl FnOnce(&AppRuntimeSettings) -> Result<(), String>,
+) -> Result<AppRuntimeSettings, String> {
+	ensure_app_settings_loaded(state)?;
+	write(&next)?;
+	*state = next;
+	Ok(state.clone())
+}
+
+fn save_app_settings_with_effects(
+	state: &mut AppRuntimeSettings,
+	next: AppRuntimeSettings,
+	write: impl FnOnce(&AppRuntimeSettings) -> Result<(), String>,
+	prepare: impl FnOnce(&AppRuntimeSettings, &AppRuntimeSettings) -> Result<bool, String>,
+	rollback: impl FnOnce(bool),
+	apply: impl FnOnce(&AppRuntimeSettings, &AppRuntimeSettings),
+) -> Result<AppRuntimeSettings, String> {
+	ensure_app_settings_loaded(state)?;
+	let old = state.clone();
+	let prepared = prepare(&old, &next)?;
+	let saved = match persist_app_settings(state, next, write) {
+		Ok(saved) => saved,
+		Err(error) => { rollback(prepared); return Err(error); }
+	};
+	apply(&old, &saved);
+	Ok(saved)
 }
 
 fn normalize_app_settings(settings: &mut AppRuntimeSettings) {
@@ -2610,12 +2898,8 @@ fn attach_close_handler(window: WebviewWindow, app_handle: tauri::AppHandle) {
 				}
 				return;
 			}
-			if should_stop_capturers_on_exit(&app_handle)
-				&& let Some(state) = app_handle.try_state::<Mutex<SupervisorState>>()
-			{
-				tracing::info!(target: "un_motion_supervisor", "CloseRequested: stop_all_capturers (stop_capturers_on_exit=true)");
-				stop_all_in_state(&state);
-			}
+			api.prevent_close();
+			request_supervisor_close(&app_handle, close_gate::CloseIntent::Window);
 		}
 		WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
 			update_console_window_geometry_in_memory(&app_handle);
@@ -2724,30 +3008,94 @@ fn handle_tray_menu_event(app: &tauri::AppHandle, event: tauri::menu::MenuEvent)
 		"open" => show_main_window(app),
 		"stop_all" => {
 			if let Some(state) = app.try_state::<Mutex<SupervisorState>>() {
-				stop_all_in_state(&state);
+				if let Err(error) = stop_all_in_state(&state) {
+					tracing::warn!(%error, "Capturer stop-all failed");
+				}
 			}
 		}
 		"quit" => {
-			if let Some(state) = app.try_state::<Mutex<SupervisorState>>() {
-				stop_all_in_state(&state);
-			}
-			persist_console_window_geometry(app);
-			app.exit(0);
+			request_supervisor_close(app, close_gate::CloseIntent::Quit);
 		}
 		_ => {}
 	}
+}
+
+fn request_supervisor_close(app: &tauri::AppHandle, intent: close_gate::CloseIntent) {
+	let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else { return; };
+	let gate = app.state::<Mutex<close_gate::CloseGate>>();
+	let Some(id) = gate.lock().expect("close gate").request(intent) else { return; };
+	let script = include_str!("close_review.js").replace("__REQUEST_ID__", &id.to_string());
+	if let Err(error) = window.eval(script) {
+		let _ = gate.lock().expect("close gate").resolve(id, false);
+		tracing::error!(%error, "Close review could not be delivered; keeping application open");
+		show_main_window(app);
+	}
+}
+
+#[tauri::command]
+async fn resolve_supervisor_close(
+	app: tauri::AppHandle,
+	window: WebviewWindow,
+	request_id: u64,
+	allowed: bool,
+) -> Result<bool, String> {
+	if window.label() != MAIN_WINDOW_LABEL { return Err("Wrong close review window".into()); }
+	let intent = app.state::<Mutex<close_gate::CloseGate>>()
+		.lock().map_err(|e| e.to_string())?.resolve(request_id, allowed)
+		.map_err(str::to_owned)?;
+	let Some(intent) = intent else { show_main_window(&app); return Ok(false); };
+	// Only an approved request may stop Capturers. Window-close keeps its old
+	// configured policy; explicit tray Quit keeps its existing stop-all policy.
+	let stop = intent == close_gate::CloseIntent::Quit || should_stop_capturers_on_exit(&app);
+	{
+		// Capturer shutdown uses reqwest::blocking and waits for child exit.
+		// Running it on this async command's Tokio worker can panic before
+		// close completes. Keep the window alive until the blocking job ends.
+		let shutdown_app = app.clone();
+		let stopped = tauri::async_runtime::spawn_blocking(move || {
+			if let Some(state) = shutdown_app.try_state::<Mutex<SupervisorState>>() {
+				wait_for_capturer_launches(&state)?;
+				if stop { stop_all_in_state(&state) } else { Ok(()) }
+			} else { Err("Capturer state unavailable".into()) }
+		}).await.map_err(|error| error.to_string()).and_then(|result| result);
+		if let Err(error) = stopped {
+			if let Ok(mut state) = app.state::<Mutex<SupervisorState>>().lock() { state.closing = false; }
+			app.state::<Mutex<close_gate::CloseGate>>().lock()
+				.map_err(|e| e.to_string())?.completion_failed();
+			show_main_window(&app);
+			return Err(format!("Capturer shutdown did not complete: {error}"));
+		}
+	}
+	persist_console_window_geometry(&app);
+	if intent == close_gate::CloseIntent::Quit { app.exit(0); }
+	else if let Err(error) = window.destroy() {
+		if let Ok(mut state) = app.state::<Mutex<SupervisorState>>().lock() { state.closing = false; }
+		app.state::<Mutex<close_gate::CloseGate>>().lock()
+			.map_err(|e| e.to_string())?.completion_failed();
+		return Err(error.to_string());
+	}
+	Ok(true)
 }
 
 /// GUI から「即座に全停止」を呼ぶための Tauri command。
 /// `App.svelte` 左メニュー / Settings タブ等から手動で呼べるようにしておく。
 #[tauri::command]
 fn stop_all_capturers(state: State<'_, Mutex<SupervisorState>>) -> Result<(), String> {
-	stop_all_in_state(state.inner());
-	Ok(())
+	stop_all_in_state(state.inner())
 }
 
 /// Tauri アプリのエントリポイント。`main.rs` から呼ばれる。
 pub fn run() {
+    #[cfg(feature = "isolated-review")]
+    {
+        // Review binaries must never fall back to the normal user store.
+        let config = PathBuf::from(env::var_os("UN_MOTION_CONFIG_DIR").expect("isolated config required"));
+        assert!(config.is_absolute(), "isolated config must be absolute");
+        let config = config.canonicalize().expect("isolated config must exist");
+        assert_eq!(config.file_name().and_then(|s|s.to_str()), Some("config"));
+        let marker = config.parent().expect("isolated parent").join(".un-motion-review");
+        assert_eq!(fs::read_to_string(marker).expect("isolated marker required"), "isolated-native-ui-v1");
+    }
 	install_panic_log_hook("un-motion-supervisor");
 	// tracing 出力を有効化 (cargo run / 端末から起動したとき stdout に流す)。
 	// すでに別のレイヤが初期化済みなら try_init で握り潰す。
@@ -2757,8 +3105,10 @@ pub fn run() {
 	tauri::Builder::default()
 		.plugin(tauri_plugin_notification::init())
 		.manage(Mutex::new(SupervisorState::default()))
+		.manage(Mutex::new(close_gate::CloseGate::default()))
 		.manage(Mutex::new(load_app_settings()))
 		.invoke_handler(tauri::generate_handler![
+			resolve_supervisor_close,
 			list_capturers,
 			capturer_logs,
 			launch_capturer,
@@ -2771,14 +3121,18 @@ pub fn run() {
 			save_capturer_unmf_pose,
 			save_all_capturers_unmf_pose,
 			list_profiles,
+            resolve_profile_icon,
 			selected_profile_id,
 			set_selected_profile_id,
 			create_profile,
 			delete_profile,
+			list_deleted_profiles,
+			restore_deleted_profile,
 			duplicate_profile,
 			reorder_profiles,
 			get_profile_detail,
 			update_profile_field,
+			update_profile_fields,
 			get_app_settings,
 			set_stop_capturers_on_exit,
 			sync_app_settings,
@@ -2866,6 +3220,9 @@ fn install_panic_log_hook(process_name: &'static str) {
 #[serde(rename_all = "camelCase")]
 pub struct ProfileDetail {
 	pub id: String,
+	pub revision: String,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub deletion_revision: Option<String>,
 	pub name: String,
 	pub note: String,
 	pub path: String,
@@ -2873,6 +3230,24 @@ pub struct ProfileDetail {
 	pub group: String,
 	pub runtime: ProfileRuntimeView,
 	pub pipeline: ProfilePipelineView,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub sync_report: Option<ProfileSyncReport>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileSyncReport {
+	pub targets: Vec<CapturerSyncResult>,
+	pub discovery_error: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapturerSyncResult {
+	pub capturer_id: u32,
+	pub accepted: bool,
+	pub error: Option<String>,
+	pub status_code: Option<u16>,
 }
 
 #[derive(Clone, Serialize, Default)]
@@ -2990,6 +3365,18 @@ struct ProfileSummary {
 	pub pipeline_components: Option<ProfilePipelineComponents>,
 }
 
+fn profile_revision(profile: &CoreProfileDocumentProfile) -> String {
+	use sha2::{Digest, Sha256};
+	let encoded = serde_json::to_vec(profile).expect("profile serialization has string keys and serializable fields");
+	format!("{:x}", Sha256::digest(encoded))
+}
+
+fn profile_detail_with_deletion_revision(profile: &CoreProfileDocumentProfile, doc: &CoreProfileDocument) -> ProfileDetail {
+    let mut detail = ProfileDetail::from(profile);
+    detail.deletion_revision = profile_archive::ArchivedProfile::capture(doc, &profile.id).ok().map(|snapshot| snapshot.revision());
+    detail
+}
+
 impl From<&CoreProfileDocumentProfile> for ProfileDetail {
 	fn from(profile: &CoreProfileDocumentProfile) -> Self {
 		let mut runtime = profile.runtime_selection.as_ref().map(ProfileRuntimeView::from).unwrap_or_default();
@@ -3003,6 +3390,8 @@ impl From<&CoreProfileDocumentProfile> for ProfileDetail {
 			.unwrap_or_default();
 		Self {
 			id: profile.id.clone(),
+			revision: profile_revision(profile),
+			deletion_revision: None,
 			name: profile.name.clone(),
 			note: profile.note.clone(),
 			path: profile_path_for_id(&profile.id).display().to_string(),
@@ -3010,6 +3399,7 @@ impl From<&CoreProfileDocumentProfile> for ProfileDetail {
 			group: profile.group.clone(),
 			runtime,
 			pipeline,
+			sync_report: None,
 		}
 	}
 }
@@ -3211,6 +3601,15 @@ fn next_profile_name(doc: &CoreProfileDocument, base: &str) -> String {
 
 /// Profile の個別フィールドを更新する。受け取った `value` が `null` の場合は
 /// `Option::None` を入れて runtime 既定値に戻す合図とする。
+fn apply_profile_updates(profile: &mut CoreProfileDocumentProfile, updates: Vec<ProfileFieldUpdate>) -> Result<(), String> {
+	let mut next = profile.clone();
+	for update in updates {
+		apply_profile_field(&mut next, &update.field, update.value)?;
+	}
+	*profile = next;
+	Ok(())
+}
+
 fn apply_profile_field(profile: &mut CoreProfileDocumentProfile, field: &str, value: serde_json::Value) -> Result<(), String> {
 	match field {
 		"name" => {
@@ -3502,9 +3901,11 @@ fn opt_f32(value: &serde_json::Value, field: &str) -> Result<Option<f32>, String
 /// 編集された profile を実行しているプロセスだけに同期する。
 ///
 /// 失敗は警告のみで握りつぶす (再起動すれば user profile store から復元できるため致命的でない)。
-fn push_document_to_matching_capturers(state: &Mutex<SupervisorState>, doc: &CoreProfileDocument, profile_id: &str) {
+fn push_document_to_matching_capturers(state: &Mutex<SupervisorState>, doc: &CoreProfileDocument, profile_id: &str) -> ProfileSyncReport {
 	let (http_client, targets) = {
-		let Ok(state) = state.lock() else { return };
+		let Ok(state) = state.lock() else {
+			return ProfileSyncReport { targets: vec![], discovery_error: Some("capturer registry lock failed".into()) };
+		};
 		let targets = state
 			.capturers
 			.values()
@@ -3515,13 +3916,28 @@ fn push_document_to_matching_capturers(state: &Mutex<SupervisorState>, doc: &Cor
 			.collect::<Vec<_>>();
 		(state.http_client.clone(), targets)
 	};
-	let body = serde_json::json!({ "selection": doc });
+	let body = serde_json::json!({ "selection": doc, "expectedProfileId": profile_id });
+	let mut results = Vec::new();
 	for (id, bind_addr) in targets {
 		let url = format!("http://{bind_addr}/api/profiles/document/sync");
-		if let Err(error) = http_client.put(&url).json(&body).send() {
+		let result = http_client.put(&url).json(&body).send().map(|response| response.status()).map_err(|error| error.to_string());
+		let outcome = capturer_sync_result(id, result);
+		if let Some(error) = &outcome.error {
 			tracing::warn!(id, %error, "sync profile document via capturer failed");
 		}
+		results.push(outcome);
 	}
+	ProfileSyncReport { targets: results, discovery_error: None }
+}
+
+fn capturer_sync_result(id: u32, status: Result<reqwest::StatusCode, String>) -> CapturerSyncResult {
+	let status_code = status.as_ref().ok().map(|status| status.as_u16());
+	let error = match status {
+		Ok(status) if status.is_success() => None,
+		Ok(status) => Some(format!("HTTP {status}")),
+		Err(error) => Some(error),
+	};
+	CapturerSyncResult { capturer_id: id, accepted: error.is_none(), error, status_code }
 }
 
 /// 対象 Capturer から HTTP 経由で active_profile_id を取得する。
@@ -3933,6 +4349,9 @@ fn capturer_command(
 		command.arg("--with-tray=true");
 		return Ok(command);
 	}
+	if !cfg!(debug_assertions) {
+		return Err(format!("Capturerが見つかりません（{}）。配布ZIP全体を展開し、un-motion-capturer.exeをSupervisorと同じフォルダーへ戻してください。", exe.display()));
+	}
 	let repo = repo_root();
 	tracing::info!(
 		cwd = %repo.display(),
@@ -3958,36 +4377,48 @@ fn capturer_command(
 
 /// Capturer プロセスを spawn するときの cwd を決める。
 /// 隣接 exe の親ディレクトリに `models/` があればそれ (release zip 配布レイアウト)、
-/// なければ `repo_root()` (cargo run 開発レイアウト) を返す。
+/// runtimes内のsidecarなら親の配布フォルダーも確認する。
+/// debugビルドのみ、モデルがなければ開発workspaceへフォールバックする。
 fn capturer_working_directory(capturer_exe: &Path) -> PathBuf {
+	let workspace = cfg!(debug_assertions).then(repo_root);
+	capturer_working_directory_for(capturer_exe, workspace.as_deref())
+}
+
+fn capturer_working_directory_for(capturer_exe: &Path, development_workspace: Option<&Path>) -> PathBuf {
 	if let Some(dir) = capturer_exe.parent()
 		&& dir.join("models").is_dir()
 	{
 		return dir.to_path_buf();
 	}
-	repo_root()
+	let dir = capturer_exe.parent().unwrap_or_else(|| Path::new("."));
+	let package = if dir.file_name().is_some_and(|name| name == "runtimes") {
+		dir.parent().unwrap_or(dir)
+	} else { dir };
+	if package.join("models").is_dir() { return package.to_path_buf(); }
+	development_workspace.unwrap_or(package).to_path_buf()
 }
 
 fn capturer_executable_path() -> PathBuf {
 	capturer_executable_candidates()
 		.into_iter()
 		.find(|path| path.is_file())
-		.unwrap_or_else(|| repo_root().join("target").join("debug").join(exe_name("un-motion-capturer")))
+		.unwrap_or_else(|| env::current_exe().ok().and_then(|exe| exe.parent().map(|dir| dir.join(exe_name("un-motion-capturer")))).unwrap_or_else(|| PathBuf::from(exe_name("un-motion-capturer"))))
 }
 
 fn capturer_executable_candidates() -> Vec<PathBuf> {
 	let current = std::env::current_exe().ok();
+	let workspace = cfg!(debug_assertions).then(repo_root);
+	capturer_candidates_for(current.as_deref(), workspace.as_deref())
+}
+
+fn capturer_candidates_for(current: Option<&Path>, development_workspace: Option<&Path>) -> Vec<PathBuf> {
 	let mut candidates = Vec::new();
-	if let Some(dir) = current.as_ref().and_then(|path| path.parent()) {
+	if let Some(dir) = current.and_then(Path::parent) {
 		candidates.extend(capturer_candidates_from_dir(dir));
 	}
-	let repo = repo_root();
-	if cfg!(debug_assertions) {
+	if let Some(repo) = development_workspace {
 		candidates.extend(capturer_candidates_from_dir(&repo.join("target").join("debug")));
 		candidates.extend(capturer_candidates_from_dir(&repo.join("target").join("release")));
-	} else {
-		candidates.extend(capturer_candidates_from_dir(&repo.join("target").join("release")));
-		candidates.extend(capturer_candidates_from_dir(&repo.join("target").join("debug")));
 	}
 	candidates
 }
@@ -4043,7 +4474,12 @@ fn exe_suffix() -> &'static str {
 }
 
 fn supervisor_logs_dir() -> PathBuf {
-	repo_root().join("target").join("tmp").join("supervisor-logs")
+	let development = (cfg!(debug_assertions) && !cfg!(feature = "isolated-review") && env::var_os("UN_MOTION_CONFIG_DIR").is_none()).then(repo_root);
+	supervisor_logs_dir_for(&app_config_dir(), development.as_deref())
+}
+
+fn supervisor_logs_dir_for(config: &Path, development: Option<&Path>) -> PathBuf {
+	development.map(|repo| repo.join("target/tmp/supervisor-logs")).unwrap_or_else(|| config.join("logs"))
 }
 
 #[tauri::command]
@@ -4054,16 +4490,42 @@ fn save_supervisor_logs(content: String, file_prefix: String) -> Result<String, 
 		.duration_since(std::time::UNIX_EPOCH)
 		.map(|d| d.as_secs())
 		.unwrap_or(0);
-	let prefix: String = file_prefix.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
-	let prefix = if prefix.is_empty() { "supervisor".to_string() } else { prefix };
-	let path = dir.join(format!("{prefix}-{ts}.txt"));
-	fs::write(&path, content.as_bytes()).map_err(|e| format!("write logs: {e}"))?;
+	let path = log_export::save(&dir, &content, &file_prefix, ts)?;
 	Ok(path.display().to_string())
 }
 
 #[tauri::command]
+fn resolve_profile_icon(profile_id: String, app: tauri::AppHandle) -> Result<String, String> {
+    let profile = get_profile_detail(profile_id)?;
+    let raw = profile.icon_path.ok_or("profile has no icon")?;
+    let path = PathBuf::from(raw);
+    let path = if path.is_absolute() { path } else { profile_asset_root().join(path) };
+    let resolved = validated_profile_icon(&path)?;
+    app.asset_protocol_scope().allow_file(&resolved).map_err(|e| format!("allow selected icon: {e}"))?;
+    Ok(resolved.to_string_lossy().to_string())
+}
+
+fn validated_profile_icon(path: &Path) -> Result<PathBuf, String> {
+    let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
+    if !["png", "jpg", "jpeg", "ico", "webp"].contains(&extension.as_str()) {
+        return Err("unsupported profile icon format".into());
+    }
+    let resolved = path.canonicalize().map_err(|e| format!("read profile icon: {e}"))?;
+    if !resolved.is_file() { return Err("profile icon is not a file".into()); }
+    Ok(resolved)
+}
+
+fn profile_asset_root() -> PathBuf {
+    if cfg!(debug_assertions) { return repo_root(); }
+    env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(app_config_dir)
+}
+
+// Native modal dialogs must not block WebView IPC dispatch.
+#[tauri::command(async)]
 fn pick_file_path(kind: String) -> Result<Option<String>, String> {
-	let mut dialog = rfd::FileDialog::new().set_directory(repo_root());
+	static PICKER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+	let _picker = PICKER.try_lock().map_err(|_| "A file picker is already open".to_string())?;
+	let mut dialog = rfd::FileDialog::new().set_directory(profile_asset_root());
 	dialog = match kind.as_str() {
 		"icon" => dialog
 			.add_filter("Image", &["png", "jpg", "jpeg", "ico", "webp"])
@@ -4090,8 +4552,7 @@ fn pick_file_path(kind: String) -> Result<Option<String>, String> {
 }
 
 fn path_for_profile(path: &Path) -> String {
-	let repo = repo_root();
-	let relative = path.strip_prefix(&repo).unwrap_or(path);
+	let relative = path;
 	relative.to_string_lossy().replace('\\', "/")
 }
 
@@ -4161,8 +4622,93 @@ fn exe_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recording_postsave_failure_preserves_primary_and_reports_its_path() {
+        let root = std::env::temp_dir().join(format!("unm-recording-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("pose 日本語.jsonl");
+        let sidecar = root.join("pose 日本語.jsonl.analysis.jsonl");
+        fs::create_dir(&sidecar).unwrap();
+        let content = "{}\n";
+        let error = super::write_snapshot_recording(&path, content, true, |_| panic!("Remember must not run after analysis failure")).unwrap_err();
+        assert_eq!(fs::read_to_string(&path).unwrap(), content);
+        assert!(error.contains(&path.display().to_string()));
+        assert!(error.contains("Analysis sidecar could not be saved"));
+        let error = super::write_snapshot_recording(&path, content, false, |_| Err("settings denied".into())).unwrap_err();
+        assert_eq!(fs::read_to_string(&path).unwrap(), content);
+        assert!(error.contains("Motion recording saved to"));
+        assert!(error.contains("settings denied"));
+        let error = super::write_snapshot_recording(&sidecar, content, false, |_| panic!("Primary write failed")).unwrap_err();
+        assert!(error.starts_with("write UNMotionFrame JSONL:"));
+        assert!(!error.contains("recording saved"));
+        assert!(root.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn selected_profile_icon_requires_existing_supported_file() {
+        let root = std::env::temp_dir().join(format!("unm-icon-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir(&root).unwrap();
+        let image = root.join("selected image 日本語.PNG");
+        fs::write(&image, b"fixture").unwrap();
+        assert_eq!(super::validated_profile_icon(&image).unwrap(), image.canonicalize().unwrap());
+        assert!(super::validated_profile_icon(&root.join("missing.png")).is_err());
+        let document = root.join("settings.toml");
+        fs::write(&document, b"private configuration").unwrap();
+        assert!(super::validated_profile_icon(&document).is_err());
+        let directory = root.join("folder.png");
+        fs::create_dir(&directory).unwrap();
+        assert!(super::validated_profile_icon(&directory).is_err());
+        assert!(root.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+	#[test]
+	fn distributed_logs_use_the_selected_user_store() {
+		let config = std::path::Path::new("isolated user settings");
+		assert_eq!(super::supervisor_logs_dir_for(config, None), config.join("logs"));
+		assert_eq!(super::supervisor_logs_dir_for(config, Some(std::path::Path::new("workspace"))), std::path::Path::new("workspace/target/tmp/supervisor-logs"));
+	}
+
 	use super::*;
 	use serde_json::json;
+
+	#[test]
+	fn distributed_capturer_paths_stay_inside_the_package() {
+		let root = env::temp_dir().join(format!("unm-runtime-paths-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+		let package = root.join("package");
+		let workspace = root.join("developer");
+		fs::create_dir_all(package.join("runtimes")).unwrap();
+		fs::create_dir_all(workspace.join("target/release")).unwrap();
+		let developer_exe = workspace.join("target/release").join(exe_name("un-motion-capturer"));
+		fs::write(&developer_exe, b"not a runnable binary").unwrap();
+		let supervisor = package.join(exe_name("un-motion-supervisor"));
+		let packaged = capturer_candidates_for(Some(&supervisor), None);
+		assert!(packaged.iter().all(|path| path.starts_with(&package)));
+		assert!(!packaged.iter().any(|path| path.is_file()));
+		assert!(capturer_candidates_for(Some(&supervisor), Some(&workspace)).contains(&developer_exe));
+		let sidecar = package.join("runtimes").join(exe_name("un-motion-capturer"));
+		assert_eq!(capturer_working_directory_for(&sidecar, None), package);
+		assert_eq!(capturer_working_directory_for(&sidecar, Some(&workspace)), workspace);
+		fs::create_dir(package.join("models")).unwrap();
+		assert_eq!(capturer_working_directory_for(&sidecar, Some(&workspace)), package);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn template_lookup_excludes_developer_profiles_from_distribution() {
+		let root = env::temp_dir().join(format!("unm-template-lookup-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+		let binary = root.join("binary");
+		let workspace = root.join("developer");
+		fs::create_dir_all(&binary).unwrap();
+		fs::create_dir_all(workspace.join("profiles")).unwrap();
+		fs::write(workspace.join("profiles/private.toml"), "private developer configuration").unwrap();
+		assert_eq!(find_template_profiles_dir(Some(&binary), None), None);
+		assert_eq!(find_template_profiles_dir(Some(&binary), Some(&workspace)), Some(workspace.join("profiles")));
+		fs::create_dir(binary.join("profiles")).unwrap();
+		assert_eq!(find_template_profiles_dir(Some(&binary), None), Some(binary.join("profiles")));
+		assert_eq!(find_template_profiles_dir(Some(&binary), Some(&workspace)), Some(binary.join("profiles")));
+		fs::remove_dir_all(&root).unwrap();
+	}
 
 	#[test]
 	fn capturer_bind_conflicts_are_retryable() {
@@ -4262,6 +4808,34 @@ mod tests {
 	}
 
 	#[test]
+	fn launch_resolves_default_before_reserving_and_rejects_deleted_target() {
+		let mut doc = CoreProfileDocument::default();
+		doc.profiles = vec![make_profile("a", "A"), make_profile("b", "B")];
+		doc.selected_profile_id = "b".into();
+		assert_eq!(resolve_launch_profile(&doc, None).unwrap(), "b");
+		assert_eq!(resolve_launch_profile(&doc, Some(" ")).unwrap(), "b");
+		assert_eq!(resolve_launch_profile(&doc, Some(" a ")).unwrap(), "a");
+		doc.profiles.retain(|profile| profile.id != "a");
+		assert!(resolve_launch_profile(&doc, Some("a")).is_err());
+		doc.profiles.clear();
+		assert!(resolve_launch_profile(&doc, None).is_err());
+	}
+
+	#[test]
+	fn deletion_detects_launch_reservation_and_release_without_blocking_other_profiles() {
+		let state = Mutex::new(SupervisorState::new());
+		state.lock().unwrap().launching_profiles.insert(Some("a".into()));
+		{
+			let _reservation = CapturerLaunchReservation { state: &state, profile_id: Some("a".into()) };
+			assert!(profile_is_in_use(&state.lock().unwrap(), "a"));
+			assert!(!profile_is_in_use(&state.lock().unwrap(), "b"));
+		}
+		assert!(!profile_is_in_use(&state.lock().unwrap(), "a"));
+		state.lock().unwrap().launching_profiles.insert(None);
+		assert!(profile_is_in_use(&state.lock().unwrap(), "a"));
+	}
+
+	#[test]
 	fn capturer_launch_reservation_is_released_on_scope_exit() {
 		let state = Mutex::new(SupervisorState::new());
 		let profile_id = Some("profile-a".to_string());
@@ -4292,6 +4866,136 @@ mod tests {
 	}
 
 	#[test]
+	fn duplicate_profile_keeps_owned_sources_independent_through_save_reload() {
+		let root = std::env::temp_dir().join(format!("unm-duplicate-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+		let store = CoreProfileDocumentStore::from_root(&root);
+		let mut doc = CoreProfileDocument::default();
+		doc.profiles = vec![make_profile("a", "Alpha"), make_profile("b", "Beta")];
+		doc.profiles[0].runtime_selection = Some(new_profile_runtime_defaults());
+		doc.selected_profile_id = "b".into();
+		doc.profile_sources = vec![un_motion_profile_schema::CoreProfileDocumentSource {
+			id: "alpha-copy-source-1".into(), profile_id: "a".into(), kind: "vmc-osc".into(), label: "Phone".into(),
+			protocol: Some("udp".into()), host: Some("127.0.0.1".into()), port: Some(39539), mirror_correction_enabled: true,
+		}];
+		store.save(doc).unwrap();
+		let original = store.load().unwrap();
+		let new_id = duplicate_profile_in_store(&store, "a").unwrap().id;
+		let mut loaded = store.load().unwrap();
+		assert_eq!(loaded.profile_sources.len(), 2);
+		assert_ne!(loaded.profile_sources[0].id, loaded.profile_sources[1].id);
+		assert_eq!(loaded.selected_profile_id, "b");
+		for profile in &original.profiles { assert_eq!(loaded.profiles.iter().find(|p| p.id == profile.id), Some(profile)); }
+		let copied = loaded.profiles.iter().find(|p| p.id == new_id).unwrap();
+		assert_eq!(copied.runtime_selection, original.profiles.iter().find(|p| p.id == "a").unwrap().runtime_selection);
+		let source = loaded.profile_sources.iter_mut().find(|s| s.profile_id == new_id).unwrap();
+		let mut comparable = source.clone(); comparable.id = original.profile_sources[0].id.clone(); comparable.profile_id = "a".into();
+		assert_eq!(comparable, original.profile_sources[0]);
+		source.label = "Edited copy".into();
+		store.save(loaded).unwrap();
+		assert_eq!(store.load().unwrap().profile_sources.iter().find(|s| s.profile_id == "a"), original.profile_sources.first());
+		let mut loaded = store.load().unwrap(); let before = loaded.clone();
+		assert!(duplicate_profile_document(&mut loaded, "missing").is_err()); assert_eq!(loaded, before);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn reorder_rejects_changed_membership_without_writing_files() {
+		let root = std::env::temp_dir().join(format!("unm-reorder-conflict-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+		let store = CoreProfileDocumentStore::from_root(&root);
+		store.save(CoreProfileDocument {
+			selected_profile_id: "b".into(),
+			profiles: vec![make_profile("a", "Alpha"), make_profile("b", "Beta")],
+			..Default::default()
+		}).unwrap();
+		let snapshot = || {
+			let mut files = std::collections::BTreeMap::new();
+			files.insert(store.conf_path().to_path_buf(), fs::read(store.conf_path()).unwrap());
+			for entry in fs::read_dir(store.profiles_dir()).unwrap() {
+				let path = entry.unwrap().path();
+				if path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
+					files.insert(path.clone(), fs::read(path).unwrap());
+				}
+			}
+			files
+		};
+		let before = snapshot();
+		for ids in [vec!["a"], vec!["a", "b", "deleted"], vec!["a", "a"], vec!["a", "unknown"]] {
+			let ids: Vec<String> = ids.into_iter().map(str::to_owned).collect();
+			assert!(reorder_profiles_in_store(&store, &ids, &["a".into(), "b".into()]).unwrap_err().contains("Profile list changed"));
+			assert_eq!(snapshot(), before, "Rejected order must leave all profile files unchanged");
+		}
+		let original = store.load().unwrap();
+		reorder_profiles_in_store(&store, &["b".into(), "a".into()], &["a".into(), "b".into()]).unwrap();
+		let saved = CoreProfileDocumentStore::from_root(&root).load().unwrap();
+		assert_eq!(saved.selected_profile_id, "b");
+		assert_eq!(saved.profiles, vec![original.profiles[1].clone(), original.profiles[0].clone()]);
+		assert_eq!(saved.profile_sources, original.profile_sources);
+		let after = snapshot();
+		assert!(reorder_profiles_in_store(&store, &["a".into(), "b".into()], &["a".into(), "b".into()]).unwrap_err().contains("Profile list changed"));
+		assert_eq!(snapshot(), after, "Stale order must not overwrite a newer order");
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn concurrent_duplicate_and_reorder_keep_all_profiles() {
+		let root = std::env::temp_dir().join(format!("unm-reorder-race-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+		let store = CoreProfileDocumentStore::from_root(&root);
+		let mut doc = CoreProfileDocument::default();
+		doc.profiles = vec![make_profile("a", "Alpha"), make_profile("b", "Beta")];
+		doc.selected_profile_id = "a".into();
+		store.save(doc).unwrap();
+		let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+		let copy_store = store.clone();
+		let copy_barrier = barrier.clone();
+		let worker = std::thread::spawn(move || {
+			copy_barrier.wait();
+			duplicate_profile_in_store(&copy_store, "a").unwrap().id
+		});
+		barrier.wait();
+		let reorder = reorder_profiles_in_store(&store, &["b".into(), "a".into()], &["a".into(), "b".into()]);
+		let copy_id = worker.join().unwrap();
+		let saved = store.load().unwrap();
+		assert_eq!(saved.profiles.len(), 3);
+		if reorder.is_ok() {
+			assert_eq!(saved.profiles[0].id, "b");
+			assert_eq!(saved.profiles[1].id, "a");
+		} else {
+			assert!(reorder.unwrap_err().contains("Profile list changed"));
+			assert_eq!(saved.profiles[0].id, "a");
+			assert_eq!(saved.profiles[1].id, "b");
+		}
+		assert_eq!(saved.profiles[2].id, copy_id);
+		assert_eq!(saved.selected_profile_id, "a");
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn concurrent_creation_and_selected_profile_validation_preserve_store() {
+		let root = std::env::temp_dir().join(format!("unm-create-race-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+		let store = CoreProfileDocumentStore::from_root(&root);
+		store.save(CoreProfileDocument::default()).unwrap();
+		let original_count = store.load().unwrap().profiles.len();
+		let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+		let workers: Vec<_> = (0..2).map(|_| {
+			let store = store.clone(); let barrier = barrier.clone();
+			std::thread::spawn(move || { barrier.wait(); create_profile_in_store(&store, "Same Name".into()).unwrap().id })
+		}).collect();
+		let ids: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+		assert_ne!(ids[0], ids[1]);
+		let saved = store.load().unwrap();
+		assert_eq!(saved.profiles.len(), original_count + 2);
+		assert!(ids.contains(&saved.selected_profile_id));
+		assert!(set_selected_profile_in_store(&store, Some("missing".into())).is_err());
+		assert_eq!(store.load().unwrap(), saved);
+		set_selected_profile_in_store(&store, Some(ids[0].clone())).unwrap();
+		let selected = store.load().unwrap();
+		assert_eq!(selected.selected_profile_id, ids[0]);
+		assert_eq!(selected.profiles, saved.profiles);
+		assert_eq!(selected.profile_sources, saved.profile_sources);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
 	fn next_profile_id_slugifies_and_avoids_duplicates() {
 		let doc = CoreProfileDocument {
 			profiles: vec![make_profile("alpha", "Alpha"), make_profile("alpha-2", "Alpha 2")],
@@ -4309,6 +5013,58 @@ mod tests {
 		};
 		let id = next_profile_id(&doc, "！？");
 		assert_eq!(id, "profile-2");
+	}
+
+	fn native_preview_save_contract() -> Vec<serde_json::Value> {
+		let cases: Vec<serde_json::Value> = serde_json::from_str(include_str!("../../scripts/preview-save-cases.json")).unwrap();
+		let mut results = Vec::new();
+		for case in cases {
+			let mut profile = make_profile("contract", "New Profile");
+			profile.runtime_selection = Some(new_profile_runtime_defaults());
+			apply_profile_field(&mut profile, case["field"].as_str().unwrap(), case["value"].clone()).unwrap();
+			let doc = un_motion_profile_schema::normalize_profile_document(CoreProfileDocument { profiles: vec![profile], ..CoreProfileDocument::default() });
+			let profile = &doc.profiles[0];
+			let mut settings = profile.runtime_selection.clone().unwrap_or_default();
+			let lan_enabled = settings.zenoh_lan_enabled;
+			// Avoid primary_lan_ipv4/socket inspection in this pure contract export.
+			settings.zenoh_lan_enabled = Some(false);
+			let mut runtime = serde_json::to_value(ProfileRuntimeView::from(&settings)).unwrap();
+			runtime["zenohLanEnabled"] = serde_json::json!(lan_enabled);
+			runtime.as_object_mut().unwrap().remove("zenohLanConnectAddress");
+			let pipeline = profile.pipeline_components.as_ref().map(ProfilePipelineView::from).unwrap_or_default();
+			results.push(serde_json::json!({"input":case,"expected":{"name":profile.name,"note":profile.note,"group":profile.group,"iconPath":profile.icon_path,"runtime":runtime,"pipeline":pipeline}}));
+		}
+		results
+	}
+
+	#[test]
+	#[ignore = "explicit native save contract export without devices or user store"]
+	fn export_preview_save_contract() {
+		println!("UN_SAVE_CONTRACT:{}", serde_json::to_string(&native_preview_save_contract()).unwrap());
+	}
+
+	#[test]
+	fn preview_save_contract_matches_current_native_handlers() {
+		let current = native_preview_save_contract();
+		let current: serde_json::Value = serde_json::from_str(&serde_json::to_string(&current).unwrap()).unwrap();
+		let saved: serde_json::Value = serde_json::from_str(include_str!("../../scripts/preview-save-native-contract.json")).unwrap();
+		assert_eq!(saved, current, "Regenerate and compare preview behavior after native save changes");
+	}
+
+	#[test]
+	#[ignore = "explicit preview fixture generation; no user settings are read or written"]
+	fn export_new_profile_preview_defaults() {
+		let value = serde_json::json!({"runtime": ProfileRuntimeView::from(&new_profile_runtime_defaults()), "pipeline": ProfilePipelineView::default()});
+		println!("UN_PREVIEW_DEFAULTS:{}", serde_json::to_string(&value).unwrap());
+	}
+
+	#[test]
+	fn new_profile_preview_defaults_match_native() {
+		let expected = serde_json::json!({"runtime": ProfileRuntimeView::from(&new_profile_runtime_defaults()), "pipeline": ProfilePipelineView::default()});
+		// Compare the serialized API representation, including its float parsing semantics.
+		let expected: serde_json::Value = serde_json::from_str(&serde_json::to_string(&expected).unwrap()).unwrap();
+		let fixture: serde_json::Value = serde_json::from_str(include_str!("../../src/lib/newProfileDefaults.json")).unwrap();
+		assert_eq!(fixture, expected, "Regenerate the isolated preview defaults from the native implementation");
 	}
 
 	#[test]
@@ -4360,13 +5116,126 @@ mod tests {
 		user_document.profiles[1].note = "current waidayo".to_string();
 
 		let mut capturer_document = user_document.clone();
-		capturer_document.profiles[0].note = "updated global".to_string();
+		capturer_document.profiles[0].note = "stale global".to_string();
+		capturer_document.profiles[0].runtime_selection = Some(ProfileRuntimeSettings {
+			modifier: Some(ProfileModifierSettings { neutral_calibration_enabled: Some(false), ..Default::default() }),
+			..Default::default()
+		});
 		capturer_document.profiles[1].note = "stale waidayo from capturer".to_string();
 
-		let merged = merge_profile_from_capturer_selection("global", user_document, capturer_document).expect("merge");
+		let merged = merge_profile_from_capturer_selection("global", user_document, capturer_document, CapturerProfileResult::NeutralCalibration).expect("merge");
 
-		assert_eq!(merged.profiles[0].note, "updated global");
+		assert_eq!(merged.profiles[0].note, "");
+		assert_eq!(merged.profiles[0].runtime_selection.as_ref().unwrap().modifier.as_ref().unwrap().neutral_calibration_enabled, Some(false));
 		assert_eq!(merged.profiles[1].note, "current waidayo");
+	}
+
+	#[test]
+	fn capturer_calibration_merge_changes_only_requested_result_fields() {
+		let mut current = CoreProfileDocument::default();
+		current.profiles = vec![make_profile("a", "Current name")];
+		current.profiles[0].runtime_selection = Some(new_profile_runtime_defaults());
+		let mut incoming = current.clone();
+		incoming.profiles[0].name = "Stale name".into();
+		let runtime = incoming.profiles[0].runtime_selection.as_mut().unwrap();
+		runtime.zenoh_enabled = Some(false);
+		let modifier = runtime.modifier.as_mut().unwrap();
+		modifier.hands_enabled = Some(false);
+		modifier.neutral_calibration_enabled = Some(true);
+		modifier.neutral_calibration_pose = Some("u".into());
+		modifier.face_pose_model = Some(un_motion_profile_schema::profile_settings::ProfileFacePoseModelSettings {
+			enabled: Some(true), sample_count: Some(90), ..Default::default()
+		});
+		for result in [CapturerProfileResult::NeutralCalibration, CapturerProfileResult::FacePoseModel] {
+			let mut expected = current.clone();
+			let target = expected.profiles[0].runtime_selection.as_mut().unwrap().modifier.as_mut().unwrap();
+			match result {
+				CapturerProfileResult::NeutralCalibration => {
+					target.neutral_calibration_enabled = Some(true);
+					target.neutral_calibration_pose = Some("u".into());
+				}
+				CapturerProfileResult::FacePoseModel => {
+					target.face_pose_model = incoming.profiles[0].runtime_selection.as_ref().unwrap().modifier.as_ref().unwrap().face_pose_model.clone();
+				}
+			}
+			let merged = merge_profile_from_capturer_selection("a", current.clone(), incoming.clone(), result).unwrap();
+			assert_eq!(merged, expected);
+		}
+		incoming.profiles[0].runtime_selection = None;
+		assert!(merge_profile_from_capturer_selection("a", current, incoming, CapturerProfileResult::NeutralCalibration).is_err());
+	}
+
+	#[test]
+	fn capturer_result_rejects_same_field_change_during_measurement() {
+		for result in [CapturerProfileResult::NeutralCalibration, CapturerProfileResult::FacePoseModel] {
+			let mut initial = CoreProfileDocument::default();
+			initial.profiles = vec![make_profile("a", "Alpha")];
+			initial.profiles[0].runtime_selection = Some(new_profile_runtime_defaults());
+			let incoming = initial.clone();
+			let mut latest = initial.clone();
+			let modifier = latest.profiles[0].runtime_selection.as_mut().unwrap().modifier.as_mut().unwrap();
+			match result {
+				CapturerProfileResult::NeutralCalibration => modifier.neutral_calibration_pose = Some("newer-choice".into()),
+				CapturerProfileResult::FacePoseModel => modifier.face_pose_model = Some(un_motion_profile_schema::profile_settings::ProfileFacePoseModelSettings { enabled: Some(true), sample_count: Some(37), ..Default::default() }),
+			}
+			let expected = capturer_result_fields(&initial, "a", result).unwrap();
+			let outcome = merge_capturer_result_checked("a", latest, incoming, result, &expected);
+			assert!(outcome.is_err(), "A measurement must not replace a newer edit to the same calibration fields");
+		}
+	}
+
+	#[test]
+	fn capturer_result_allows_unrelated_changes_and_preserves_them() {
+		for result in [CapturerProfileResult::NeutralCalibration, CapturerProfileResult::FacePoseModel] {
+			let mut initial = CoreProfileDocument::default();
+			initial.profiles = vec![make_profile("a", "Alpha"), make_profile("b", "Beta")];
+			initial.profiles[0].runtime_selection = Some(new_profile_runtime_defaults());
+			let expected = capturer_result_fields(&initial, "a", result).unwrap();
+			let mut latest = initial.clone();
+			latest.profiles[0].note = "newer note".into();
+			latest.profiles[1].name = "newer other profile".into();
+			let merged = merge_capturer_result_checked("a", latest.clone(), initial, result, &expected).unwrap();
+			assert_eq!(merged, latest);
+		}
+	}
+
+	#[test]
+	fn capturer_result_store_reopens_after_conflict_and_accepts_unrelated_edits() {
+		for result in [CapturerProfileResult::NeutralCalibration, CapturerProfileResult::FacePoseModel] {
+			let root = std::env::temp_dir().join(format!("unm-calibration-conflict-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+			let store = CoreProfileDocumentStore::from_root(&root);
+			let mut initial = CoreProfileDocument::default();
+			initial.profiles = vec![make_profile("a", "Alpha"), make_profile("b", "Beta")];
+			initial.selected_profile_id = "b".into();
+			initial.profiles[0].runtime_selection = Some(new_profile_runtime_defaults());
+			store.save(initial).unwrap();
+			let initial = store.load().unwrap();
+			let expected = capturer_result_fields(&initial, "a", result).unwrap();
+			let mut measurement = initial.clone();
+			let modifier = measurement.profiles.iter_mut().find(|p| p.id == "a").unwrap().runtime_selection.as_mut().unwrap().modifier.as_mut().unwrap();
+			match result {
+				CapturerProfileResult::NeutralCalibration => modifier.neutral_calibration_pose = Some("u".into()),
+				CapturerProfileResult::FacePoseModel => modifier.face_pose_model = Some(un_motion_profile_schema::profile_settings::ProfileFacePoseModelSettings { enabled: Some(true), sample_count: Some(37), ..Default::default() }),
+			}
+			assert_ne!(capturer_result_fields(&measurement, "a", result).unwrap(), expected);
+			// Another writer commits while this measurement is outstanding.
+			store.save(measurement.clone()).unwrap();
+			let before = store.load().unwrap();
+			let error = save_capturer_result_in_store(&store, "a", initial.clone(), result, &expected).unwrap_err();
+			assert!(error.contains("profile_conflict"));
+			assert_eq!(CoreProfileDocumentStore::from_root(&root).load().unwrap(), before);
+			// A fresh measurement's base may coexist with unrelated edits.
+			let expected = capturer_result_fields(&before, "a", result).unwrap();
+			let mut latest = before.clone();
+			latest.profiles.iter_mut().find(|p| p.id == "a").unwrap().note = "saved during measurement".into();
+			latest.profiles.iter_mut().find(|p| p.id == "b").unwrap().name = "Other edited".into();
+			store.save(latest).unwrap();
+			let latest = store.load().unwrap();
+			let expected_saved = merge_profile_from_capturer_selection("a", latest, initial.clone(), result).unwrap();
+			save_capturer_result_in_store(&store, "a", initial, result, &expected).unwrap();
+			assert_eq!(CoreProfileDocumentStore::from_root(&root).load().unwrap(), expected_saved);
+			println!("isolated calibration store verified: {}", root.display());
+		}
 	}
 
 	#[test]
@@ -4500,9 +5369,365 @@ mod tests {
 	}
 
 	#[test]
+	fn apply_profile_updates_rejects_batch_without_partial_changes() {
+		let mut profile = make_profile("alpha", "Alpha");
+		let before = serde_json::to_value(&profile).unwrap();
+		let result = apply_profile_updates(&mut profile, vec![
+			ProfileFieldUpdate { field: "name".into(), value: json!("Changed") },
+			ProfileFieldUpdate { field: "runtime_selection.unknown_knob".into(), value: json!(true) },
+		]);
+		assert!(result.is_err());
+		assert_eq!(serde_json::to_value(&profile).unwrap(), before);
+	}
+
+	#[test]
+	fn capturer_sync_result_distinguishes_acceptance_http_and_transport_failure() {
+		assert!(capturer_sync_result(1, Ok(reqwest::StatusCode::OK)).accepted);
+		let conflict = capturer_sync_result(4, Ok(reqwest::StatusCode::CONFLICT));
+		assert!(!conflict.accepted);
+		assert_eq!(serde_json::to_value(&conflict).unwrap()["statusCode"], 409);
+		let rejected = capturer_sync_result(2, Ok(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
+		assert!(!rejected.accepted);
+		assert_eq!(rejected.capturer_id, 2);
+		assert!(rejected.error.unwrap().contains("500"));
+		let unavailable = capturer_sync_result(3, Err("timeout".into()));
+		assert!(!unavailable.accepted);
+		assert_eq!(unavailable.status_code, None);
+		assert_eq!(unavailable.error.as_deref(), Some("timeout"));
+	}
+
+	#[test]
+	fn apply_profile_updates_commits_all_fields_to_same_profile() {
+		let mut profile = make_profile("alpha", "Alpha");
+		apply_profile_updates(&mut profile, vec![
+			ProfileFieldUpdate { field: "name".into(), value: json!("Changed") },
+			ProfileFieldUpdate { field: "note".into(), value: json!("New note") },
+		]).unwrap();
+		assert_eq!(profile.id, "alpha");
+		assert_eq!(profile.name, "Changed");
+		assert_eq!(profile.note, "New note");
+	}
+
+	#[test]
+	fn all_audited_profile_fields_survive_disk_reopen_and_optional_reset() {
+        let cases:serde_json::Value=serde_json::from_str(include_str!("profile_field_roundtrip_cases.json")).unwrap();
+        let cases=cases.as_array().unwrap();assert_eq!(cases.len(),91);
+        let root=std::env::temp_dir().join(format!("unm-all-fields-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir(&root).unwrap();
+        let store=CoreProfileDocumentStore::from_root(&root);
+        store.save(CoreProfileDocument{selected_profile_id:"beta".into(),profiles:vec![make_profile("alpha","Alpha"),make_profile("beta","Beta")],..Default::default()}).unwrap();
+        let before=store.load().unwrap();
+        let other=serde_json::to_value(before.profiles.iter().find(|p|p.id=="beta").unwrap()).unwrap();
+        save_profile_updates(&store,"alpha",cases.iter().map(|row|ProfileFieldUpdate{field:row["field"].as_str().unwrap().into(),value:row["value"].clone()}).collect()).unwrap();
+        let reopened=CoreProfileDocumentStore::from_root(&root).load().unwrap();
+        let saved=serde_json::to_value(reopened.profiles.iter().find(|p|p.id=="alpha").unwrap()).unwrap();
+        let at=|document:&serde_json::Value,row:&serde_json::Value|{
+            let mut value=document;
+            for key in row["serialized_path"].as_array().unwrap(){value=&value[key.as_str().unwrap()];}
+            value.clone()
+        };
+        for row in cases {assert_eq!(at(&saved,row),row["value"],"disk field {}",row["field"]);}
+        // Use the same pure view converters as IPC, without ProfileDetail::from:
+        // that constructor resolves the normal user store to find its path.
+        let profile=reopened.profiles.iter().find(|p|p.id=="alpha").unwrap();
+        let mut view=saved.clone();
+        view["runtime"]=serde_json::to_value(profile.runtime_selection.as_ref().map(ProfileRuntimeView::from).unwrap_or_default()).unwrap();
+        view["pipeline"]=serde_json::to_value(profile.pipeline_components.as_ref().map(ProfilePipelineView::from).unwrap_or_default()).unwrap();
+        let mut checked=0;
+        for row in cases {
+            if let Some(path)=row["view_path"].as_array() {
+                let mut actual=&view;
+                for key in path {actual=&actual[key.as_str().unwrap()];}
+                assert_eq!(actual,&row["value"],"editor view field {}",row["field"]);
+                checked+=1;
+            }else{assert!(row["view_note"].is_string(),"unexplained missing view mapping");}
+        }
+        assert_eq!(checked,89);
+        assert_eq!(reopened.selected_profile_id,"beta");
+        assert_eq!(serde_json::to_value(reopened.profiles.iter().find(|p|p.id=="beta").unwrap()).unwrap(),other);
+        // This command intentionally discards the learned model; it is not a
+        // persisted false override. All other settings must remain untouched.
+        save_profile_updates(&store,"alpha",vec![ProfileFieldUpdate{field:"runtime_selection.modifier.face_pose_model.enabled".into(),value:json!(false)}]).unwrap();
+        let disabled=CoreProfileDocumentStore::from_root(&root).load().unwrap();
+        let disabled=serde_json::to_value(disabled.profiles.iter().find(|p|p.id=="alpha").unwrap()).unwrap();
+        let mut expected_without_model=saved.clone();
+        expected_without_model["runtimeSelection"]["modifier"].as_object_mut().unwrap().remove("facePoseModel");
+        assert_eq!(disabled,expected_without_model);
+        // Optional controls must clear explicit overrides, not replace them with
+        // a display default that becomes permanently saved.
+        save_profile_updates(&store,"alpha",cases.iter().filter(|row|row["optional"]==true).map(|row|ProfileFieldUpdate{field:row["field"].as_str().unwrap().into(),value:serde_json::Value::Null}).collect()).unwrap();
+        let reset=CoreProfileDocumentStore::from_root(&root).load().unwrap();
+        let alpha=reset.profiles.iter().find(|p|p.id=="alpha").unwrap();
+        let serialized=serde_json::to_value(alpha).unwrap();
+        for row in cases {assert_eq!(at(&serialized,row),if row["optional"]==true {serde_json::Value::Null}else{row["value"].clone()},"reset field {}",row["field"]);}
+        assert!(alpha.runtime_selection.is_none());assert!(alpha.pipeline_components.is_none());
+        assert_eq!(serde_json::to_value(reset.profiles.iter().find(|p|p.id=="beta").unwrap()).unwrap(),other);
+        assert_eq!(reset.selected_profile_id,"beta");
+        assert!(root.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+	#[test]
+	fn save_profile_updates_real_store_preserves_rejected_batch_and_other_profile() {
+		let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+		let root = std::env::temp_dir().join(format!("unm-batch-save-{}-{nonce}", std::process::id()));
+		fs::create_dir(&root).unwrap();
+		let store = CoreProfileDocumentStore::from_root(&root);
+		store.save(CoreProfileDocument {
+			selected_profile_id: "beta".into(),
+			profiles: vec![make_profile("alpha", "Alpha"), make_profile("beta", "Beta")],
+			..Default::default()
+		}).unwrap();
+		let snapshot = || {
+			let mut files = std::collections::BTreeMap::new();
+			files.insert(store.conf_path().to_path_buf(), fs::read(store.conf_path()).unwrap());
+			for entry in fs::read_dir(store.profiles_dir()).unwrap() {
+				let path = entry.unwrap().path();
+				if path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
+					files.insert(path.clone(), fs::read(path).unwrap());
+				}
+			}
+			files
+		};
+		let before = snapshot();
+		let original = store.load().unwrap();
+		assert!(save_profile_updates(&store, "alpha", vec![
+			ProfileFieldUpdate { field: "note".into(), value: json!("must not persist") },
+			ProfileFieldUpdate { field: "runtime_selection.unknown_knob".into(), value: json!(true) },
+		]).is_err());
+		assert_eq!(snapshot(), before, "Rejected batch must not change any stored file");
+		assert!(save_profile_updates(&store, "missing", vec![ProfileFieldUpdate { field: "note".into(), value: json!("wrong target") }]).is_err());
+		assert!(save_profile_updates(&store, "alpha", vec![]).is_err());
+		assert_eq!(snapshot(), before);
+		save_profile_updates(&store, "alpha", vec![
+			ProfileFieldUpdate { field: "note".into(), value: json!("saved together") },
+			ProfileFieldUpdate { field: "group".into(), value: json!("Streaming") },
+		]).unwrap();
+		let reloaded = CoreProfileDocumentStore::from_root(&root).load().unwrap();
+		let alpha = reloaded.profiles.iter().find(|profile| profile.id == "alpha").unwrap();
+		assert_eq!(alpha.note, "saved together");
+		assert_eq!(alpha.group, "Streaming");
+		assert_eq!(reloaded.selected_profile_id, "beta");
+		assert_eq!(
+			serde_json::to_value(reloaded.profiles.iter().find(|profile| profile.id == "beta").unwrap()).unwrap(),
+			serde_json::to_value(original.profiles.iter().find(|profile| profile.id == "beta").unwrap()).unwrap()
+		);
+		let stale_revision = profile_revision(original.profiles.iter().find(|profile| profile.id == "alpha").unwrap());
+		let before_conflict = snapshot();
+		let rejected = save_profile_updates_checked(&store, "alpha", vec![
+			ProfileFieldUpdate { field: "note".into(), value: json!("stale overwrite") },
+		], Some(&stale_revision)).unwrap_err();
+		assert!(rejected.contains("profile_conflict"));
+		assert_eq!(snapshot(), before_conflict, "Conflict must not publish any file");
+		let beta_revision = profile_revision(original.profiles.iter().find(|profile| profile.id == "beta").unwrap());
+		save_profile_updates_checked(&store, "beta", vec![
+			ProfileFieldUpdate { field: "note".into(), value: json!("independent profile edit") },
+		], Some(&beta_revision)).expect("Another profile's edit must not invalidate beta's revision");
+		let latest = store.load().unwrap();
+		let alpha_revision = profile_revision(latest.profiles.iter().find(|profile| profile.id == "alpha").unwrap());
+		let saved = save_profile_updates_checked(&store, "alpha", vec![
+			ProfileFieldUpdate { field: "note".into(), value: json!("reviewed latest") },
+		], Some(&alpha_revision)).expect("Reviewed revision can be updated");
+		assert_eq!(saved.profiles.iter().find(|profile| profile.id == "alpha").unwrap().note, "reviewed latest");
+		// Only the unique directory created by this test is removed.
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[test]
 	fn opt_string_trims_and_returns_none_for_empty() {
 		assert_eq!(opt_string(&json!(null), "field").unwrap(), None);
 		assert_eq!(opt_string(&json!("   "), "field").unwrap(), None);
 		assert_eq!(opt_string(&json!("  hello "), "field").unwrap(), Some("hello".to_string()));
 	}
+
+	#[test]
+	fn receiver_profiles_persist_independently_and_reject_stale_source_edits() {
+		let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+		let root = std::env::temp_dir().join(format!("unm-receiver-roundtrip-{}-{nonce}", std::process::id()));
+		fs::create_dir(&root).unwrap();
+		let store = CoreProfileDocumentStore::from_root(&root);
+		store.save(CoreProfileDocument {
+			selected_profile_id: "phone".into(),
+			profiles: vec![make_profile("vmc", "VMC"), make_profile("phone", "iFacialMocap")],
+			..Default::default()
+		}).unwrap();
+		for (id, engine, field, address) in [
+			("vmc", "vmc", "vmc_receive_listen_addr", "127.0.0.1:39549"),
+			("phone", "ifacialmocap", "ifacialmocap_receive_listen_addr", "127.0.0.1:49984"),
+		] {
+			let current = store.load().unwrap();
+			let revision = profile_revision(current.profiles.iter().find(|p| p.id == id).unwrap());
+			save_profile_updates_checked(&store, id, vec![
+				ProfileFieldUpdate { field: "runtime_selection.engine".into(), value: json!(engine) },
+				ProfileFieldUpdate { field: format!("runtime_selection.{field}"), value: json!(address) },
+			], Some(&revision)).unwrap();
+		}
+		let reopened = CoreProfileDocumentStore::from_root(&root);
+		let before = reopened.load().unwrap();
+		assert_eq!(before.selected_profile_id, "phone");
+		let vmc = before.profiles.iter().find(|p| p.id == "vmc").unwrap();
+		let phone = before.profiles.iter().find(|p| p.id == "phone").unwrap();
+		assert_eq!(vmc.runtime_selection.as_ref().unwrap().engine.as_deref(), Some("vmc"));
+		assert_eq!(vmc.runtime_selection.as_ref().unwrap().vmc_receive_listen_addr.as_deref(), Some("127.0.0.1:39549"));
+		assert_eq!(phone.runtime_selection.as_ref().unwrap().engine.as_deref(), Some("ifacialmocap"));
+		assert_eq!(phone.runtime_selection.as_ref().unwrap().ifacialmocap_receive_listen_addr.as_deref(), Some("127.0.0.1:49984"));
+		let stale = profile_revision(vmc);
+		save_profile_updates_checked(&reopened, "vmc", vec![ProfileFieldUpdate {
+			field: "runtime_selection.vmc_receive_listen_addr".into(), value: json!("127.0.0.1:39550")
+		}], Some(&stale)).unwrap();
+		let latest = reopened.load().unwrap();
+		assert!(save_profile_updates_checked(&reopened, "vmc", vec![ProfileFieldUpdate {
+			field: "runtime_selection.engine".into(), value: json!("ifacialmocap")
+		}], Some(&stale)).unwrap_err().contains("profile_conflict"));
+		assert_eq!(serde_json::to_value(reopened.load().unwrap()).unwrap(), serde_json::to_value(&latest).unwrap());
+		assert_eq!(serde_json::to_value(latest.profiles.iter().find(|p| p.id == "phone").unwrap()).unwrap(), serde_json::to_value(phone).unwrap());
+		assert_eq!(latest.selected_profile_id, "phone");
+		fs::remove_dir_all(&root).unwrap();
+	}
+}
+
+#[cfg(test)]
+mod app_settings_commit_tests {
+	#[test]
+	fn unreadable_settings_are_preserved_instead_of_replaced_with_defaults() {
+		let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+		let root = std::env::temp_dir().join(format!("unm-invalid-settings-{}-{nonce}", std::process::id()));
+		std::fs::create_dir(&root).unwrap();
+		struct Cleanup(PathBuf);
+		impl Drop for Cleanup { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+		let _cleanup = Cleanup(root.clone());
+		let path = root.join("settings.toml");
+		let mut current = super::AppRuntimeSettings::default();
+		let mut next = current.clone();
+		next.locale = "en-US".into();
+		for bytes in [b"locale = [broken".as_slice(), b"locale = 123", &[0xff, 0xfe]] {
+			std::fs::write(&path, bytes).unwrap();
+			let result = super::persist_app_settings(&mut current, next.clone(), |value| super::write_app_settings_at(&path, value));
+			assert!(result.is_err());
+			assert_eq!(std::fs::read(&path).unwrap(), bytes);
+			assert_eq!(current.locale, super::AppRuntimeSettings::default().locale);
+		}
+		std::fs::write(&path, "locale = 'ja-JP'\n").unwrap();
+		super::persist_app_settings(&mut current, next, |value| super::write_app_settings_at(&path, value)).unwrap();
+		let saved: super::AppRuntimeSettings = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+		assert_eq!(saved.locale, "en-US");
+	}
+	#[test]
+	fn startup_read_failure_stays_blocked_until_fresh_load_after_repair() {
+		let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+		let root = std::env::temp_dir().join(format!("unm-startup-settings-{}-{nonce}", std::process::id()));
+		std::fs::create_dir(&root).unwrap();
+		struct Cleanup(PathBuf);
+		impl Drop for Cleanup { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+		let _cleanup = Cleanup(root.clone());
+		let path = root.join("settings.toml");
+		assert!(ensure_app_settings_loaded(&load_app_settings_at(&path)).is_ok());
+		std::fs::write(&path, "locale = [broken").unwrap();
+		let mut loaded = load_app_settings_at(&path);
+		assert!(ensure_app_settings_loaded(&loaded).unwrap_err().contains("再起動"));
+		let incoming: AppRuntimeSettings = serde_json::from_value(serde_json::to_value(AppRuntimeSettings::default()).unwrap()).unwrap();
+		assert!(persist_app_settings(&mut loaded, incoming, |_| panic!("must not write fallback settings")).is_err());
+		std::fs::write(&path, "locale = 'en-US'\n").unwrap();
+		assert!(write_app_settings_at(&path, &loaded).is_err());
+		assert_eq!(std::fs::read_to_string(&path).unwrap(), "locale = 'en-US'\n");
+		let fresh = load_app_settings_at(&path);
+		assert!(ensure_app_settings_loaded(&fresh).is_ok());
+		assert_eq!(fresh.locale, "en-US");
+		assert!(serde_json::to_value(fresh).unwrap().get("startupReadError").is_none());
+	}
+    use super::*;
+    use std::cell::RefCell;
+
+    #[cfg(windows)]
+    #[test]
+    fn actual_locked_settings_preserve_policy_then_retry_and_reopen() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("unm-settings-commit-{}-{nonce}", std::process::id()));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+        let _cleanup = Cleanup(root.clone());
+        let path = root.join("target/settings.toml");
+        let other = root.join("other/settings.toml");
+        let mut current = AppRuntimeSettings::default();
+        current.stop_capturers_on_exit = true;
+        current.locale = "ja-JP".into();
+        write_app_settings_at(&path, &current).unwrap();
+        write_app_settings_at(&other, &current).unwrap();
+        let original = fs::read(&path).unwrap();
+        let before = serde_json::to_value(&current).unwrap();
+        let mut next = current.clone();
+        next.stop_capturers_on_exit = false;
+        next.locale = "en-US".into();
+        let locked = fs::OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
+        let rolled_back = std::cell::Cell::new(false);
+        assert!(save_app_settings_with_effects(&mut current, next.clone(),
+            |value| write_app_settings_at(&path, value),
+            |_, _| Ok(true),
+            |created| rolled_back.set(created),
+            |_, _| panic!("must not apply failed disk write")).is_err());
+        assert!(rolled_back.get());
+        assert_eq!(serde_json::to_value(&current).unwrap(), before);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        drop(locked);
+        persist_app_settings(&mut current, next, |value| write_app_settings_at(&path, value)).unwrap();
+        let reopened: AppRuntimeSettings = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(!reopened.stop_capturers_on_exit);
+        assert_eq!(reopened.locale, "en-US");
+        assert_eq!(serde_json::to_value(&reopened).unwrap(), serde_json::to_value(&current).unwrap());
+        assert_eq!(fs::read(&other).unwrap(), original);
+    }
+
+    #[test]
+    fn failed_policy_save_keeps_current_shutdown_behavior() {
+        let mut current = AppRuntimeSettings::default();
+        current.stop_capturers_on_exit = true;
+        let mut next = current.clone();
+        next.stop_capturers_on_exit = false;
+        assert!(persist_app_settings(&mut current, next.clone(), |_| Err("disk refused".into())).is_err());
+        assert!(current.stop_capturers_on_exit);
+        let saved = persist_app_settings(&mut current, next, |_| Ok(())).unwrap();
+        assert!(!saved.stop_capturers_on_exit);
+        assert!(!current.stop_capturers_on_exit);
+    }
+
+    #[test]
+    fn failed_save_rolls_back_prepared_tray_without_applying_locale_or_policy() {
+        let mut current = AppRuntimeSettings::default();
+        current.locale = "ja-JP".into();
+        current.system_tray_enabled = false;
+        let mut next = current.clone();
+        next.locale = "en-US".into();
+        next.system_tray_enabled = true;
+        let events = RefCell::new(Vec::new());
+        let result = save_app_settings_with_effects(&mut current, next.clone(),
+            |_| { events.borrow_mut().push("write-failed"); Err("disk refused".into()) },
+            |_, _| { events.borrow_mut().push("prepare"); Ok(true) },
+            |created| { assert!(created); events.borrow_mut().push("rollback"); },
+            |_, _| panic!("failed settings must not apply"));
+        assert!(result.is_err());
+        assert_eq!(current.locale, "ja-JP");
+        assert!(!current.system_tray_enabled);
+        assert_eq!(*events.borrow(), ["prepare", "write-failed", "rollback"]);
+        events.borrow_mut().clear();
+        save_app_settings_with_effects(&mut current, next,
+            |_| { events.borrow_mut().push("write"); Ok(()) },
+            |_, _| { events.borrow_mut().push("prepare"); Ok(true) },
+            |_| panic!("successful write must not roll back"),
+            |old, next| { assert_eq!(old.locale,"ja-JP"); assert_eq!(next.locale,"en-US"); events.borrow_mut().push("apply"); }).unwrap();
+        assert_eq!(*events.borrow(), ["prepare", "write", "apply"]);
+        assert!(current.system_tray_enabled);
+        assert_eq!(current.locale, "en-US");
+    }
+
+    #[test]
+    fn tray_prepare_failure_does_not_write_or_apply_settings() {
+        let mut current = AppRuntimeSettings::default();
+        let next = current.clone();
+        assert!(save_app_settings_with_effects(&mut current, next,
+            |_| panic!("no write after failed preparation"),
+            |_, _| Err("tray unavailable".into()),
+            |_| panic!("no prepared tray"),
+            |_, _| panic!("no apply")).is_err());
+    }
 }

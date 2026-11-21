@@ -5,8 +5,32 @@
 <script lang="ts">
 	import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 	import { flip } from "svelte/animate";
-	import { onDestroy, onMount } from "svelte";
-	import { _ } from "svelte-i18n";
+	import { onDestroy, onMount, tick, untrack } from "svelte";
+	import { _, locale } from "svelte-i18n";
+	import FeatureMap from "./lib/FeatureMap.svelte";
+	import MotionAdvancedSettings from "./lib/MotionAdvancedSettings.svelte";
+	import { resolvedLostBehavior } from "./lib/lostSignalBehavior";
+	import { effectiveSmoothing, smoothingMigration } from "./lib/smoothingMigration";
+	import DeletedProfiles from "./lib/DeletedProfiles.svelte";
+	import ReviewProfileStop from "./lib/ReviewProfileStop.svelte";
+	import { ProfileSyncFeedback, mergeProfileSyncWarnings, profileSyncWarning, savedProfileRefreshWarning, type ProfileSyncReport } from "./lib/profileSync";
+	import ProfileWriteRecovery from "./lib/ProfileWriteRecovery.svelte";
+	import { beginProfileWrite, finishProfileWrite, canRetryProfileWrite, type ProfileWrite } from "./lib/profileWriteRecovery";
+	import { ProfileSaveQueue } from "./lib/profileSaveQueue";
+	import PreviewFeatureIndex from "./lib/PreviewFeatureIndex.svelte";
+	import "./lib/featureNavigation.css";
+	const previewQuery = new URLSearchParams(window.location.search);
+	// Adopted A; historical layout remains available in comparison builds.
+	const previewOperationsA = import.meta.env.VITE_UN_DESIGN_PREVIEW !== '1' || (document.documentElement.dataset.unIsolatedPreview === '1' && previewQuery.get('supervisorLayout') === 'A');
+	let previewFeatureIndex = $state(import.meta.env.VITE_UN_DESIGN_PREVIEW !== "1" || (previewQuery.get("navigation") !== "existing" && previewQuery.get("design") !== "baseline"));
+	$effect(() => {
+		if (import.meta.env.VITE_UN_DESIGN_PREVIEW !== "1") return;
+		const update = (event: Event) => { previewFeatureIndex = (event as CustomEvent).detail === "inline"; };
+		window.addEventListener("un-series-navigation", update);
+		return () => window.removeEventListener("un-series-navigation", update);
+	});
+	import MotionHome from "./lib/MotionHome.svelte";
+	import { featureText, featureAnchor, type MotionFeature } from "./lib/featureCatalog";
 	import { setUiLocale } from "@usagi.network/un-i18n-svelte";
 	import {
 		Activity,
@@ -281,6 +305,8 @@
 
 	interface ProfileDetail {
 		id: string;
+		revision?: string;
+		deletionRevision?: string;
 		name: string;
 		note: string;
 		path: string;
@@ -288,10 +314,11 @@
 		group: string;
 		runtime: ProfileRuntimeView;
 		pipeline: ProfilePipelineView;
+		syncReport?: ProfileSyncReport;
 	}
 
 	type ThemeMode = "light" | "dark" | "system";
-	type TabId = "capturers" | "profiles" | "logs" | "app";
+	type TabId = "home" | "capturers" | "profiles" | "logs" | "app" | "map";
 
 	/// Tauri backend (Rust) の `AppRuntimeSettings` (= `%APPDATA%/UN Motion/settings.toml`)
 	/// と双方向に同期する設定。UN Avatar Supervisor の `AppSettings` と
@@ -394,7 +421,15 @@
 
 	let appSettings = $state<AppSettings>({ ...defaultAppSettings });
 	let appSettingsReady = $state(false);
-	let activeTab: TabId = $state("capturers");
+	let appSettingsLoading = false;
+	let appSettingsEarlyEdits: Partial<AppSettings> = {};
+	let appSettingsBeforeEarlyEdits: AppSettings | null = null;
+	let appSettingsPending = $state(0);
+	let appSettingsSaveError = $state("");
+	let appSettingsSaveSequence = 0;
+	let appSettingsSaveTail: Promise<void> = Promise.resolve();
+	let activeTab: TabId = $state("home");
+	let featureQuery = $state("");
 	let appVersion = $state("");
 	// Language 一覧は起動後にバックエンドの `i18n_available_locales` で置き換わる（初期表示用の仮値）。
 	let availableLocales = $state<string[]>(["ja-JP", "en-US"]);
@@ -435,15 +470,35 @@
 		return items[0]?.id ?? "";
 	}
 
+    let resolvedProfileIcons: Record<string, string> = $state({});
+    let iconLoadGeneration = 0;
+    $effect(() => {
+        const entries = [...profiles, ...(profileDetail ? [profileDetail] : [])]
+            .filter(p => p.iconPath).map(p => ({ id: p.id, path: p.iconPath! }));
+        untrack(() => { void loadProfileIcons(entries); });
+    });
+    async function loadProfileIcons(entries: { id: string; path: string }[]) {
+        if (!hasTauriRuntime()) return;
+        const generation = ++iconLoadGeneration;
+        const resolved = await Promise.all(entries.map(async entry => {
+            if (/^https?:\/\//.test(entry.path)) return [entry.path, entry.path] as const;
+            try {
+                const local = await invoke<string>("resolve_profile_icon", { profileId: entry.id });
+                return [entry.path, convertFileSrc(local)] as const;
+            } catch { return [entry.path, defaultIconSrc] as const; }
+        }));
+        if (generation === iconLoadGeneration) resolvedProfileIcons = Object.fromEntries(resolved);
+    }
+
 	function iconSrc(path: string | null | undefined): string {
 		if (!path) return defaultIconSrc;
-		if (path.startsWith("http://") || path.startsWith("https://") || path.startsWith("/")) {
+		if (path.startsWith("http://") || path.startsWith("https://") || (!hasTauriRuntime() && path.startsWith("/"))) {
 			return path;
 		}
 		if (path.endsWith("un-motion-design-master.png") || path.endsWith("un-motion-artwork-supervisor.png")) {
 			return defaultIconSrc;
 		}
-		if (hasTauriRuntime()) return convertFileSrc(path);
+		if (hasTauriRuntime()) return resolvedProfileIcons[path] ?? defaultIconSrc;
 		return defaultIconSrc;
 	}
 
@@ -455,12 +510,13 @@
 
 	async function browseProfileIcon(): Promise<void> {
 		if (!selectedProfileId) return;
+		const profileId = selectedProfileId;
 		try {
 			const path = await invoke<string | null>("pick_file_path", {
 				kind: "icon",
 			});
 			if (path != null) {
-				await updateProfileField("icon_path", path);
+				await updateProfileField("icon_path", path, profileId);
 			}
 		} catch (error) {
 			errorMessage = `pick_file_path failed: ${String(error)}`;
@@ -506,39 +562,82 @@
 	);
 
 	async function loadBackendSettings() {
+		if (appSettingsLoading) return;
+		appSettingsLoading = true;
+		appSettingsPending++;
 		try {
 			const result = await invoke<AppSettings>("get_app_settings");
-			if (result) {
-				appSettings = { ...defaultAppSettings, ...result };
-				// backend が解決した locale (永続化済 or 起動時 OS 自動解決済) を svelte-i18n へ反映する。
-				// 空文字なら resolve_default_locale を再取得して適用 (二重解決にはなるが起動経路を一本化)。
-				const effective = appSettings.locale || (await invoke<string>("i18n_resolve_default_locale").catch(() => "ja-JP"));
-				setUiLocale(effective);
-			}
-		} catch (error) {
-			console.error("get_app_settings failed:", error);
-		} finally {
+			if (!result) throw new Error("Settings read returned no values");
+			const resolvedLocale = result.locale || (await invoke<string>("i18n_resolve_default_locale").catch(() => "ja-JP"));
+			const hasEarlyEdits = Object.keys(appSettingsEarlyEdits).length > 0;
+			appSettings = { ...defaultAppSettings, ...result, locale: resolvedLocale, ...appSettingsEarlyEdits };
+			appSettingsEarlyEdits = {};
+			appSettingsBeforeEarlyEdits = null;
 			appSettingsReady = true;
+			appSettingsSaveError = "";
+			setUiLocale(appSettings.locale);
+			if (hasEarlyEdits) void syncAppSettingsToBackend(appSettings);
+		} catch (error) {
+			appSettingsSaveError = `Settings read failed: ${String(error)}`;
+		} finally {
+			appSettingsLoading = false;
+			appSettingsPending--;
 		}
 	}
 
 	async function syncAppSettingsToBackend(settings: AppSettings): Promise<void> {
-		if (!appSettingsReady) return;
+		if (!appSettingsReady) { await loadBackendSettings(); return; }
+		const sequence = ++appSettingsSaveSequence;
+		const snapshot: AppSettings = JSON.parse(JSON.stringify(settings));
+		appSettingsPending++;
+		const save = appSettingsSaveTail.then(async () => {
+			try {
+				const result = await invoke<AppSettings>("sync_app_settings", { settings: snapshot });
+				if (!result) throw new Error("Settings save returned no values");
+				if (sequence === appSettingsSaveSequence) {
+					appSettings = { ...defaultAppSettings, ...result };
+					appSettingsSaveError = "";
+				}
+			} catch (error) {
+				if (sequence === appSettingsSaveSequence) appSettingsSaveError = String(error);
+			} finally {
+				appSettingsPending--;
+			}
+		});
+		appSettingsSaveTail = save;
+		await save;
+	}
+
+	async function discardAppSettingsDraft(): Promise<void> {
+		if (appSettingsPending > 0) return;
+		if (!appSettingsReady) {
+			if (appSettingsBeforeEarlyEdits) appSettings = appSettingsBeforeEarlyEdits;
+			appSettingsEarlyEdits = {};
+			appSettingsBeforeEarlyEdits = null;
+			setUiLocale(appSettings.locale || "ja-JP");
+			return;
+		}
+		const sequence = ++appSettingsSaveSequence;
+		appSettingsPending++;
 		try {
-			const result = await invoke<AppSettings>("sync_app_settings", {
-				settings,
-			});
-			if (result) {
+			const result = await invoke<AppSettings>("get_app_settings");
+			if (!result) throw new Error("Settings read returned no values");
+			if (sequence === appSettingsSaveSequence) {
 				appSettings = { ...defaultAppSettings, ...result };
+				appSettingsEarlyEdits = {};
+				appSettingsReady = true;
+				appSettingsSaveError = "";
+				setUiLocale(appSettings.locale || "ja-JP");
 			}
 		} catch (error) {
-			if (!hasTauriRuntime()) return;
-			errorMessage = `sync_app_settings failed: ${String(error)}`;
-		}
+			if (sequence === appSettingsSaveSequence) appSettingsSaveError = String(error);
+		} finally { appSettingsPending--; }
 	}
 
 	function setAppSetting<K extends keyof AppSettings>(key: K, value: AppSettings[K]): void {
+		if (!appSettingsReady && !appSettingsBeforeEarlyEdits) appSettingsBeforeEarlyEdits = { ...appSettings };
 		appSettings = { ...appSettings, [key]: value };
+		if (!appSettingsReady) appSettingsEarlyEdits = { ...appSettingsEarlyEdits, [key]: value };
 		void syncAppSettingsToBackend(appSettings);
 	}
 
@@ -602,7 +701,9 @@
 
 	let capturers: CapturerInstance[] = $state([]);
 	let runtimeStatuses: Record<number, CapturerRuntimeStatus> = $state({});
+	let runtimeStatusErrors: Record<number, string> = $state({});
 	let selectedCapturerId: number | null = $state(null);
+	let restartingCapturerId: number | null = $state(null);
 	let showStoppedCapturers = $state(false);
 
 	let profiles: ProfileSummary[] = $state([]);
@@ -645,7 +746,46 @@
 	let busy = $state(false);
 	let message = $state("");
 	let errorMessage = $state("");
+	let profileWrites = $state<ProfileWrite[]>([]);
+	let profileWriteSequence = 0;
+	let profileOrderDraft = $state<{ ids: string[]; expectedIds: string[]; error: string } | null>(null);
+	let profileOrderSaving = $state(false);
+	let profileDragOriginal: ProfileSummary[] | null = null;
+	const profileSaveQueue = new ProfileSaveQueue();
+	let profileDeliveryWarnings = $state<string[]>([]);
+	const profileSyncFeedback = new ProfileSyncFeedback(warnings => { profileDeliveryWarnings = warnings; });
+	const visibleErrorMessage = $derived(mergeProfileSyncWarnings(errorMessage, profileDeliveryWarnings));
+	const appliedProfileSummaryWrites = new Map<string, number>();
+	function guardProfileWriteUnload(event: BeforeUnloadEvent) {
+		const hasSettingsDraft = Object.keys(appSettingsEarlyEdits).length > 0 || (appSettingsReady && Boolean(appSettingsSaveError));
+		if (profileWrites.length === 0 && !busy && appSettingsPending === 0 && !hasSettingsDraft && !profileOrderDraft && !profileOrderSaving && !profilePointerDrag?.active) return;
+		event.preventDefault();
+		event.returnValue = "";
+	}
+	function explainBlockedClose() {
+		errorMessage = ($locale ?? "ja-JP").startsWith("ja")
+			? "終了を中止しました。処理中の操作、または保存を確認できなかった入力があります。内容を確認し、保存または保持した入力の破棄を終えてから終了してください。実行中のキャプチャーは停止していません。"
+			: "Close cancelled. An operation is in progress or retained input has an unconfirmed save. Review and save or discard the retained input before closing. Running Capturers have not been stopped.";
+	}
+	function explainFailedClose() {
+		errorMessage = ($locale ?? "ja-JP").startsWith("ja")
+			? "終了処理の結果を確認できませんでした。入力を保持したまま、実行中のキャプチャーの状態と診断ログを確認してください。"
+			: "The close result could not be confirmed. Keep retained input and check Capturer status and diagnostic logs.";
+	}
+	onMount(() => {
+		window.addEventListener("beforeunload", guardProfileWriteUnload);
+  document.documentElement.dataset.unCloseGuardReady = "true";
+		window.addEventListener("un-motion-close-blocked", explainBlockedClose);
+		window.addEventListener("un-motion-close-failed", explainFailedClose);
+		return () => {
+			delete document.documentElement.dataset.unCloseGuardReady;
+  window.removeEventListener("beforeunload", guardProfileWriteUnload);
+			window.removeEventListener("un-motion-close-blocked", explainBlockedClose);
+			window.removeEventListener("un-motion-close-failed", explainFailedClose);
+		};
+	});
 	let startupAutoLaunchAttempted = false;
+	let startupAutoLaunchReady = $state(false);
 
 	let pollHandle: ReturnType<typeof setInterval> | null = null;
 	let refreshCapturersPromise: Promise<void> | null = null;
@@ -855,8 +995,9 @@
 	$effect(() => {
 		const profileId = selectedProfileId;
 		if (!profilesReady) return;
-		if (profileId === persistedSelectedProfileId) return;
-		void persistSelectedProfileId(profileId);
+		// An external default refresh or save acknowledgement is not an editor
+		// selection change and must not trigger a write back to the shared store.
+		untrack(() => { void persistSelectedProfileId(profileId); });
 	});
 
 	// Logs タブが選択中、かつ autoscroll が ON、かつ Capturer の stderrTail に
@@ -876,6 +1017,8 @@
 
 	$effect(() => {
 		const tableCapturers = showStoppedCapturers ? capturers : liveCapturers();
+		// Keep the selected restart target while its old process leaves the list.
+		if (restartingCapturerId != null && selectedCapturerId === restartingCapturerId) return;
 		const selectedExists = tableCapturers.some((c) => c.id === selectedCapturerId);
 		if (!selectedExists && tableCapturers.length > 0) {
 			selectedCapturerId = tableCapturers[0].id;
@@ -885,11 +1028,11 @@
 	});
 
 	const runningCount = $derived(capturers.filter((capturer) => capturer.state === "running").length);
-	const issueCount = $derived(capturers.filter((capturer) => capturer.state === "crashed").length);
+	const issueCount = $derived(capturers.filter((capturer) => capturer.state === "crashed").length + (visibleErrorMessage.trim() ? 1 : 0));
 	const capturerTableCapturers = $derived(showStoppedCapturers ? capturers : liveCapturers());
 
 	const selectedCapturer = $derived(capturerTableCapturers.find((capturer) => capturer.id === selectedCapturerId) ?? null);
-	const selectedRuntime = $derived(selectedCapturerId == null ? null : (runtimeStatuses[selectedCapturerId] ?? null));
+	const selectedRuntime = $derived(selectedCapturerId == null || runtimeStatusErrors[selectedCapturerId] ? null : (runtimeStatuses[selectedCapturerId] ?? null));
 	const selectedCapturerProfileId = $derived(selectedCapturer?.profileId ?? null);
 	const selectedCapturerProfileSummary = $derived(
 		selectedCapturerProfileId == null ? null : (profiles.find((profile) => profile.id === selectedCapturerProfileId) ?? null)
@@ -912,7 +1055,7 @@
 		availableLocales = await invoke<string[]>("i18n_available_locales").catch(() => ["ja-JP", "en-US"]);
 		await Promise.all([loadBackendSettings(), refreshCapturers(), refreshProfiles()]);
 		await refreshCapturerLogs();
-		await maybeAutoLaunchSelectedOnStartup();
+		startupAutoLaunchReady = true;
 		pollHandle = setInterval(() => {
 			void refreshCapturers().then(() => Promise.all([refreshRuntimeStatuses(), refreshCapturerLogs()]));
 		}, 1500);
@@ -975,46 +1118,75 @@
 		return refreshCapturerLogsPromise;
 	}
 
-	async function refreshProfiles() {
+	let profileListRequest = 0;
+	async function refreshProfiles(refreshDetails = true) {
+		const request = ++profileListRequest;
+		const profilesAtRequest = profiles;
+		const defaultAtRequest = persistedSelectedProfileId;
+		const isCurrent = () => request === profileListRequest && profiles === profilesAtRequest && persistedSelectedProfileId === defaultAtRequest;
 		try {
-			profiles = await invoke<ProfileSummary[]>("list_profiles");
-			const storedSelectedProfileId = profilesReady ? selectedProfileId : await invoke<string>("selected_profile_id").catch(() => "");
+			const [nextProfiles, savedDefaultId] = await Promise.all([
+				invoke<ProfileSummary[]>("list_profiles"),
+				invoke<string>("selected_profile_id"),
+			]);
+			if (!isCurrent()) return;
+			profiles = retainProfileOrder(nextProfiles);
+			persistedSelectedProfileId = savedDefaultId || null;
+			const storedSelectedProfileId = profilesReady ? selectedProfileId : savedDefaultId;
 			const stillExists = storedSelectedProfileId !== null && profiles.some((profile) => profile.id === storedSelectedProfileId);
 			if (!stillExists) {
 				selectedProfileId = profiles[0]?.id ?? null;
 			} else {
 				selectedProfileId = storedSelectedProfileId;
 			}
-			if (!profilesReady) {
-				persistedSelectedProfileId = selectedProfileId;
-			}
 			launchTargetId = pickInitialLaunchTargetId(launchTargetId, selectedProfileId, profiles);
 			if (selectedProfileId) {
-				await refreshProfileDetail(selectedProfileId);
+                if (refreshDetails || profileDetail?.id !== selectedProfileId) await refreshProfileDetail(selectedProfileId);
 			} else {
 				profileDetail = null;
 			}
+			if (request !== profileListRequest) return;
 			profilesReady = true;
 		} catch (error) {
+			if (!isCurrent()) return;
 			errorMessage = `list_profiles failed: ${String(error)}`;
 		}
 	}
 
+	let selectedProfileSaveQueue: Promise<void> = Promise.resolve();
+	let selectedProfileSavePending = $state(0);
+	let selectedProfileSaveFailure: { profileId: string | null; detail: string } | null = $state(null);
 	async function persistSelectedProfileId(profileId: string | null) {
-		try {
-			await invoke("set_selected_profile_id", { profileId });
-			persistedSelectedProfileId = profileId;
-		} catch (error) {
-			console.warn("set_selected_profile_id failed", error);
-		}
+		selectedProfileSavePending += 1;
+		const save = selectedProfileSaveQueue.then(async () => {
+			// Check after earlier writes finish: A -> B -> A must save the final A.
+			if (profileId === persistedSelectedProfileId) { selectedProfileSaveFailure = null; return; }
+			try {
+				await invoke("set_selected_profile_id", { profileId });
+				persistedSelectedProfileId = profileId;
+				selectedProfileSaveFailure = null;
+			} catch (error) {
+				console.warn("set_selected_profile_id failed", error);
+				selectedProfileSaveFailure = { profileId, detail: String(error) };
+			}
+		});
+		selectedProfileSaveQueue = save;
+		try { await save; } finally { selectedProfileSavePending -= 1; }
 	}
 
+	let profileDetailRequest = 0;
 	async function refreshProfileDetail(profileId: string) {
+		const request = ++profileDetailRequest;
 		try {
-			profileDetail = await invoke<ProfileDetail>("get_profile_detail", {
+			const detail = await invoke<ProfileDetail>("get_profile_detail", {
 				profileId,
 			});
+			if (selectedProfileId === profileId && request === profileDetailRequest) {
+				profileDetail = detail;
+				profileSaveQueue.observe(profileId, detail.revision);
+			}
 		} catch (error) {
+			if (selectedProfileId !== profileId || request !== profileDetailRequest) return;
 			errorMessage = `get_profile_detail failed: ${String(error)}`;
 			profileDetail = null;
 		}
@@ -1062,23 +1234,52 @@
 		profiles = next;
 	}
 
+	function retainProfileOrder(incoming: ProfileSummary[]): ProfileSummary[] {
+		if (!profileOrderDraft) return incoming;
+		const byId = new Map(incoming.map(profile => [profile.id, profile]));
+		const retained = profileOrderDraft.ids.flatMap(id => {
+			const profile = byId.get(id);
+			if (!profile) return [];
+			byId.delete(id);
+			return [profile];
+		});
+		return [...retained, ...byId.values()];
+	}
+
 	async function saveProfilesOrder(): Promise<void> {
+		if (profileOrderSaving) return;
+		const draft = profileOrderDraft ?? { ids: profiles.map(profile => profile.id), expectedIds: (profileDragOriginal ?? profiles).map(profile => profile.id), error: "" };
+		profileOrderDraft = draft;
+		profileOrderSaving = true;
 		try {
-			await invoke<ProfileSummary[]>("reorder_profiles", {
-				profileIds: profiles.map((profile) => profile.id),
-			});
+			if (draft.ids.length !== profiles.length || draft.ids.some(id => !profiles.some(profile => profile.id === id))) throw new Error("Profile list changed. Reload the saved order before rearranging again.");
+			await invoke<ProfileSummary[]>("reorder_profiles", { profileIds: draft.ids, expectedIds: draft.expectedIds });
+			profileOrderDraft = null;
 			message = "Reordered profiles";
-		} catch (error) {
-			errorMessage = String(error);
-			await refreshProfiles();
-		}
+		} catch (error) { profileOrderDraft = { ...draft, error: String(error) }; }
+		finally { profileOrderSaving = false; }
+	}
+
+	async function discardProfileOrder(): Promise<void> {
+		if (profileOrderSaving) return;
+		profileOrderSaving = true;
+		try {
+			const beforeRead = profiles;
+			const request = ++profileListRequest;
+			const saved = await invoke<ProfileSummary[]>("list_profiles");
+			if (profiles !== beforeRead || request !== profileListRequest) throw new Error("Profile list changed while reloading. Retry to read the current saved order.");
+			profiles = saved;
+			profileOrderDraft = null;
+		} catch (error) { if (profileOrderDraft) profileOrderDraft = { ...profileOrderDraft, error: String(error) }; }
+		finally { profileOrderSaving = false; }
 	}
 
 	function beginProfilePointerDrag(event: PointerEvent, profileId: string): void {
-		if (busy || event.button !== 0) return;
+		if (busy || profileOrderSaving || profileOrderDraft || event.button !== 0) return;
 		const card = (event.currentTarget as HTMLElement).closest<HTMLElement>("[data-profile-id]");
 		const rect = card?.getBoundingClientRect();
 		if (!rect) return;
+		profileDragOriginal = [...profiles];
 		profilePointerDrag = {
 			id: profileId,
 			startX: event.clientX,
@@ -1107,6 +1308,8 @@
 	}
 
 	function cancelProfilePointerDrag(): void {
+		if (profileDragOriginal) profiles = profileDragOriginal;
+		profileDragOriginal = null;
 		removeProfileDragListeners();
 		profilePointerDrag = null;
 		draggedProfileId = null;
@@ -1154,25 +1357,29 @@
 
 	function finishProfilePointerDrag(event: PointerEvent): void {
 		const drag = profilePointerDrag;
+		if (drag?.active && profileDragOriginal) profileOrderDraft = { ids: profiles.map(profile => profile.id), expectedIds: profileDragOriginal.map(profile => profile.id), error: "" };
 		removeProfileDragListeners();
 		profilePointerDrag = null;
 		draggedProfileId = null;
+		profileDragOriginal = null;
 		if (!drag?.active) return;
 		event.preventDefault();
 		event.stopPropagation();
 		void saveProfilesOrder();
 	}
 
+	let capturerProfileDetailRequest = 0;
 	async function refreshSelectedCapturerProfileDetail(profileId: string) {
+		const request = ++capturerProfileDetailRequest;
 		try {
 			const detail = await invoke<ProfileDetail>("get_profile_detail", {
 				profileId,
 			});
-			if (selectedCapturerProfileId === profileId) {
+			if (selectedCapturerProfileId === profileId && request === capturerProfileDetailRequest) {
 				selectedCapturerProfileDetail = detail;
 			}
 		} catch {
-			if (selectedCapturerProfileId === profileId) {
+			if (selectedCapturerProfileId === profileId && request === capturerProfileDetailRequest) {
 				selectedCapturerProfileDetail = null;
 			}
 		}
@@ -1180,12 +1387,27 @@
 
 	async function selectProfile(profileId: string) {
 		selectedProfileId = profileId;
+		profileDetail = null;
 		await refreshProfileDetail(profileId);
 	}
 
+	async function reloadSelectedProfile() {
+		const id = selectedProfileId;
+		if (!id || busy || profileWrites.some(write => write.profileId === id)) return;
+		busy = true;
+		errorMessage = "";
+		try { await refreshProfileDetail(id); }
+		finally { busy = false; }
+	}
+
+	let creatingProfile = $state(false);
+
 	async function createNewProfile() {
 		if (busy) return;
+		const originId = selectedProfileId;
+		const originRequest = profileDetailRequest;
 		busy = true;
+		creatingProfile = true;
 		message = "Creating profile...";
 		errorMessage = "";
 		try {
@@ -1195,23 +1417,31 @@
 			const detail = await invoke<ProfileDetail>("create_profile", {
 				name: "",
 			});
-			profileDetail = detail;
-			selectedProfileId = detail.id;
-			await refreshProfiles();
+			// Native creation also persists this profile as the next-start default.
+			persistedSelectedProfileId = detail.id;
+			if (selectedProfileId === originId && profileDetailRequest === originRequest) {
+				profileDetail = detail;
+				selectedProfileId = detail.id;
+			}
+			await refreshProfiles(false);
 			message = `Created ${detail.name}`;
 		} catch (error) {
 			errorMessage = `create_profile failed: ${String(error)}`;
 			message = "";
 		} finally {
 			busy = false;
+			creatingProfile = false;
 		}
 	}
 
 	async function quickLaunchSelectedProfile() {
 		if (busy || !selectedProfileId) return;
-		launchTargetId = selectedProfileId;
-		await launchCapturer();
-		if (appSettings.jumpToCapturersOnQuickLaunch) {
+		const originProfile = selectedProfileId;
+		const originRequest = profileDetailRequest;
+		const originTab = activeTab;
+		launchTargetId = originProfile;
+		const launched = await launchCapturer();
+		if (launched && selectedProfileId === originProfile && profileDetailRequest === originRequest && activeTab === originTab && appSettings.jumpToCapturersOnQuickLaunch) {
 			activeTab = "capturers";
 		}
 	}
@@ -1228,17 +1458,19 @@
 	let actionCountdownOverlay = $state<ActionCountdownOverlay | null>(null);
 
 	function startDeleteHold(id: string | null): void {
-		if (!id || busy) return;
+		if (!id || busy || profileDetail?.id !== id) return;
+		const confirmedRevision = profileDetail.deletionRevision ?? profileDetail.revision;
 		cancelDeleteHold();
 		deleteHoldTargetId = id;
 		deleteHoldProgress = 0;
 		deleteHoldStartedAt = performance.now();
 		const tick = () => {
 			if (deleteHoldTargetId !== id) return;
+			if (selectedProfileId !== id) { cancelDeleteHold(); return; }
 			deleteHoldProgress = Math.min(1, (performance.now() - deleteHoldStartedAt) / deleteHoldDurationMs);
 			if (deleteHoldProgress >= 1) {
 				cancelDeleteHold();
-				void deleteSelectedProfile();
+				void deleteSelectedProfile(confirmedRevision);
 				return;
 			}
 			deleteHoldTimer = window.requestAnimationFrame(tick);
@@ -1257,16 +1489,25 @@
 
 	async function duplicateSelectedProfile() {
 		if (busy || !selectedProfileId) return;
+		if (profileWrites.some(write => write.profileId === selectedProfileId)) {
+			errorMessage = $_("profiles.actions.duplicate_pending_edits");
+			message = "";
+			return;
+		}
+		const originId = selectedProfileId;
+		const originRequest = profileDetailRequest;
 		busy = true;
 		message = "Duplicating profile...";
 		errorMessage = "";
 		try {
 			const detail = await invoke<ProfileDetail>("duplicate_profile", {
-				profileId: selectedProfileId,
+				profileId: originId,
 			});
-			profileDetail = detail;
-			selectedProfileId = detail.id;
-			await refreshProfiles();
+			if (selectedProfileId === originId && profileDetailRequest === originRequest) {
+				profileDetail = detail;
+				selectedProfileId = detail.id;
+			}
+			await refreshProfiles(false);
 			message = `Duplicated to ${detail.name}`;
 		} catch (error) {
 			errorMessage = `duplicate_profile failed: ${String(error)}`;
@@ -1276,8 +1517,13 @@
 		}
 	}
 
-	async function deleteSelectedProfile() {
+	async function deleteSelectedProfile(expectedRevision = profileDetail?.deletionRevision ?? profileDetail?.revision) {
 		if (busy || !selectedProfileId || !profileDetail) return;
+		if (profileWrites.some(write => write.profileId === selectedProfileId)) {
+			errorMessage = $_("profiles.archive.pending_edits");
+			message = "";
+			return;
+		}
 		// 確認ダイアログは廃止。toolbar の Delete ボタンを 1.2 秒間長押しした場合のみ
 		// この関数が呼ばれるため、誤操作の防止は UI レイヤーで担保している
 		// (UN Avatar Supervisor の deleteSetting と同じ UX)。
@@ -1286,10 +1532,12 @@
 		errorMessage = "";
 		try {
 			const removedId = selectedProfileId;
-			await invoke("delete_profile", { profileId: removedId });
-			selectedProfileId = null;
-			profileDetail = null;
-			await refreshProfiles();
+			await invoke("delete_profile", { profileId: removedId, expectedRevision });
+            if (selectedProfileId === removedId) {
+                selectedProfileId = null;
+                profileDetail = null;
+            }
+			await refreshProfiles(false);
 			message = `Deleted ${removedId}`;
 		} catch (error) {
 			errorMessage = `delete_profile failed: ${String(error)}`;
@@ -1299,16 +1547,140 @@
 		}
 	}
 
-	async function updateProfileField(field: string, value: unknown) {
-		if (!selectedProfileId) return;
+	async function restoreArchivedProfile(archiveId: string): Promise<void> {
+		if (busy) throw new Error("Another profile operation is in progress");
+		busy = true;
+		const defaultAtRestore = persistedSelectedProfileId;
+		++profileListRequest;
+		// The archive panel owns this operation's result; retire earlier toolbar feedback.
+		message = "";
+		errorMessage = "";
 		try {
-			const detail = await invoke<ProfileDetail>("update_profile_field", {
-				profileId: selectedProfileId,
+			const restored = await invoke<{ selectedProfileId: string }>("restore_deleted_profile", { archiveId });
+			if (persistedSelectedProfileId === defaultAtRestore) persistedSelectedProfileId = restored.selectedProfileId || null;
+			try {
+				const request = ++profileListRequest;
+				const profilesAtRequest = profiles;
+				const nextProfiles = await invoke<ProfileSummary[]>("list_profiles");
+				if (request !== profileListRequest || profiles !== profilesAtRequest) {
+					throw new Error("A newer profile update superseded this list response");
+				}
+				profiles = retainProfileOrder(nextProfiles);
+			} catch (error) {
+				throw new Error(`${$_("profiles.archive.refresh_failed")}: ${String(error)}`);
+			}
+		} finally {
+			busy = false;
+		}
+	}
+
+	let featureNavigationNotice = "";
+	async function openFeature(feature: MotionFeature): Promise<void> {
+		if (featureNavigationNotice && message === featureNavigationNotice) message = "";
+		featureNavigationNotice = "";
+		if (feature.destination === "profiles" && selectedProfileId && profileDetail?.id !== selectedProfileId) {
+			message = featureNavigationNotice = featureText(
+				{
+					ja: "プロフィールを読み込んでいます。読み込み後にもう一度開いてください。",
+					en: "Loading the selected profile. Open the feature after loading finishes.",
+				},
+				$locale
+			);
+			return;
+		}
+		const incompatible = feature.engine && feature.engine !== engineType;
+		activeTab = feature.destination;
+		await tick();
+		const target = document.getElementById(featureAnchor(feature, engineType) ?? "");
+		if (target) {
+			target.scrollIntoView({ block: "start" });
+			target.focus({ preventScroll: true });
+		}
+		if (incompatible)
+			message = featureNavigationNotice = featureText(
+				{
+					ja: "この機能は別の入力方式を使います。エンジン種別で選べます。設定は自動変更していません。",
+					en: "This feature uses another input engine. Choose it under Engine type. No settings were changed.",
+				},
+				$locale
+			);
+		else if (feature.anchor && !target)
+			message = featureNavigationNotice = featureText(
+				{
+					ja: "操作するプロフィール、または稼働中の対象を選ぶと、この機能を使えます。",
+					en: "Select a profile or running capture to use this feature.",
+				},
+				$locale
+			);
+	}
+
+	function startProfileWrite(profileId: string, fields: Record<string, unknown>, retryId?: number): number {
+		const id = ++profileWriteSequence;
+		const expectedRevision = retryId !== undefined
+			? profileWrites.find(write => write.id === retryId)?.expectedRevision
+			: profileDetail?.id === profileId ? profileDetail.revision : profileSaveQueue.revision(profileId);
+		profileWrites = beginProfileWrite(profileWrites, id, profileId,
+			profiles.find(p => p.id === profileId)?.name ?? profileId, fields, retryId, expectedRevision);
+		return id;
+	}
+
+	function acceptProfileSummaryWrite(profileId: string, writeId: number): boolean {
+		if (writeId < (appliedProfileSummaryWrites.get(profileId) ?? 0)) return false;
+		appliedProfileSummaryWrites.set(profileId, writeId);
+		return true;
+	}
+
+	async function retryProfileWrite(write: ProfileWrite) {
+		const current = profileWrites.find(w => w.id === write.id);
+		if (!current || !canRetryProfileWrite(current)) return;
+		await updateProfileFields(current.fields, current.profileId, current.id);
+	}
+
+	function retainInvalidProfileInput(field: string, value: string, reason: string) {
+		if (!selectedProfileId) return;
+		const id = startProfileWrite(selectedProfileId, { [field]: value });
+		profileWrites = finishProfileWrite(profileWrites, id, `input_validation: ${reason}`);
+	}
+
+	function discardProfileWrite(id: number) {
+		profileWrites = profileWrites.filter(w => w.id !== id || w.state === "saving");
+	}
+
+	const videoProbeRequests = new Map<string, number>();
+	function invalidateVideoProbe(profileId: string): number {
+		const request = (videoProbeRequests.get(profileId) ?? 0) + 1;
+		videoProbeRequests.set(profileId, request);
+		return request;
+	}
+
+	async function updateProfileField(field: string, value: unknown, profileId = selectedProfileId) {
+		if (!profileId) return;
+		if (/^pipeline_components\.input(?:_path|_fps|_width|_height)?$/.test(field)) invalidateVideoProbe(profileId);
+		if (profileDetail?.id === profileId) {
+			const fields = { [field]: value };
+			const migrated = smoothingMigration(profileDetail.runtime, fields);
+			if (migrated !== fields) return updateProfileFields(fields, profileId);
+		}
+		const request = ++profileDetailRequest;
+		const writeId = startProfileWrite(profileId, { [field]: value });
+		// Dispatch the same snapshot retained for recovery after waiting in the queue.
+		value = profileWrites.find(write => write.id === writeId)!.fields[field];
+		let saved = false;
+		let deliveryWarning: string | null = null;
+		try {
+			const detail = await profileSaveQueue.run(profileId, profileWrites.find(write => write.id === writeId)?.expectedRevision, expectedRevision => invoke<ProfileDetail>("update_profile_field", {
+				profileId,
 				field,
 				value,
-			});
-			profileDetail = detail;
-			profiles = profiles.map((profile) =>
+				...(expectedRevision ? { expectedRevision } : {}),
+			}));
+			saved = true;
+			profileWrites = finishProfileWrite(profileWrites, writeId);
+			const syncWarning = profileSyncWarning(detail, $locale ?? "ja-JP");
+			deliveryWarning = syncWarning;
+			errorMessage = profileSyncFeedback.update(detail, $locale ?? "ja-JP", errorMessage);
+			if (selectedProfileId === profileId && request === profileDetailRequest) profileDetail = detail;
+			if (acceptProfileSummaryWrite(profileId, writeId)) profiles = profiles.map((profile) =>
 				profile.id === detail.id
 					? {
 							...profile,
@@ -1320,16 +1692,19 @@
 						}
 					: profile
 			);
-			// name 変更を一覧に即時反映するため refresh
+			// Refresh summaries without rereading a newer edit or another selected profile.
 			if (field === "name" || field === "icon_path" || field === "group") {
-				await refreshProfiles();
+				await refreshProfiles(false);
 			}
 			// 編集が稼働中の Capturer に sync 反映されると、対象 profile で動く
 			// runtime だけが restart する。UX を滑らかにするため telemetry を即時更新する
 			// (1.5s の polling を待たない)。
 			await refreshRuntimeStatuses();
 		} catch (error) {
-			errorMessage = `update_profile_field(${field}) failed: ${String(error)}`;
+			if (!saved) profileWrites = finishProfileWrite(profileWrites, writeId, String(error));
+			errorMessage = saved
+				? [deliveryWarning, savedProfileRefreshWarning(profileId, error, $locale ?? "ja-JP")].filter(Boolean).join("\n")
+				: `update_profile_field(${profileId}, ${field}) failed: ${String(error)}`;
 		}
 	}
 
@@ -1338,25 +1713,30 @@
 		const id = capturer.id;
 		const profile_id = capturer.profileId ?? null;
 		if (!profile_id) {
-			errorMessage = `restart capturer failed: profile is unknown for #${id}`;
+			errorMessage = $_("capturers.messages.restart_profile_unknown", { values: { id } });
 			return;
 		}
+		const originSelection = selectedCapturerId;
+		restartingCapturerId = id;
 		busy = true;
-		message = `Restarting #${id}...`;
+		message = $_("capturers.messages.restarting", { values: { id } });
 		errorMessage = "";
 		try {
+			// Keep the running capturer if its saved profile cannot be loaded.
+			await invoke<ProfileDetail>("get_profile_detail", { profileId: profile_id });
 			await invoke("stop_capturer", { id });
 			const instance = await invoke<CapturerInstance>("launch_capturer", {
 				profileId: profile_id,
 				allowNonLoopback: false,
 			});
-			selectedCapturerId = instance.id;
 			await refreshCapturers();
-			message = `Restarted as #${instance.id}`;
+			if (selectedCapturerId === originSelection) selectedCapturerId = instance.id;
+			message = $_("capturers.messages.restarted", { values: { id: instance.id } });
 		} catch (error) {
-			errorMessage = `restart capturer failed: ${String(error)}`;
+			errorMessage = $_("capturers.messages.restart_failed", { values: { error: String(error) } });
 			message = "";
 		} finally {
+			restartingCapturerId = null;
 			busy = false;
 		}
 	}
@@ -1580,24 +1960,38 @@
 		});
 	}
 
+	async function finishCapturerProfileSave(detail: ProfileDetail, success: string, scope = { editor: profileDetailRequest, capturer: capturerProfileDetailRequest, observe: profileSaveQueue.captureObserver() }): Promise<void> {
+		if (selectedProfileId === detail.id && profileDetailRequest === scope.editor) {
+			profileDetailRequest++;
+			profileDetail = detail;
+		}
+		if (selectedCapturerProfileId === detail.id && capturerProfileDetailRequest === scope.capturer) {
+			capturerProfileDetailRequest++;
+			selectedCapturerProfileDetail = detail;
+		}
+		scope.observe(detail.id, detail.revision);
+		const deliveryWarning = profileSyncFeedback.update(detail, $locale ?? "ja-JP", errorMessage);
+		message = success;
+		errorMessage = deliveryWarning;
+		try {
+			await refreshProfiles(false);
+			await refreshRuntimeStatuses();
+		} catch (error) {
+			errorMessage = [deliveryWarning, savedProfileRefreshWarning(detail.id, error, $locale ?? "ja-JP")].filter(Boolean).join("\n");
+		}
+	}
+
 	async function calibrateCapturerNeutral(capturer: CapturerInstance, pose: CalibrationPoseKind): Promise<void> {
 		if (busy || calibratingCapturerId != null) return;
 		calibratingCapturerId = capturer.id;
 		const poseLabel = calibrationPoseDisplayLabel(pose);
 		message = `${poseLabel} calibration #${capturer.id}: prepare pose...`;
 		errorMessage = "";
+		const resultScope = { editor: profileDetailRequest, capturer: capturerProfileDetailRequest, observe: profileSaveQueue.captureObserver() };
 		try {
 			await runCalibrationCountdown(pose, capturer.id);
 			const detail = await invokeCapturerNeutralCalibration(capturer, pose);
-			if (profileDetail?.id === detail.id || selectedProfileId === detail.id) {
-				profileDetail = detail;
-			}
-			if (selectedCapturerProfileId === detail.id) {
-				selectedCapturerProfileDetail = detail;
-			}
-			await refreshProfiles();
-			await refreshRuntimeStatuses();
-			message = `${poseLabel} calibration saved for ${detail.name}`;
+			await finishCapturerProfileSave(detail, `${poseLabel} calibration saved for ${detail.name}`, resultScope);
 		} catch (error) {
 			errorMessage = `neutral calibration failed: ${String(error)}`;
 			message = "";
@@ -1612,19 +2006,12 @@
 		calibratingCapturerId = capturer.id;
 		message = `Clearing calibration #${capturer.id}...`;
 		errorMessage = "";
+		const resultScope = { editor: profileDetailRequest, capturer: capturerProfileDetailRequest, observe: profileSaveQueue.captureObserver() };
 		try {
 			const detail = await invoke<ProfileDetail>("clear_capturer_neutral_calibration", {
 				id: capturer.id,
 			});
-			if (profileDetail?.id === detail.id || selectedProfileId === detail.id) {
-				profileDetail = detail;
-			}
-			if (selectedCapturerProfileId === detail.id) {
-				selectedCapturerProfileDetail = detail;
-			}
-			await refreshProfiles();
-			await refreshRuntimeStatuses();
-			message = `Calibration cleared for ${detail.name}`;
+			await finishCapturerProfileSave(detail, `Calibration cleared for ${detail.name}`, resultScope);
 		} catch (error) {
 			errorMessage = `clear calibration failed: ${String(error)}`;
 			message = "";
@@ -1638,6 +2025,7 @@
 		calibratingCapturerId = capturer.id;
 		message = `Face Head personal correction #${capturer.id}: face front...`;
 		errorMessage = "";
+		const resultScope = { editor: profileDetailRequest, capturer: capturerProfileDetailRequest, observe: profileSaveQueue.captureObserver() };
 		try {
 			await runActionCountdown(
 				`Face Head personal correction #${capturer.id}`,
@@ -1648,13 +2036,8 @@
 				id: capturer.id,
 				validSampleCount: Math.max(1, Math.min(240, Math.round(appSettings.calibrationSampleCount ?? 90))),
 			});
-			if (profileDetail?.id === detail.id || selectedProfileId === detail.id) {
-				profileDetail = detail;
-			}
-			await refreshProfiles();
-			await refreshRuntimeStatuses();
 			const neutral = detail.runtime.modifierFacePoseModelNeutralNoseDropEyeMouth;
-			message = `Face Head personal correction saved for ${detail.name}${neutral == null ? "" : ` (${neutral.toFixed(3)})`}`;
+			await finishCapturerProfileSave(detail, `Face Head personal correction saved for ${detail.name}${neutral == null ? "" : ` (${neutral.toFixed(3)})`}`, resultScope);
 		} catch (error) {
 			errorMessage = `Face Head personal correction build failed: ${String(error)}`;
 			message = "";
@@ -1671,24 +2054,25 @@
 			errorMessage = `clear Face Head personal correction failed: profile is unknown for #${capturer.id}`;
 			return;
 		}
+		const expectedRevision = selectedCapturerProfileDetail?.id === profileId
+			? selectedCapturerProfileDetail.revision
+			: profileDetail?.id === profileId ? profileDetail.revision : profileSaveQueue.revision(profileId);
+		if (!expectedRevision) {
+			errorMessage = "保存内容を確認できていません。設定を再読み込みしてから個人補正を解除してください。";
+			return;
+		}
 		busy = true;
 		message = `Clearing Face Head personal correction #${capturer.id}...`;
 		errorMessage = "";
+		const resultScope = { editor: profileDetailRequest, capturer: capturerProfileDetailRequest, observe: profileSaveQueue.captureObserver() };
 		try {
-			const detail = await invoke<ProfileDetail>("update_profile_field", {
+			const detail = await profileSaveQueue.run(profileId, expectedRevision, revision => invoke<ProfileDetail>("update_profile_field", {
 				profileId,
 				field: "runtime_selection.modifier.face_pose_model.enabled",
 				value: false,
-			});
-			if (profileDetail?.id === detail.id || selectedProfileId === detail.id) {
-				profileDetail = detail;
-			}
-			if (selectedCapturerProfileId === detail.id) {
-				selectedCapturerProfileDetail = detail;
-			}
-			await refreshProfiles();
-			await refreshRuntimeStatuses();
-			message = `Face Head personal correction cleared for ${detail.name}`;
+				expectedRevision: revision,
+			}));
+			await finishCapturerProfileSave(detail, `Face Head personal correction cleared for ${detail.name}`, resultScope);
 		} catch (error) {
 			errorMessage = `clear Face Head personal correction failed: ${String(error)}`;
 			message = "";
@@ -1701,18 +2085,23 @@
 		if (busy || calibratingCapturerId != null || !profileDetail) return;
 		const profileId = profileDetail.id;
 		const profileName = profileDetail.name;
-		await refreshCapturers();
-		const existing = capturers.find(
-			(capturer) => capturer.profileId === profileId && (capturer.state === "running" || capturer.state === "starting")
-		);
-		let capturer = existing ?? null;
+		let capturer: CapturerInstance | null = null;
 		let shouldStopAfterBuild = false;
 		busy = true;
-		message = existing
-			? `Face Head personal correction #${existing.id}: face front...`
-			: `Launching ${profileName} for Face Head personal correction...`;
 		errorMessage = "";
+		const resultScope = { editor: profileDetailRequest, capturer: capturerProfileDetailRequest, observe: profileSaveQueue.captureObserver() };
 		try {
+			const previousGeneration = capturerListGeneration;
+			await refreshCapturers();
+			if (capturerListGeneration === previousGeneration) {
+				throw new Error(errorMessage || "Capturer list could not be refreshed. Retry after the connection recovers.");
+			}
+			capturer = capturers.find(
+				(candidate) => candidate.profileId === profileId && (candidate.state === "running" || candidate.state === "starting")
+			) ?? null;
+			message = capturer
+				? `Face Head personal correction #${capturer.id}: face front...`
+				: `Launching ${profileName} for Face Head personal correction...`;
 			if (!capturer) {
 				capturer = await invoke<CapturerInstance>("launch_capturer", {
 					profileId,
@@ -1732,12 +2121,8 @@
 				id: capturer.id,
 				validSampleCount: Math.max(1, Math.min(240, Math.round(appSettings.calibrationSampleCount ?? 90))),
 			});
-			profileDetail = detail;
-			selectedProfileId = detail.id;
-			await refreshProfiles();
-			await refreshRuntimeStatuses();
 			const neutral = detail.runtime.modifierFacePoseModelNeutralNoseDropEyeMouth;
-			message = `Face Head personal correction saved for ${detail.name}${neutral == null ? "" : ` (${neutral.toFixed(3)})`}`;
+			await finishCapturerProfileSave(detail, `Face Head personal correction saved for ${detail.name}${neutral == null ? "" : ` (${neutral.toFixed(3)})`}`, resultScope);
 		} catch (error) {
 			errorMessage = `Face Head personal correction build failed: ${String(error)}`;
 			message = "";
@@ -1749,7 +2134,7 @@
 					await invoke("stop_capturer", { id: capturer.id });
 					await refreshCapturers();
 				} catch (error) {
-					errorMessage = `Face Head personal correction saved, but temporary capturer stop failed: ${String(error)}`;
+					errorMessage = [errorMessage, `Temporary capturer cleanup failed: ${String(error)}`].filter(Boolean).join("\n");
 				}
 			}
 			busy = false;
@@ -1812,20 +2197,40 @@
 		busy = true;
 		message = `Clearing calibration for ${targets.length} capturers...`;
 		errorMessage = "";
+		let resultRequest = profileDetailRequest;
+		let capturerResultRequest = capturerProfileDetailRequest;
+		const observe = profileSaveQueue.captureObserver();
+		let deliveryWarnings = "";
+		const completed: number[] = [];
+		let pendingTarget: number | null = null;
 		try {
 			let lastDetail: ProfileDetail | null = null;
 			for (const capturer of targets) {
+				pendingTarget = capturer.id;
 				lastDetail = await invoke<ProfileDetail>("clear_capturer_neutral_calibration", { id: capturer.id });
-				if (profileDetail?.id === lastDetail.id || selectedProfileId === lastDetail.id) {
+				completed.push(capturer.id);
+				pendingTarget = null;
+				if (selectedProfileId === lastDetail.id && profileDetailRequest === resultRequest) {
+					resultRequest = ++profileDetailRequest;
 					profileDetail = lastDetail;
 				}
+				if (selectedCapturerProfileId === lastDetail.id && capturerProfileDetailRequest === capturerResultRequest) {
+					capturerResultRequest = ++capturerProfileDetailRequest;
+					selectedCapturerProfileDetail = lastDetail;
+				}
+				observe(lastDetail.id, lastDetail.revision);
+				deliveryWarnings = profileSyncFeedback.update(lastDetail, $locale ?? "ja-JP", deliveryWarnings);
 			}
-			await refreshProfiles();
+			errorMessage = deliveryWarnings;
+			await refreshProfiles(false);
 			await refreshRuntimeStatuses();
 			message = `Calibration cleared for ${targets.length} capturers`;
 		} catch (error) {
-			errorMessage = `clear ALL calibration failed: ${String(error)}`;
-			message = "";
+			errorMessage = pendingTarget === null
+				? `Calibration result refresh failed: ${String(error)}`
+				: `Clear calibration #${pendingTarget} failed: ${String(error)}`;
+			errorMessage = [deliveryWarnings, errorMessage].filter(Boolean).join("\n");
+			message = completed.length ? `Calibration cleared: ${completed.map(id => `#${id}`).join(", ")}` : "";
 		} finally {
 			busy = false;
 		}
@@ -1839,43 +2244,50 @@
 		const poseLabel = calibrationPoseDisplayLabel(pose);
 		message = `${poseLabel} calibration ALL: prepare pose...`;
 		errorMessage = "";
+		let resultRequest = profileDetailRequest;
+		let capturerResultRequest = capturerProfileDetailRequest;
+		const observe = profileSaveQueue.captureObserver();
+		let deliveryWarnings = "";
+		const completed: number[] = [];
+		let pendingTarget: number | null = null;
 		try {
 			await runActionCountdown(`${poseLabel} calibration ALL`, "sampling", calibrationOverlay(pose, `${targets.length} Capturers`));
 			let lastDetail: ProfileDetail | null = null;
 			for (const capturer of targets) {
+				pendingTarget = capturer.id;
 				lastDetail = await invokeCapturerNeutralCalibration(capturer, pose);
-				if (profileDetail?.id === lastDetail.id || selectedProfileId === lastDetail.id) {
+				completed.push(capturer.id);
+				pendingTarget = null;
+				if (selectedProfileId === lastDetail.id && profileDetailRequest === resultRequest) {
+					resultRequest = ++profileDetailRequest;
 					profileDetail = lastDetail;
 				}
+				if (selectedCapturerProfileId === lastDetail.id && capturerProfileDetailRequest === capturerResultRequest) {
+					capturerResultRequest = ++capturerProfileDetailRequest;
+					selectedCapturerProfileDetail = lastDetail;
+				}
+				observe(lastDetail.id, lastDetail.revision);
+				deliveryWarnings = profileSyncFeedback.update(lastDetail, $locale ?? "ja-JP", deliveryWarnings);
 			}
-			await refreshProfiles();
+			errorMessage = deliveryWarnings;
+			await refreshProfiles(false);
 			await refreshRuntimeStatuses();
 			message = `${poseLabel} calibration saved for ${targets.length} capturers`;
 		} catch (error) {
-			errorMessage = `calibrate ALL ${poseLabel} failed: ${String(error)}`;
-			message = "";
+			errorMessage = pendingTarget !== null
+				? `${poseLabel} calibration #${pendingTarget} failed: ${String(error)}`
+				: `${completed.length ? "Calibration result refresh" : "Calibration preparation"} failed: ${String(error)}`;
+			errorMessage = [deliveryWarnings, errorMessage].filter(Boolean).join("\n");
+			message = completed.length ? `${poseLabel} calibration saved: ${completed.map(id => `#${id}`).join(", ")}` : "";
 		} finally {
 			actionCountdownOverlay = null;
 			busy = false;
 		}
 	}
 
-	function smoothingEmaEnabled(runtime: ProfileRuntimeView): boolean {
-		if (runtime.modifierSmoothingEmaEnabled !== null) return runtime.modifierSmoothingEmaEnabled;
-		return ["low", "medium", "high"].includes(runtime.modifierSmoothingPreset ?? "");
-	}
-
-	function smoothingOneEuroEnabled(runtime: ProfileRuntimeView): boolean {
-		if (runtime.modifierSmoothingOneEuroEnabled !== null) return runtime.modifierSmoothingOneEuroEnabled;
-		return runtime.modifierSmoothingPreset === "adaptive";
-	}
-
-	function smoothingEmaAlpha(runtime: ProfileRuntimeView): number {
-		if (runtime.modifierSmoothingEmaAlpha !== null) return runtime.modifierSmoothingEmaAlpha;
-		if (runtime.modifierSmoothingPreset === "low") return 0.7;
-		if (runtime.modifierSmoothingPreset === "high") return 0.25;
-		return 0.45;
-	}
+	function smoothingEmaEnabled(runtime: ProfileRuntimeView): boolean { return effectiveSmoothing(runtime).ema; }
+	function smoothingOneEuroEnabled(runtime: ProfileRuntimeView): boolean { return effectiveSmoothing(runtime).oneEuro; }
+	function smoothingEmaAlpha(runtime: ProfileRuntimeView): number { return effectiveSmoothing(runtime).alpha; }
 
 	function torsoPitchScale(runtime: ProfileRuntimeView): number {
 		return clampNumber(runtime.modifierTorsoPitchScale ?? 1.0, 0.0, 1.0);
@@ -1932,8 +2344,7 @@
 				: part === "hands"
 					? runtime.modifierLostSignalHandsBehavior
 					: runtime.modifierLostSignalArmsBehavior;
-		if (value === "hold" || value === "drop" || value === "rest-pose") return value;
-		return part === "head" ? "hold" : "rest-pose";
+		return resolvedLostBehavior(part, value, runtime.modifierLostSignalBehavior);
 	}
 
 	function lostSignalPartRestPoseBlend(runtime: ProfileRuntimeView, part: LostSignalPart): number {
@@ -2126,50 +2537,67 @@
 		return profile?.runtimeSelection?.fps ?? profile?.pipelineComponents?.inputFps ?? null;
 	}
 
-	async function updateProfileFields(fields: Record<string, unknown>): Promise<void> {
-		if (!selectedProfileId) return;
+	async function updateProfileFields(fields: Record<string, unknown>, profileId = selectedProfileId, retryId?: number): Promise<void> {
+		if (!profileId || Object.keys(fields).length === 0) return;
+		if (Object.keys(fields).some(field => /^pipeline_components\.input(?:_path|_fps|_width|_height)?$/.test(field))) invalidateVideoProbe(profileId);
+		if (retryId === undefined && profileDetail?.id === profileId) fields = smoothingMigration(profileDetail.runtime, fields, profileWrites.filter(write => write.profileId === profileId).map(write => write.fields));
+		const request = ++profileDetailRequest;
+		const writeId = startProfileWrite(profileId, fields, retryId);
+		fields = profileWrites.find(write => write.id === writeId)!.fields;
+		let saved = false;
+		let deliveryWarning: string | null = null;
 		try {
-			let detail: ProfileDetail | null = null;
-			for (const [field, value] of Object.entries(fields)) {
-				detail = await invoke<ProfileDetail>("update_profile_field", {
-					profileId: selectedProfileId,
-					field,
-					value,
-				});
-			}
-			if (detail) {
+			const updates = Object.entries(fields).map(([field, value]) => ({ field, value }));
+			if (updates.length === 0) return;
+			const detail = await profileSaveQueue.run(profileId, profileWrites.find(write => write.id === writeId)?.expectedRevision,
+				expectedRevision => invoke<ProfileDetail>("update_profile_fields", { profileId, updates, ...(expectedRevision ? { expectedRevision } : {}) }));
+			saved = true;
+			profileWrites = finishProfileWrite(profileWrites, writeId);
+			const syncWarning = profileSyncWarning(detail, $locale ?? "ja-JP");
+			deliveryWarning = syncWarning;
+			errorMessage = profileSyncFeedback.update(detail, $locale ?? "ja-JP", errorMessage);
+			if (detail && selectedProfileId === profileId && request === profileDetailRequest) {
 				profileDetail = detail;
 			}
+			if (acceptProfileSummaryWrite(profileId, writeId)) profiles = profiles.map((profile) => profile.id === detail.id
+				? { ...profile, name: detail.name, note: detail.note, iconPath: detail.iconPath, group: detail.group, engine: detail.runtime.engine }
+				: profile);
 			await refreshRuntimeStatuses();
 		} catch (error) {
-			errorMessage = `update profile fields failed: ${String(error)}`;
+			if (!saved) profileWrites = finishProfileWrite(profileWrites, writeId, String(error));
+			errorMessage = saved
+				? [deliveryWarning, savedProfileRefreshWarning(profileId, error, $locale ?? "ja-JP")].filter(Boolean).join("\n")
+				: `update profile fields (${profileId}) failed: ${String(error)}`;
 		}
 	}
 
 	async function browseInputFile(): Promise<void> {
 		if (!selectedProfileId) return;
+		const profileId = selectedProfileId;
 		const kind = mediaPipeSourceType === "file-video" ? "file-video" : "file-image";
 		try {
 			const path = await invoke<string | null>("pick_file_path", { kind });
 			if (path == null) return;
 			if (kind === "file-video") {
-				await updateVideoInputPath(path);
+				await updateVideoInputPath(path, profileId);
 			} else {
-				await updateProfileField("pipeline_components.input_path", path);
+				await updateProfileField("pipeline_components.input_path", path, profileId);
 			}
 		} catch (error) {
 			errorMessage = `pick input file failed: ${String(error)}`;
 		}
 	}
 
-	async function updateVideoInputPath(path: string | null): Promise<void> {
+	async function updateVideoInputPath(path: string | null, profileId = selectedProfileId): Promise<void> {
+		if (!profileId) return;
+		const request = invalidateVideoProbe(profileId);
 		if (!path) {
 			await updateProfileFields({
 				"pipeline_components.input_path": null,
 				"pipeline_components.input_fps": null,
 				"pipeline_components.input_width": null,
 				"pipeline_components.input_height": null,
-			});
+			}, profileId);
 			return;
 		}
 		const fields: Record<string, unknown> = {
@@ -2180,16 +2608,18 @@
 				path,
 				ffmpegPath: appSettings.externalToolsFfmpegPath ?? null,
 			});
+			if (videoProbeRequests.get(profileId) !== request) return;
 			fields["pipeline_components.input_fps"] = meta.fpsRounded ?? null;
 			fields["pipeline_components.input_width"] = meta.width ?? null;
 			fields["pipeline_components.input_height"] = meta.height ?? null;
 			const fpsLabel = meta.fps != null ? meta.fps.toFixed(3).replace(/\.?0+$/, "") : "unknown";
-			message = `Video metadata: ${meta.width ?? "?"}x${meta.height ?? "?"} @ ${fpsLabel} fps`;
+			if (selectedProfileId === profileId) message = `Video metadata: ${meta.width ?? "?"}x${meta.height ?? "?"} @ ${fpsLabel} fps`;
 		} catch (error) {
+			if (videoProbeRequests.get(profileId) !== request) return;
 			fields["pipeline_components.input_fps"] = null;
-			errorMessage = `video metadata probe failed: ${String(error)}`;
+			if (selectedProfileId === profileId) errorMessage = `video metadata probe failed: ${String(error)}`;
 		}
-		await updateProfileFields(fields);
+		await updateProfileFields(fields, profileId);
 	}
 
 	function webcamFormatValue(format: WebcamFormatDto): string {
@@ -2232,12 +2662,10 @@
 			});
 			return;
 		}
-		await invoke("update_profile_field", {
-			profileId: selectedProfileId,
-			field: "pipeline_components.input_pixel_format",
-			value: null,
+		await updateProfileFields({
+			"pipeline_components.input_pixel_format": null,
+			"runtime_selection.resolution": raw,
 		});
-		await updateProfileField("runtime_selection.resolution", raw);
 	}
 
 	/// 表示・保存上の Engine Type を解決する。
@@ -2291,53 +2719,12 @@
 		}
 	}
 
-	/// Engine Type の変更を一括反映する。
-	/// VMC / iFacialMocap engine では MediaPipe webcam 用フィールドも同時にクリアして
-	/// 不釣り合いなフィールド残留 (古い設定の引きずり) を防ぐ。
+	/// 入力方式の切替は選択だけを変更する。各方式の保存値は、戻した際に再利用する。
+	/// 実行側は engine ごとに専用 source を開くため、非選択方式の値を削除する必要はない。
 	async function updateEngineType(newType: EngineType): Promise<void> {
-		if (!selectedProfileId) return;
-		try {
-			// VMC / iFacialMocap に切り替えるときは MediaPipe webcam 関連フィールドもクリア。
-			if (newType === "vmc" || newType === "ifacialmocap") {
-				await invoke("update_profile_field", {
-					profileId: selectedProfileId,
-					field: "runtime_selection.device",
-					value: null,
-				});
-				await invoke("update_profile_field", {
-					profileId: selectedProfileId,
-					field: "runtime_selection.resolution",
-					value: null,
-				});
-				await invoke("update_profile_field", {
-					profileId: selectedProfileId,
-					field: "pipeline_components.input",
-					value: null,
-				});
-				await invoke("update_profile_field", {
-					profileId: selectedProfileId,
-					field: "pipeline_components.input_path",
-					value: null,
-				});
-			}
-			// MediaPipe 系に切り替えるときは VMC / iFacialMocap listen address をクリア。
-			if (newType === "mediapipe-native") {
-				await invoke("update_profile_field", {
-					profileId: selectedProfileId,
-					field: "runtime_selection.vmc_receive_listen_addr",
-					value: null,
-				});
-				await invoke("update_profile_field", {
-					profileId: selectedProfileId,
-					field: "runtime_selection.ifacialmocap_receive_listen_addr",
-					value: null,
-				});
-			}
-			// 最後に engine 自体を更新 (これで profileDetail も refresh される)。
-			await updateProfileField("runtime_selection.engine", newType);
-		} catch (error) {
-			errorMessage = `update engine type failed: ${String(error)}`;
-		}
+		const profileId = selectedProfileId;
+		if (!profileId) return;
+		await updateProfileFields({ "runtime_selection.engine": newType }, profileId);
 	}
 
 	/// MediaPipe Source Type の変更を ``pipeline_components.input`` に書き込む。
@@ -2363,50 +2750,65 @@
 	let webcamFormats = $state<WebcamFormatDto[]>([]);
 	let webcamFormatsLoading = $state(false);
 	let webcamFormatsError = $state("");
+	let webcamDevicesRequest = 0;
+	let webcamFormatsRequest = 0;
 
 	function currentWebcamBackend(): "directshow" | "mediafoundation" | null {
+		// Empty/non-camera profiles must not query a device merely because the
+		// editor's source selector has a webcam fallback value.
+		if (!profileDetail || !isMediaPipeEngine) return null;
 		if (mediaPipeSourceType === "webcam-directshow") return "directshow";
 		if (mediaPipeSourceType === "webcam-mediafoundation") return "mediafoundation";
 		return null;
 	}
 
 	async function refreshWebcamDevices() {
+		const request = ++webcamDevicesRequest;
 		const backend = currentWebcamBackend();
 		if (!backend) {
 			webcamDevices = [];
 			webcamDevicesError = "";
+			webcamDevicesLoading = false;
 			return;
 		}
 		webcamDevicesLoading = true;
+		webcamDevices = [];
 		webcamDevicesError = "";
 		try {
-			webcamDevices = await invoke<WebcamDeviceDto[]>("enumerate_webcams", {
+			const result = await invoke<WebcamDeviceDto[]>("enumerate_webcams", {
 				backend,
 			});
+			if (request === webcamDevicesRequest) webcamDevices = result;
 		} catch (error) {
+			if (request !== webcamDevicesRequest) return;
 			webcamDevicesError = String(error);
 			webcamDevices = [];
 		} finally {
-			webcamDevicesLoading = false;
+			if (request === webcamDevicesRequest) webcamDevicesLoading = false;
 		}
 	}
 
 	async function refreshWebcamFormats(deviceIdOrName: string) {
+		const request = ++webcamFormatsRequest;
 		const backend = currentWebcamBackend();
 		if (!backend || deviceIdOrName.trim() === "") {
 			webcamFormats = [];
 			webcamFormatsError = "";
+			webcamFormatsLoading = false;
 			return;
 		}
 		webcamFormatsLoading = true;
+		webcamFormats = [];
 		webcamFormatsError = "";
 		try {
-			webcamFormats = await invoke<WebcamFormatDto[]>("enumerate_webcam_formats", { backend, deviceIdOrName });
+			const result = await invoke<WebcamFormatDto[]>("enumerate_webcam_formats", { backend, deviceIdOrName });
+			if (request === webcamFormatsRequest) webcamFormats = result;
 		} catch (error) {
+			if (request !== webcamFormatsRequest) return;
 			webcamFormatsError = String(error);
 			webcamFormats = [];
 		} finally {
-			webcamFormatsLoading = false;
+			if (request === webcamFormatsRequest) webcamFormatsLoading = false;
 		}
 	}
 
@@ -2437,57 +2839,66 @@
 			);
 			if (generation !== capturerListGeneration) return;
 			const updates: Record<number, CapturerRuntimeStatus> = {};
-			for (const result of results) {
-				if (result.status === "fulfilled") updates[result.value.id] = result.value;
+			const errors = { ...runtimeStatusErrors };
+			for (const [index, result] of results.entries()) {
+				const id = activeCapturers[index].id;
+				if (result.status === "fulfilled") { updates[id] = result.value; delete errors[id]; }
+				else errors[id] = String(result.reason);
 			}
 			runtimeStatuses = { ...runtimeStatuses, ...updates };
+			runtimeStatusErrors = errors;
 		})().finally(() => {
 			refreshRuntimeStatusesPromise = null;
 		});
 		return refreshRuntimeStatusesPromise;
 	}
 
-	async function launchCapturer() {
-		if (busy) return;
+	async function launchCapturer(): Promise<boolean> {
+		if (busy) return false;
+		const group = launchGroupName;
+		const targets = group ? launchGroupProfiles.map(profile => ({ id: profile.id, name: profile.name })) : [{ id: launchProfileId || null, name: launchProfileId || "" }];
+		const originSelection = selectedCapturerId;
+		const opened: CapturerInstance[] = [];
+		let failed = false;
+		let targetName = "";
 		busy = true;
-		message = "Launching capturer...";
+		message = $_("capturers.messages.launching");
 		errorMessage = "";
 		try {
-			if (launchGroupName) {
-				if (launchGroupProfiles.length === 0) {
-					throw new Error(`No profiles in group: ${launchGroupName}`);
-				}
-				let lastInstance: CapturerInstance | null = null;
-				for (const profile of launchGroupProfiles) {
-					lastInstance = await invoke<CapturerInstance>("launch_capturer", {
-						profileId: profile.id,
-						allowNonLoopback: false,
-					});
-				}
-				if (lastInstance) selectedCapturerId = lastInstance.id;
-				await refreshCapturers();
-				message = `Launched ${launchGroupProfiles.length} capturers`;
-				return;
+			if (targets.length === 0) throw new Error($_("capturers.messages.empty_group", { values: { name: group } }));
+			for (const target of targets) {
+				targetName = target.name || target.id || "";
+				opened.push(await invoke<CapturerInstance>("launch_capturer", { profileId: target.id, allowNonLoopback: false }));
 			}
-
-			const profile_id = launchProfileId || null;
-			const instance = await invoke<CapturerInstance>("launch_capturer", {
-				profileId: profile_id,
-				allowNonLoopback: false,
-			});
-			selectedCapturerId = instance.id;
-			await refreshCapturers();
-			message = `Launched #${instance.id}`;
+			message = group
+				? $_("capturers.messages.launched_group", { values: { count: opened.length } })
+				: $_("capturers.messages.launched", { values: { id: opened[0].id } });
 		} catch (error) {
-			await refreshCapturers();
-			errorMessage = `launch_capturer failed: ${String(error)}`;
-			message = "";
+			failed = true;
+			errorMessage = $_("capturers.messages.launch_target_failed", { values: { name: targetName || group || "", error: String(error) } });
+			message = opened.length
+				? $_("capturers.messages.partial_launch", { values: { count: opened.length, ids: opened.map(item => `#${item.id}`).join(", ") } })
+				: "";
 		} finally {
-			busy = false;
+			if (opened.length && selectedCapturerId === originSelection) selectedCapturerId = opened[opened.length - 1].id;
+			try { await refreshCapturers(); }
+			catch (error) {
+				const warning = $_("capturers.messages.refresh_failed", { values: { error: String(error) } });
+				errorMessage = [errorMessage, warning].filter(Boolean).join("\n");
+			} finally { busy = false; }
 		}
+		return !failed && opened.length > 0;
 	}
 
+	$effect(() => {
+		if (startupAutoLaunchReady && appSettingsReady && !busy) {
+			untrack(() => { void maybeAutoLaunchSelectedOnStartup(); });
+		}
+	});
+
 	async function maybeAutoLaunchSelectedOnStartup(): Promise<void> {
+		if (busy) return;
+		if (!appSettingsReady) return;
 		if (startupAutoLaunchAttempted) return;
 		startupAutoLaunchAttempted = true;
 		if (!appSettings.autoLaunchSelectedOnStartup) return;
@@ -2584,7 +2995,10 @@
 	<title>UN Motion Supervisor</title>
 </svelte:head>
 
-<main class="shell">
+<main class="shell" class:feature-navigation={previewFeatureIndex}>
+	{#if import.meta.env.VITE_UN_DESIGN_PREVIEW === "1"}
+		<p role="status">{ $locale?.startsWith("ja") ? "検討用画面 · 架空データ／保存はメモリーのみ／実機器は動作しない" : "Design preview · Simulated data / memory only / no devices connected" }</p>
+	{/if}
 	<header class="topbar">
 		<div class="brand">
 			<img src="/un-motion-artwork-supervisor.png" alt="" />
@@ -2593,15 +3007,15 @@
 				<p>{$_("app.subtitle")}</p>
 			</div>
 		</div>
-		<div class="status-strip" aria-label="Capturer status summary">
-			<span><Activity size={14} />{runningCount} running</span>
+		<div class="status-strip" aria-label={$_("app.status_aria")}>
+			<span><Activity size={14} />{$_("app.running_count", { values: { count: runningCount } })}</span>
 			<span class:warn={issueCount > 0}>
-				<AlertTriangle size={14} />{issueCount} issues
+				<AlertTriangle size={14} />{$_("app.issue_count", { values: { count: issueCount } })}
 			</span>
 			<span>{message}</span>
 		</div>
 		<div class="header-actions">
-			<div class="theme-switch" aria-label="Theme">
+			<div class="theme-switch" aria-label={$_("settings.theme.label")}>
 				<button class:active={appSettings.themeMode === "system"} onclick={() => setThemeMode("system")}
 					>{$_("theme.system")}</button
 				>
@@ -2616,10 +3030,24 @@
 	</header>
 
 	<div class="workspace">
-		<aside class="side-rail" aria-label="Primary navigation">
+		<aside class="side-rail" aria-label={$_("sidebar.aria")}>
+            {#if previewOperationsA}
+                <button class:active={activeTab === 'profiles'} onclick={() => activeTab = 'profiles'}><FileCog size={17} />{$_("supervisor_operations.profiles_runtime")}</button>
+                <button class:active={activeTab === 'capturers'} onclick={() => activeTab = 'capturers'}><Monitor size={17} />{$_("supervisor_operations.all_instances")}</button>
+                <button class:active={activeTab === 'map'} onclick={() => activeTab = 'map'}>{$_('sidebar.feature_map')}</button>
+                <button class:active={activeTab === 'logs'} onclick={() => activeTab = 'logs'}><TerminalSquare size={17} />{$_('sidebar.logs')}</button>
+                <button class:active={activeTab === 'app'} onclick={() => activeTab = 'app'}><Settings size={17} />{$_('sidebar.settings')}</button>
+                <details><summary>{$_("supervisor_operations.motion_tools")}</summary><button class:active={activeTab === 'home'} onclick={() => activeTab = 'home'}>{$_('sidebar.workspace')}</button></details>
+            {:else}
+			<button class:active={activeTab === "home"} onclick={() => (activeTab = "home")}
+				><Monitor size={17} />{$_("sidebar.workspace")}</button
+			>
 			<button class:active={activeTab === "capturers"} onclick={() => (activeTab = "capturers")}>
 				<Monitor size={17} />{$_("sidebar.capturers")}
 			</button>
+			<button class:active={activeTab === "map"} onclick={() => (activeTab = "map")}
+				><Activity size={17} />{$_("sidebar.feature_map")}</button
+			>
 			<button class:active={activeTab === "profiles"} onclick={() => (activeTab = "profiles")}>
 				<FileCog size={17} />{$_("sidebar.profiles")}
 			</button>
@@ -2629,6 +3057,7 @@
 			<button class:active={activeTab === "app"} onclick={() => (activeTab = "app")}>
 				<Settings size={17} />{$_("sidebar.settings")}
 			</button>
+            {/if}
 			<div class="rail-footer">
 				<button
 					class="danger"
@@ -2670,7 +3099,38 @@
 			</div>
 		{/if}
 
-		{#if activeTab === "capturers"}
+		{#if activeTab === "home"}
+			<MotionHome
+				{profiles}
+				{capturers}
+				{busy}
+				onMap={() => (activeTab = "map")}
+				onEdit={(id) => {
+					activeTab = "profiles";
+					void selectProfile(id);
+				}}
+				onInspect={(id) => {
+					selectedCapturerId = id;
+					activeTab = "capturers";
+				}}
+				onLaunch={(id) => {
+					if (!busy) {
+						launchTargetId = id;
+						void launchCapturer();
+					}
+				}}
+				onStop={(id) => void stopCapturer(id)}
+			/>
+		{:else if activeTab === "map"}
+			<FeatureMap
+				{profiles}
+				{selectedProfileId}
+				engine={engineType}
+				bind:query={featureQuery}
+				onSelectProfile={(id) => void selectProfile(id)}
+				onOpen={(feature) => void openFeature(feature)}
+			/>
+		{:else if activeTab === "capturers"}
 			<section class="view">
 				<div class="toolbar">
 					<button class="primary" disabled={busy || profiles.length === 0} onclick={launchCapturer}>
@@ -2681,7 +3141,7 @@
 							type="button"
 							class="launch-select-button launch-select-text-only"
 							disabled={busy || profiles.length === 0}
-							title={launchGroupName || launchProfileSummary?.name || ""}
+							title={launchGroupName || (launchProfileSummary ? `${launchProfileSummary.name} · ${launchProfileSummary.id}` : "")}
 							onclick={() => (capturersProfileMenuOpen = !capturersProfileMenuOpen)}
 						>
 							{#if profiles.length === 0}
@@ -2690,6 +3150,7 @@
 								<strong>Group: {launchGroupName}</strong>
 							{:else if launchProfileSummary}
 								<strong>{launchProfileSummary.name}</strong>
+								<small>ID: {launchProfileSummary.id}</small>
 							{:else}
 								<strong>{$_("capturers.toolbar.pick_profile")}</strong>
 							{/if}
@@ -2728,7 +3189,8 @@
 									>
 										<span>
 											<strong>{profile.name}</strong>
-											<small>{profile.note ? profile.note : profile.id}</small>
+											<small>ID: {profile.id}</small>
+											{#if profile.note}<small>{profile.note}</small>{/if}
 										</span>
 									</button>
 								{/each}
@@ -2815,7 +3277,7 @@
 							</thead>
 							<tbody>
 								{#each capturerTableCapturers as capturer (capturer.id)}
-									{@const fps = runtimeStatuses[capturer.id]?.fps ?? null}
+									{@const fps = runtimeStatusErrors[capturer.id] ? null : runtimeStatuses[capturer.id]?.fps ?? null}
 									{@const bestSrc = bestSourceRate(fps)}
 									{@const bestEngine = bestEngineRate(fps)}
 									{@const capProfileId = capturer.profileId ?? null}
@@ -2841,9 +3303,11 @@
 											>
 												<span class={stateClass(capturer.state)}>{capturerStateLabel(capturer.state)}</span>
 											</button>
+											{#if runtimeStatusErrors[capturer.id]}<small role="status" title={runtimeStatusErrors[capturer.id]}>{$_("capturers.details.telemetry_unavailable")}</small>{/if}
 										</td>
-										<td class="process-cell-profile" title={`${capProfileName} · ${capEngineLabel}`}>
+										<td class="process-cell-profile" title={`${capProfileName} · ${capProfileId ?? "—"} · ${capEngineLabel}`}>
 											<strong>{capProfileName}</strong>
+											{#if capProfileId}<small>ID: {capProfileId}</small>{/if}
 											<small>{capEngineLabel}</small>
 										</td>
 										<td class="process-cell-source" title={profileSummarySourceLine(capProf)}>
@@ -2853,7 +3317,7 @@
 										<td class="process-cell-perf">
 											<span>Engine {formatTelemetryWithUnit(bestEngine, "fps")}</span>
 											<small
-												>Input {formatTelemetryWithUnit(bestSrc ?? profileSummaryOutputFps(capProf), "fps")}</small
+												>Input {formatTelemetryWithUnit(bestSrc ?? (runtimeStatusErrors[capturer.id] ? null : profileSummaryOutputFps(capProf)), "fps")}</small
 											>
 										</td>
 										<td class="process-cell-output">
@@ -2876,6 +3340,7 @@
 
 					<aside class="panel details-panel">
 						<h2>{$_("capturers.details.title")}</h2>
+						{#if selectedCapturer}<p class="muted-small" data-testid="capturer-operation-target">{selectedCapturerProfileSummary?.name ?? selectedCapturer.name} · #{selectedCapturer.id} · ID: {selectedCapturer.profileId ?? "—"}</p>{/if}
 						{#if selectedCapturer}
 							{@const detail = selectedCapturerProfileDetail}
 							{@const runtime = detail?.runtime}
@@ -2943,6 +3408,9 @@
 							</div>
 							<div class="capturer-diagnostic-and-calibration">
 								<div class="part-diagnostic-panel" aria-label="Motion part diagnostics">
+									{#if runtimeStatusErrors[selectedCapturer.id]}
+										<p role="status" title={runtimeStatusErrors[selectedCapturer.id]}>{$_("capturers.details.telemetry_unavailable")}</p>
+									{:else}
 									<svg viewBox="0 0 220 260" role="img" aria-hidden="true">
 										<line class="diag-spine" x1="110" y1="82" x2="110" y2="160" />
 										<path
@@ -3014,6 +3482,7 @@
 											</div>
 										{/each}
 									</div>
+									{/if}
 								</div>
 								<div class="capturer-calibration-panel">
 									<section
@@ -3021,7 +3490,7 @@
 										class:face-pose-model-panel--disabled={!canUseFacePoseModel(runtime, capturerEngine)}
 									>
 										<div class="capturer-action-group-heading">
-											<h3>Neutral calibration</h3>
+											<h3 id="feature-calibration" tabindex="-1">Neutral calibration</h3>
 											<span
 												class:status-applied={calibrationPoseFromRuntime(runtime) != null}
 												class="calibration-status-pill"
@@ -3137,7 +3606,7 @@
 								</dd>
 								<dt>{$_("capturers.details.healthy")}</dt>
 								<dd>
-									{selectedRuntime?.healthy ? $_("capturers.details.yes") : $_("capturers.details.no")}
+									{selectedRuntime == null ? $_("capturers.details.telemetry_unavailable") : selectedRuntime.healthy ? $_("capturers.details.yes") : $_("capturers.details.no")}
 								</dd>
 								{#if selectedRuntime?.note}
 									<dt>{$_("capturers.details.note")}</dt>
@@ -3261,21 +3730,23 @@
 			>
 				<div class="toolbar">
 					<button
-						class="primary"
+						class:primary={!previewOperationsA}
 						data-hint="新規作成: 既定の設定で新しいプロファイルを作成します。まずはこのまま起動し、必要な項目だけ調整する使い方を想定しています。"
 						disabled={busy}
 						onclick={() => void createNewProfile()}
 					>
 						<Plus size={16} />{$_("profiles.actions.new")}
 					</button>
+                    {#if !previewOperationsA}
 					<button
 						data-hint="Quick Launch: 選択中のプロファイルでCapturerを起動します。よく使うプロファイルをすばやく試すための操作です。"
 						disabled={busy || !selectedProfileId}
 						onclick={() => void quickLaunchSelectedProfile()}
-						title={$_("profiles.actions.quick_launch_hint")}
+						title={previewFeatureIndex ? (($locale ?? "ja").startsWith("ja") ? "編集中のプロファイルを起動します。起動ボタンの対象も、このプロファイルへ変更します。" : "Launch the profile being edited and make it the launch button target.") : $_("profiles.actions.quick_launch_hint")}
 					>
-						<Play size={16} />{$_("profiles.actions.quick_launch")}
+						<Play size={16} />{previewFeatureIndex ? (($locale ?? "ja").startsWith("ja") ? "このプロファイルを起動" : "Launch this profile") : $_("profiles.actions.quick_launch")}
 					</button>
+                    {/if}
 					<button
 						data-hint="複製: 選択中のプロファイルをコピーします。少しだけ違う設定を試したい場合に使います。"
 						disabled={busy || !selectedProfileId}
@@ -3312,7 +3783,9 @@
 					</button>
 				</div>
 
-				<div class="split settings-split">
+				<DeletedProfiles {busy} existingIds={profiles.map((profile) => profile.id)} onRestore={restoreArchivedProfile} onRefresh={() => refreshProfiles(false)} />
+				<button disabled={busy || !selectedProfileId || profileWrites.some(write => write.profileId === selectedProfileId)} onclick={() => void reloadSelectedProfile()}>{$_("profiles.archive.reload_selected")}</button>
+				<div class="split settings-split" class:operations-proposal-a={previewOperationsA}>
 					<div class="panel setting-list">
 						{#if profiles.length === 0}
 							<p class="empty">{$_("profiles.empty_workspace")}</p>
@@ -3322,7 +3795,7 @@
 									{@const runningCount = runningCountForProfile(profile.id)}
 									<div class="setting-list-row" animate:flip={{ duration: 120 }}>
 										{#if draggedProfileId === profile.id && profilePointerDrag?.active}
-											<div class="drag-placeholder" aria-hidden="true"></div>
+											<div class="drag-placeholder" style:height={`${profilePointerDrag.height}px`} aria-hidden="true"></div>
 										{/if}
 										<button
 											data-profile-id={profile.id}
@@ -3364,6 +3837,7 @@
 											<img src={iconSrc(profile.iconPath)} alt="" />
 											<span class="setting-card-body">
 												<strong>{profile.name}</strong>
+												{#if previewFeatureIndex}<small class="review-list-profile-id">{profile.id}</small>{/if}
 												<small
 													>{profile.group ? `${profile.group} · ` : ""}{profile.note
 														? profile.note
@@ -3384,16 +3858,41 @@
 						{/if}
 					</div>
 
-					<div class="panel editor-panel">
+					{#if previewOperationsA}
+						<section class="panel operations-proposal-runtime" aria-label={$_("supervisor_operations.runtime_aria")}>
+							<h2>{$_("supervisor_operations.runtime_heading", {values:{name:profileDetail?.name ?? $_("supervisor_operations.loading"),count:runningCountForProfile(selectedProfileId ?? '')}})}</h2>
+							<button class="primary" disabled={busy || !selectedProfileId} onclick={() => void quickLaunchSelectedProfile()}>{$_("supervisor_operations.launch")}</button>
+							{#each capturers.filter(c => c.profileId === profileDetail?.id && c.state !== 'exited' && c.state !== 'crashed') as capturer (capturer.id)}
+								<article><h3>Capturer #{capturer.id}</h3><p>{capturer.state}</p>
+									<button disabled={busy} onclick={() => void stopCapturer(capturer.id)}>{$_("supervisor_operations.stop_instance", {values:{id:capturer.id}})}</button>
+									<button onclick={() => jumpToCapturerLog(capturer)}>{$_("supervisor_operations.instance_logs")}</button>
+								</article>
+							{:else}<p>{$_("supervisor_operations.none")}</p>{/each}
+							<details><summary>{$_("supervisor_operations.motion_scope")}</summary>
+								<p>{$_("supervisor_operations.motion_save")}</p>
+								<p>{$_("supervisor_operations.motion_launch")}</p>
+							</details>
+							<button onclick={() => activeTab = 'home'}>{$_("supervisor_operations.workspace")}</button>
+							<ReviewProfileStop targets={capturers.filter(c => c.profileId === profileDetail?.id && c.state !== 'exited' && c.state !== 'crashed')} profileName={profileDetail?.name ?? $_("supervisor_operations.loading")} disabled={busy || !profileDetail} onStop={async(id) => {await invoke('stop_capturer',{id});await refreshCapturers();}} />
+						</section>
+					{/if}
+					<div class="panel editor-panel" inert={creatingProfile} aria-busy={creatingProfile}>
 						{#if profileDetail}
 							<div class="section-header-row">
 								<h2>{$_("profiles.editor.profile_setting_heading")}</h2>
-								<small class="muted-small">{profileDetail.name}</small>
+								<button onclick={() => (activeTab = "map")}>{$_("sidebar.feature_map")}</button>
+								<small class="muted-small">{profileDetail.name}{#if previewFeatureIndex}<span class="review-profile-id"> · {profileDetail.id}</span>{/if}</small>
 							</div>
+							<div class="profile-editor-scroll">
+							{#if previewFeatureIndex}
+								<PreviewFeatureIndex compact={previewOperationsA} launchTargetName={launchTargetId.startsWith("group:") ? `Group: ${launchTargetId.slice(6)}` : `${profiles.find(p => p.id === launchTargetId)?.name ?? launchTargetId} · ${launchTargetId}`} savedDefaultName={persistedSelectedProfileId ? `${profiles.find(p => p.id === persistedSelectedProfileId)?.name ?? persistedSelectedProfileId} · ${persistedSelectedProfileId}` : ""} language={$locale ?? "ja-JP"} targetName={`${profileDetail.name} · ${profileDetail.id}`} runtimeTargetName={selectedCapturer ? `${selectedCapturerProfileId ?? "?"} · ${selectedCapturer.id}` : ""} matchingRuntimeCount={capturers.filter(c => c.profileId === profileDetail?.id && c.state === "running").length} onOpen={openFeature} />
+							{/if}
+
 
 							<div class="setting-editor" role="group" aria-label="Profile settings">
 								<section
 									class="editor-section profile-section"
+                                    id="feature-identity" tabindex="-1"
 									data-hint="Profile identity: Profiles一覧、Launch対象、Capturer詳細に表示される基本情報です。"
 								>
 									<div class="identity-row">
@@ -3458,7 +3957,7 @@
 									data-hint="Engine: このプロファイルがMediaPipeで推定するか、外部モーションを受信するかを決めます。"
 								>
 									<div class="section-title-row">
-										<h3>{$_("profiles.editor.engine")}</h3>
+										<h3 id="feature-engine" tabindex="-1">{$_("profiles.editor.engine")}</h3>
 										<span class="setting-scope">{$_("profiles.editor.runtime")}</span>
 									</div>
 									<div class="section-grid">
@@ -3659,13 +4158,13 @@
 									data-hint="Source: カメラ、ファイル、外部UDPなど、Engineへ渡す入力元を設定します。"
 								>
 									<div class="section-title-row">
-										<h3>{$_("profiles.editor.source")}</h3>
+										<h3 id="feature-source" tabindex="-1">{$_("profiles.editor.source")}</h3>
 										<span class="setting-scope">{engineType}</span>
 									</div>
 									{#if isMediaPipeEngine}
 										<div class="section-grid">
 											<label
-												data-hint="Source Type: 入力元を選びます。Windowsで仮想カメラや明示的な解像度/FPS指定を重視する場合はDirectShow、扱いやすさ重視ならMediaFoundationが候補です。"
+												data-hint="Source Type: 入力元を選びます。Windowsのカメラ入力にはDirectShowを使います。MediaFoundationは機器情報の確認用で、映像入力にはまだ対応していません。"
 											>
 												<span>{$_("profiles.editor.source_type")}</span>
 												<select
@@ -3676,11 +4175,15 @@
 														)}
 												>
 													<option value="webcam-directshow">Webcam (DirectShow)</option>
-													<option value="webcam-mediafoundation">Webcam (MediaFoundation)</option>
+													<option value="webcam-mediafoundation">{$_("profiles.editor.mediafoundation_unavailable_option")}</option>
 													<option value="file-image">Image File</option>
 													<option value="file-video">Video File</option>
 												</select>
 											</label>
+
+											{#if mediaPipeSourceType === "webcam-mediafoundation"}
+												<p class="section-hint" role="status" data-testid="mediafoundation-unavailable">{$_("profiles.editor.mediafoundation_unavailable_hint")}</p>
+											{/if}
 
 											{#if mediaPipeSourceType === "webcam-directshow" || mediaPipeSourceType === "webcam-mediafoundation"}
 												<label
@@ -3841,7 +4344,8 @@
 													>
 												</label>
 											{/if}
-										</div>
+										<MotionAdvancedSettings section="input" pipeline={profileDetail.pipeline} hold={profileDetail.runtime.modifierHoldLostLandmarks} source={mediaPipeSourceType} onUpdate={(field, value) => void updateProfileField(field, value)} onInvalid={retainInvalidProfileInput} />
+</div>
 									{:else if engineType === "vmc"}
 										<div class="section-grid">
 											<label
@@ -3897,7 +4401,7 @@
 									</div>
 									<div class="modifier-groups">
 										<div class="modifier-group modifier-group--filter">
-											<h4>{$_("profiles.editor.filter_heading")}</h4>
+											<h4 id="feature-parts" tabindex="-1">{$_("profiles.editor.filter_heading")}</h4>
 											<div class="modifier-filter-grid">
 												{#each [{ field: "modifier.head_enabled", label: "Head", value: profileDetail.runtime.modifierHeadEnabled, hint: "Head: 頭部ボーンと視線系の出力を許可します。" }, { field: "modifier.face_enabled", label: "Face", value: profileDetail.runtime.modifierFaceEnabled, hint: "Face: 表情ブレンドシェイプと顔まわりの出力を許可します。" }, { field: "modifier.hands_enabled", label: "Hands", value: profileDetail.runtime.modifierHandsEnabled, hint: "Hands: 手首と指の出力を許可します。" }, { field: "modifier.arms_ik_enabled", label: "Arms", value: profileDetail.runtime.modifierArmsIkEnabled, hint: "Arms: 肩、上腕、前腕の出力を許可します。" }, { field: "modifier.torso_enabled", label: "Torso", value: profileDetail.runtime.modifierTorsoEnabled, hint: "Torso: 胸と胴体の出力を許可します。" }, { field: "modifier.legs_enabled", label: "Legs", value: profileDetail.runtime.modifierLegsEnabled, hint: "Legs: 脚の出力を許可します。初期リリースでは新規プロファイルはOFFです。" }, { field: "modifier.feet_enabled", label: "Feet", value: profileDetail.runtime.modifierFeetEnabled, hint: "Feet: 足首と足先の出力を許可します。Legsと併用する想定です。" }] as toggle (toggle.field)}
 													<label class="toggle-field" data-hint={toggle.hint}>
@@ -3946,7 +4450,7 @@
 											</label>
 										</div>
 										<div class="modifier-group modifier-group--smoothing">
-											<h4>{$_("profiles.editor.smoothing")}</h4>
+											<h4 id="feature-smoothing" tabindex="-1">{$_("profiles.editor.smoothing")}</h4>
 											<div class="smoothing-methods">
 												<div class="smoothing-method">
 													<div class="smoothing-method-header">
@@ -4154,7 +4658,11 @@
 											</div>
 										</div>
 										<div class="modifier-group modifier-group--lost-signal">
-											<h4>シグナルロスト時の挙動</h4>
+											<h4 id="feature-lost" tabindex="-1">シグナルロスト時の挙動</h4>
+<MotionAdvancedSettings section="processing" pipeline={profileDetail.pipeline} hold={profileDetail.runtime.modifierHoldLostLandmarks} source={mediaPipeSourceType} onUpdate={(field, value) => void updateProfileField(field, value)} onInvalid={retainInvalidProfileInput} />
+                                            {#if profileDetail.runtime.modifierHoldLostLandmarks === false}
+                                                <p role="status">このプロファイルでは旧設定によりホールドが無効です。「ホールド」を選んだ部位も、見失った姿勢を保持しません。</p>
+                                            {/if}
 											<div
 												class="lost-signal-panel"
 												data-hint="Signal lost: カメラが一時的に部位を見失ったときの扱いです。配信中の急な破綻を避けるため、部位ごとに復帰方法を選べます。"
@@ -4314,7 +4822,7 @@
 											class="modifier-group modifier-group--post-process"
 											class:modifier-group-disabled={!isMediaPipeEngine}
 										>
-											<h4>{$_("profiles.editor.mediapipe_post_process")}</h4>
+											<h4 id="feature-correction" tabindex="-1">{$_("profiles.editor.mediapipe_post_process")}</h4>
 											{#if !isMediaPipeEngine}
 												<small class="muted-small">{$_("profiles.editor.mediapipe_post_process_unavailable")}</small
 												>
@@ -4460,6 +4968,8 @@
 										>
 											<span>{$_("profiles.editor.mirror_mode")}</span>
 											<select
+												id="feature-mirror"
+												tabindex="-1"
 												value={profileDetail.runtime.modifierMirrorMode ?? ""}
 												onchange={(event) =>
 													void updateProfileField(
@@ -4485,7 +4995,7 @@
 									data-hint="Output: Modifier後のUNMotionFrameをUNMF/Z、VMC/UDP、VRC OSCへ送出します。"
 								>
 									<div class="section-title-row">
-										<h3>{$_("profiles.editor.output")}</h3>
+										<h3 id="feature-output" tabindex="-1">{$_("profiles.editor.output")}</h3>
 									</div>
 
 									<div class="subgroup">
@@ -4525,7 +5035,7 @@
 														min="1"
 														max="65535"
 														step="1"
-												value={profileDetail.runtime.zenohLanPort ?? 47447}
+														value={profileDetail.runtime.zenohLanPort ?? 47447}
 														onchange={(event) =>
 															void updateProfileField(
 																"runtime_selection.zenoh_lan_port",
@@ -4537,7 +5047,7 @@
 													<span>{$_("profiles.editor.connect_address")}</span>
 													<code
 														>{profileDetail.runtime.zenohLanConnectAddress ??
-													`IPv4:${profileDetail.runtime.zenohLanPort ?? 47447}`}</code
+															`IPv4:${profileDetail.runtime.zenohLanPort ?? 47447}`}</code
 													>
 												</div>
 											</div>
@@ -4717,6 +5227,7 @@
 							</div>
 							<div class="profile-hint-bar" aria-live="polite">
 								<span>{profileHint || defaultProfileHint}</span>
+							</div>
 							</div>
 						{:else}
 							<p class="empty">
@@ -5312,16 +5823,56 @@
 		{/if}
 	</div>
 
-	{#if errorMessage}
+	<div class="recovery-status">
+	{#if profileOrderDraft}
+		<section class="notification settings-save-status" aria-label={($locale ?? "ja-JP").startsWith("ja") ? "プロファイル順序の保存" : "Profile order save"}>
+			<p>{($locale ?? "ja-JP").startsWith("ja") ? (profileOrderSaving ? "プロファイルの順序を保存しています。" : "順序を保存できませんでした。変更した順序を保持しています。") : (profileOrderSaving ? "Saving profile order." : "Order could not be saved. Your requested order is retained.")}</p>
+			<p>{profileOrderDraft.ids.join(" → ")}</p>
+			{#if profileOrderDraft.error}<p>{profileOrderDraft.error}</p>{/if}
+			<button disabled={profileOrderSaving} onclick={() => void saveProfilesOrder()}>{($locale ?? "ja-JP").startsWith("ja") ? "保持した順序を再保存" : "Retry retained order"}</button>
+			<button disabled={profileOrderSaving} onclick={() => void discardProfileOrder()}>{($locale ?? "ja-JP").startsWith("ja") ? "順序の変更を破棄して読み直す" : "Discard order changes and reload"}</button>
+		</section>
+	{/if}
+	{#if selectedProfileSaveFailure}
+		<section class="notification settings-save-status" role="alert" aria-label={($locale ?? "ja-JP").startsWith("ja") ? "次回起動プロファイルの保存" : "Startup profile save"}>
+			<p>{($locale ?? "ja-JP").startsWith("ja") ? "次回起動用のプロファイル選択を保存できませんでした。現在の編集対象はそのままです。" : "Could not save the startup profile selection. Your current editing target is unchanged."}</p>
+			<p>{profiles.find(p => p.id === selectedProfileSaveFailure?.profileId)?.name ?? selectedProfileSaveFailure.profileId ?? "—"}</p>
+			<button disabled={selectedProfileSavePending > 0 || selectedProfileId !== selectedProfileSaveFailure.profileId} onclick={() => void persistSelectedProfileId(selectedProfileSaveFailure!.profileId)}>{($locale ?? "ja-JP").startsWith("ja") ? "次回起動用の選択を再保存" : "Retry startup selection save"}</button>
+			<details><summary>{($locale ?? "ja-JP").startsWith("ja") ? "診断情報" : "Diagnostics"}</summary><p>{selectedProfileSaveFailure.detail}</p></details>
+		</section>
+	{/if}
+	{#if appSettingsPending > 0 || appSettingsSaveError}
+		<section class="notification settings-save-status" aria-label={($locale ?? "ja-JP").startsWith("ja") ? "アプリ設定の保存状態" : "Application settings save status"}>
+			<p>{($locale ?? "ja-JP").startsWith("ja")
+				? (!appSettingsReady ? "アプリ設定をまだ読み込めていません。元の設定は上書きしません。" : appSettingsPending > 0 ? "アプリ設定を保存しています。" : "アプリ設定の保存を確認できませんでした。変更した内容を画面に保持しています。")
+				: (!appSettingsReady ? "Application settings have not loaded. Existing settings will not be overwritten." : appSettingsPending > 0 ? "Saving application settings." : "The settings save could not be confirmed. Your changes are retained on screen.")}</p>
+			{#if appSettingsSaveError}
+				<p>{appSettingsSaveError}</p>
+				<button disabled={appSettingsPending > 0} onclick={() => void syncAppSettingsToBackend(appSettings)}>{($locale ?? "ja-JP").startsWith("ja") ? (appSettingsReady ? "保持した設定を再保存" : "設定の読込を再試行") : (appSettingsReady ? "Retry retained settings" : "Retry loading settings")}</button>
+				<button disabled={appSettingsPending > 0} onclick={() => void discardAppSettingsDraft()}>{($locale ?? "ja-JP").startsWith("ja") ? (appSettingsReady ? "変更を破棄して保存済み設定を読み直す" : "読込前の入力を破棄（ファイルは変更しません）") : (appSettingsReady ? "Discard changes and reload saved settings" : "Discard early edits (file unchanged)")}</button>
+			{/if}
+		</section>
+	{/if}
+	<ProfileWriteRecovery writes={profileWrites} japanese={($locale ?? "ja-JP").startsWith("ja")}
+		onRetry={retryProfileWrite} onDiscard={discardProfileWrite}
+		onReview={async write => { activeTab = "profiles"; await selectProfile(write.profileId); }} />
+	{#if visibleErrorMessage}
 		<div class="notification notification-error" role="alert">
 			<strong>{$_("errors.label")}</strong>
 			<span></span>
-			<p>{errorMessage}</p>
+			<p>{visibleErrorMessage}</p>
+			{#if errorMessage.startsWith("delete_profile failed:") && errorMessage.includes("profile_conflict")}<p>{$_("profiles.archive.delete_conflict")}</p>{/if}
 		</div>
 	{/if}
+</div>
 </main>
 
 <style>
+	.shell { grid-template-rows: auto minmax(0, 1fr) auto; }
+	:global(html[data-un-isolated-preview="1"]) .shell { grid-template-rows: auto auto minmax(0, 1fr) auto; }
+	.recovery-status { min-height: 0; max-height: 35vh; overflow: auto; position: relative; z-index: 23; }
+	.settings-save-status { display: flex; flex-wrap: wrap; align-items: center; }
+	.settings-save-status p { flex-basis: 100%; }
 	.bad {
 		color: var(--accent-warn, #d97706);
 		font-weight: 600;

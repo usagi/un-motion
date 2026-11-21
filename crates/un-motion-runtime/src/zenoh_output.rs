@@ -11,11 +11,11 @@
 
 use std::sync::{
 	Arc,
-	atomic::{AtomicBool, Ordering},
+	atomic::{AtomicBool, AtomicU64, Ordering},
 	mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
 };
 use std::thread::{self, JoinHandle};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use tracing::{debug, info, warn};
@@ -146,6 +146,7 @@ pub struct ZenohOutputWorker {
 	next_sequence: u64,
 	last_direct_frame_timestamp_ns: Option<u64>,
 	stats: ZenohOutputStats,
+	max_publish_us: u64,
 }
 
 impl ZenohOutputWorker {
@@ -178,6 +179,7 @@ impl ZenohOutputWorker {
 			next_sequence: 0,
 			last_direct_frame_timestamp_ns: None,
 			stats: ZenohOutputStats::default(),
+			max_publish_us: 0,
 		})
 	}
 
@@ -190,6 +192,7 @@ impl ZenohOutputWorker {
 			next_sequence: 0,
 			last_direct_frame_timestamp_ns: None,
 			stats: ZenohOutputStats::default(),
+			max_publish_us: 0,
 		}
 	}
 
@@ -215,9 +218,11 @@ impl ZenohOutputWorker {
 		self.modifier_pipeline.apply(&mut unmotion_frame);
 		self.next_sequence = self.next_sequence.saturating_add(1);
 		let key_expr = self.publisher.strategy().key_expr_for_frame(&unmotion_frame);
-		self.publisher
-			.send(&unmotion_frame)
-			.map_err(|e| anyhow::anyhow!("zenoh publish failed on {key_expr}: {e}"))?;
+		let publish_started = Instant::now();
+		let publish_result = self.publisher.send(&unmotion_frame);
+		let publish_us = publish_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+		self.max_publish_us = self.max_publish_us.max(publish_us);
+		publish_result.map_err(|e| anyhow::anyhow!("zenoh publish failed on {key_expr}: {e}"))?;
 		self.stats.sent_frames = self.stats.sent_frames.saturating_add(1);
 		// 初回 1 frame と以降は 600 frame ごとに INFO で「実際に publish した key と
 		// payload 概要」を出す。これにより subscribe 側 (UN Avatar) で同じ key を
@@ -382,13 +387,16 @@ pub struct ZenohOutputWorkerHandle {
 	pub base_key_expr: String,
 	command_tx: SyncSender<ZenohOutputCommand>,
 	latest_frame: LatestFrameSlot<ZenohOutputFrame>,
+	replaced_frames: Arc<AtomicU64>,
 	join: Option<JoinHandle<()>>,
 	stop: Arc<AtomicBool>,
 }
 
 impl ZenohOutputWorkerHandle {
 	pub fn send(&self, frame: impl Into<ZenohOutputFrame>) -> Result<bool, OutputDisconnected> {
-		self.latest_frame.replace(frame.into())?;
+		if self.latest_frame.replace_with_status(frame.into())? {
+			self.replaced_frames.fetch_add(1, Ordering::Relaxed);
+		}
 		match self.command_tx.try_send(ZenohOutputCommand::FrameReady) {
 			Ok(()) | Err(TrySendError::Full(_)) => Ok(true),
 			Err(TrySendError::Disconnected(_)) => Err(OutputDisconnected),
@@ -413,6 +421,8 @@ pub fn spawn_zenoh_output_worker(config: ZenohOutputConfig, event_tx: Sender<Zen
 	let stream_id = worker.config.stream_id.clone();
 	let latest_frame = LatestFrameSlot::new();
 	let worker_latest_frame = latest_frame.clone();
+	let replaced_frames = Arc::new(AtomicU64::new(0));
+	let worker_replaced_frames = Arc::clone(&replaced_frames);
 	info!(
 		target: "un_motion_runtime::zenoh_output",
 		base_key_expr = %base_key_expr,
@@ -423,11 +433,12 @@ pub fn spawn_zenoh_output_worker(config: ZenohOutputConfig, event_tx: Sender<Zen
 	let (command_tx, command_rx) = mpsc::sync_channel(1);
 	let stop = Arc::new(AtomicBool::new(false));
 	let worker_stop = Arc::clone(&stop);
-	let join = thread::spawn(move || run_zenoh_output_worker(worker, command_rx, worker_latest_frame, event_tx, worker_stop));
+	let join = thread::spawn(move || run_zenoh_output_worker(worker, command_rx, worker_latest_frame, event_tx, worker_stop, worker_replaced_frames));
 	Ok(ZenohOutputWorkerHandle {
 		base_key_expr,
 		command_tx,
 		latest_frame,
+		replaced_frames,
 		join: Some(join),
 		stop,
 	})
@@ -439,6 +450,7 @@ fn run_zenoh_output_worker(
 	latest_frame: LatestFrameSlot<ZenohOutputFrame>,
 	event_tx: Sender<ZenohOutputEvent>,
 	stop: Arc<AtomicBool>,
+	replaced_frames: Arc<AtomicU64>,
 ) {
 	// 1 秒に 1 回程度の頻度で送信状況を debug ログに出す。多すぎると log が溢れ、
 	// 少なすぎると Phase E e2e Step B の切り分けに使えないので保守的に 30 frame 毎。
@@ -454,6 +466,14 @@ fn run_zenoh_output_worker(
 				match worker.send_frame(frame) {
 					Ok(event) => {
 						let frames = worker.stats().sent_frames;
+						if frames == 1 || frames.is_multiple_of(600) {
+							info!(target: "un_motion_runtime::zenoh_output",
+								stream_id = worker.config.stream_id.as_deref().unwrap_or("-"),
+								sent_frames = frames,
+								replaced_frames = replaced_frames.load(Ordering::Relaxed),
+								max_publish_us = worker.max_publish_us,
+								"UNMF output timing (cumulative; publish is not receiver acknowledgement)");
+						}
 						if (frames == 1 || frames.is_multiple_of(SEND_LOG_INTERVAL))
 							&& let ZenohOutputEvent::Sent { key_expr, .. } = &event
 						{
@@ -487,6 +507,8 @@ fn run_zenoh_output_worker(
 		target: "un_motion_runtime::zenoh_output",
 		base_key_expr = %base_key_expr,
 		sent_frames = worker.stats().sent_frames,
+		replaced_frames = replaced_frames.load(Ordering::Relaxed),
+		max_publish_us = worker.max_publish_us,
 		"Zenoh output worker stopped",
 	);
 	let _ = event_tx.send(worker.stopped_event());
@@ -529,6 +551,27 @@ pub fn vmc_bone_name_to_humanoid_bone(name: &str) -> Option<HumanoidBone> {
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn output_replacement_count_tracks_unsent_frames_not_full_notifications() {
+		let (command_tx, _command_rx) = std::sync::mpsc::sync_channel(1);
+		let handle = super::ZenohOutputWorkerHandle {
+			base_key_expr: "test".into(),
+			command_tx,
+			latest_frame: super::LatestFrameSlot::new(),
+			replaced_frames: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+			join: None,
+			stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+		};
+		handle.send(un_motion_frame::UNMotionFrame::new(1)).unwrap();
+		handle.send(un_motion_frame::UNMotionFrame::new(2)).unwrap();
+		assert_eq!(handle.replaced_frames.load(std::sync::atomic::Ordering::Relaxed), 1);
+		let Some(super::ZenohOutputFrame::UnmotionFrame(frame)) = handle.latest_frame.take() else { panic!("missing latest frame") };
+		assert_eq!(frame.header.sequence, 2);
+		// The notification is still full, but the data slot has already been consumed.
+		handle.send(un_motion_frame::UNMotionFrame::new(3)).unwrap();
+		assert_eq!(handle.replaced_frames.load(std::sync::atomic::Ordering::Relaxed), 1);
+	}
+
 	use super::*;
 	use un_motion_frame::{MotionSignal, MotionSignalValue, SampleState};
 

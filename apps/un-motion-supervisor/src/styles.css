@@ -978,6 +978,22 @@ td small {
 	flex: 0 0 auto;
 }
 
+/* Keep the selected profile outside the settings scrollport. A sticky heading
+   inside a padded scrollport obscured anchors and let fields peek above it. */
+.profile-editor-scroll {
+	flex: 1 1 auto;
+	min-height: 0;
+	min-width: 0;
+	overflow-y: auto;
+	overflow-x: hidden;
+	scrollbar-gutter: stable;
+}
+.profile-editor-scroll > .setting-editor {
+	overflow: visible;
+	flex: none;
+}
+
+
 .details-panel {
 	display: flex;
 	flex-direction: column;

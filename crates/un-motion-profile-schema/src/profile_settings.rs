@@ -214,15 +214,16 @@ pub struct ProfileMediaPipeAdvancedSettings {
 	pub limit_rotation_jumps: Option<bool>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub head_source_switch_blend: Option<bool>,
-	/// source landmark が消えた部位の signal loss policy。
-	/// 既知の値は `rest-pose`、`hold`、`drop`。
+	/// 旧形式の共通 signal loss policy。部位別 policy が明示的に空文字の場合に参照する。
+	/// 部位別値の省略時は各部位の既定値を使う。既知の値は `rest-pose`、`hold`、`drop`。
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub lost_signal_behavior: Option<String>,
-	/// `lostSignalBehavior` が `rest-pose` のときの T-wrist-front pose (0.0) と
-	/// I-pose (1.0) の blend。
+	/// 旧形式との読込・保存互換用。現在の後処理は部位別の
+	/// `lost_signal_{head,hands,arms}_rest_pose_blend` を使い、この値へはfallbackしない。
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub lost_signal_rest_pose_blend: Option<f32>,
-	/// `lostSignalBehavior` が `hold` のときの保持秒数。
+	/// 旧形式との読込・保存互換用。現在の保持秒数は部位別の
+	/// `lost_signal_{head,hands,arms}_hold_seconds` を使い、この値へはfallbackしない。
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub lost_signal_hold_seconds: Option<f32>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
