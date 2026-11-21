@@ -1,6 +1,6 @@
 # Windows input reentrancy correction
 
-Base: crates.io tao 0.35.2, original MIT license retained.
+Base: crates.io tao 0.35.2, original Apache-2.0 license retained.
 Applied without source modifications: upstream commit
 c704261c519c58cfdd0bc2d58ba24e06a0b71c92 (tauri-apps/tao PR #1215).
 

@@ -20,6 +20,14 @@ Release action:
 - Keep model provenance in `native/mediapipe/mediapipe-pin.toml`.
 - Bundled license file: `LICENSES/MediaPipe-Apache-2.0.txt`.
 
+## Tao
+
+The Windows Supervisor uses Tao 0.35.2 with the upstream Windows input reentrancy
+correction from tauri-apps/tao commit c704261c519c58cfdd0bc2d58ba24e06a0b71c92.
+The source and patch description are in `third_party/tao/`.
+The upstream license and attribution are included as `LICENSES/Tao-Apache-2.0.txt`
+and `LICENSES/Tao-0.35.2.spdx`.
+
 ## ccap-rs
 
 U.N. Motion vendors `ccap-rs` for the Windows DirectShow webcam backend.
