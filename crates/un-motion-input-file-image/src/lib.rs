@@ -247,23 +247,35 @@ mod tests {
 
 	#[test]
 	fn aspect_preservation_fits_both_canvas_axes() {
-		for (width, height, axis, expected) in [
-			(2, 4, ResizeAxis::Width, (1, 0, 2, 3)),
-			(4, 2, ResizeAxis::Height, (0, 1, 3, 2)),
-		] {
+		for (width, height, axis, expected) in [(2, 4, ResizeAxis::Width, (1, 0, 2, 3)), (4, 2, ResizeAxis::Height, (0, 1, 3, 2))] {
 			let source = RgbaImage::from_pixel(width, height, image::Rgba([255, 0, 0, 255]));
 			let path = temp_image_path(&format!("aspect-{width}-{height}.png"));
 			source.save(&path).unwrap();
 			let mut config = FileImageInputConfig::once(&path);
 			config.resize = Some(ImageResizeOptions {
-				preserve_aspect_ratio: true, reference_axis: axis, reference_length: 4,
-				output_width: 4, output_height: 4, pad_color: RgbaColor::BLACK,
+				preserve_aspect_ratio: true,
+				reference_axis: axis,
+				reference_length: 4,
+				output_width: 4,
+				output_height: 4,
+				pad_color: RgbaColor::BLACK,
 			});
 			let mut input = FileImageInputSource::open(config).unwrap();
 			let frame = input.next_image_frame().unwrap().unwrap();
 			assert_eq!((frame.width, frame.height, frame.pixel_format), (4, 4, PixelFormat::Rgb8));
-			let content: Vec<_> = frame.data.chunks_exact(3).enumerate().filter(|(_, pixel)| pixel[0] == 255).map(|(index,_)| (index as u32 % 4, index as u32 / 4)).collect();
-			let bounds = (content.iter().map(|p| p.0).min().unwrap(), content.iter().map(|p| p.1).min().unwrap(), content.iter().map(|p| p.0).max().unwrap(), content.iter().map(|p| p.1).max().unwrap());
+			let content: Vec<_> = frame
+				.data
+				.chunks_exact(3)
+				.enumerate()
+				.filter(|(_, pixel)| pixel[0] == 255)
+				.map(|(index, _)| (index as u32 % 4, index as u32 / 4))
+				.collect();
+			let bounds = (
+				content.iter().map(|p| p.0).min().unwrap(),
+				content.iter().map(|p| p.1).min().unwrap(),
+				content.iter().map(|p| p.0).max().unwrap(),
+				content.iter().map(|p| p.1).max().unwrap(),
+			);
 			assert_eq!(bounds, expected, "portrait/landscape content must retain its aspect ratio");
 			let _ = std::fs::remove_file(path);
 		}

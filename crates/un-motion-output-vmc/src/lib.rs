@@ -3991,7 +3991,8 @@ mod tests {
 		assert!(finger_spread_angle(-0.5, "LittleProximal", BodySide::Left) < 0.0);
 		assert!(
 			(finger_spread_angle(-0.5, "LittleProximal", BodySide::Left) - finger_spread_angle(0.5, "LittleProximal", BodySide::Right))
-				.abs() < 1e-5
+				.abs()
+				< 1e-5
 		);
 	}
 

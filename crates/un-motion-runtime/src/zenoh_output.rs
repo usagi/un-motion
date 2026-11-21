@@ -433,7 +433,16 @@ pub fn spawn_zenoh_output_worker(config: ZenohOutputConfig, event_tx: Sender<Zen
 	let (command_tx, command_rx) = mpsc::sync_channel(1);
 	let stop = Arc::new(AtomicBool::new(false));
 	let worker_stop = Arc::clone(&stop);
-	let join = thread::spawn(move || run_zenoh_output_worker(worker, command_rx, worker_latest_frame, event_tx, worker_stop, worker_replaced_frames));
+	let join = thread::spawn(move || {
+		run_zenoh_output_worker(
+			worker,
+			command_rx,
+			worker_latest_frame,
+			event_tx,
+			worker_stop,
+			worker_replaced_frames,
+		)
+	});
 	Ok(ZenohOutputWorkerHandle {
 		base_key_expr,
 		command_tx,
@@ -565,7 +574,9 @@ mod tests {
 		handle.send(un_motion_frame::UNMotionFrame::new(1)).unwrap();
 		handle.send(un_motion_frame::UNMotionFrame::new(2)).unwrap();
 		assert_eq!(handle.replaced_frames.load(std::sync::atomic::Ordering::Relaxed), 1);
-		let Some(super::ZenohOutputFrame::UnmotionFrame(frame)) = handle.latest_frame.take() else { panic!("missing latest frame") };
+		let Some(super::ZenohOutputFrame::UnmotionFrame(frame)) = handle.latest_frame.take() else {
+			panic!("missing latest frame")
+		};
 		assert_eq!(frame.header.sequence, 2);
 		// The notification is still full, but the data slot has already been consumed.
 		handle.send(un_motion_frame::UNMotionFrame::new(3)).unwrap();

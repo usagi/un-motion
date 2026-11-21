@@ -31,8 +31,8 @@ use std::env;
 
 use serde::{Deserialize, Serialize};
 
-mod i18n;
 mod close_gate;
+mod i18n;
 pub mod profile_archive;
 
 // rust-i18n の compile-time セットアップ。`locales/` 配下を権威ソースとして取り込み、
@@ -132,7 +132,9 @@ fn wait_for_capturer_launches(state: &Mutex<SupervisorState>) -> Result<(), Stri
 	loop {
 		let mut guard = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
 		guard.closing = true;
-		if guard.launching_profiles.is_empty() { return Ok(()); }
+		if guard.launching_profiles.is_empty() {
+			return Ok(());
+		}
 		drop(guard);
 		std::thread::sleep(Duration::from_millis(25));
 	}
@@ -372,7 +374,9 @@ fn find_template_profiles_dir(exe_dir: Option<&Path>, development_workspace: Opt
 	}
 	if let Some(workspace) = development_workspace {
 		let profiles = workspace.join("profiles");
-		if profiles.is_dir() { return Some(profiles); }
+		if profiles.is_dir() {
+			return Some(profiles);
+		}
 	}
 	None
 }
@@ -440,7 +444,10 @@ fn load_app_settings_at(path: &Path) -> AppRuntimeSettings {
 }
 
 fn ensure_app_settings_loaded(settings: &AppRuntimeSettings) -> Result<(), String> {
-	match &settings.startup_read_error { Some(error) => Err(error.clone()), None => Ok(()) }
+	match &settings.startup_read_error {
+		Some(error) => Err(error.clone()),
+		None => Ok(()),
+	}
 }
 
 /// `%APPDATA%\UN Motion\settings.toml` に設定を書き出す。
@@ -454,9 +461,21 @@ fn write_app_settings_at(path: &Path, settings: &AppRuntimeSettings) -> Result<(
 	// Startup may fall back to defaults, but that must not destroy an unreadable
 	// existing settings file on the next unrelated UI edit.
 	match fs::read_to_string(path) {
-		Ok(raw) => { toml::from_str::<AppRuntimeSettings>(&raw).map_err(|e| format!("既存の設定ファイルを読み取れないため上書きしていません。 / Existing settings are invalid; original file preserved: {}: {e}", path.display()))?; }
+		Ok(raw) => {
+			toml::from_str::<AppRuntimeSettings>(&raw).map_err(|e| {
+				format!(
+					"既存の設定ファイルを読み取れないため上書きしていません。 / Existing settings are invalid; original file preserved: {}: {e}",
+					path.display()
+				)
+			})?;
+		}
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-		Err(e) => return Err(format!("既存の設定ファイルを読み取れないため上書きしていません。 / Cannot read existing settings; original file preserved: {}: {e}", path.display())),
+		Err(e) => {
+			return Err(format!(
+				"既存の設定ファイルを読み取れないため上書きしていません。 / Cannot read existing settings; original file preserved: {}: {e}",
+				path.display()
+			));
+		}
 	}
 	if let Some(dir) = path.parent()
 		&& !dir.as_os_str().is_empty()
@@ -673,7 +692,9 @@ fn launch_capturer_blocking(
 	state: State<'_, Mutex<SupervisorState>>,
 	app_settings: State<'_, Mutex<AppRuntimeSettings>>,
 ) -> Result<CapturerInstance, String> {
-    if cfg!(feature = "isolated-review") { return Err("Capturer launch disabled in isolated review".into()); }
+	if cfg!(feature = "isolated-review") {
+		return Err("Capturer launch disabled in isolated review".into());
+	}
 	let state_handle: &Mutex<SupervisorState> = &state;
 	let api_worker_threads = app_settings
 		.lock()
@@ -684,7 +705,9 @@ fn launch_capturer_blocking(
 	let document = load_profile_document(&user_profile_store())?;
 	let resolved_profile_id = Some(resolve_launch_profile(&document, profile_id.as_deref())?);
 	let mut state = state.lock().map_err(|_| "supervisor state poisoned".to_string())?;
-	if state.closing { return Err("Supervisor is closing".into()); }
+	if state.closing {
+		return Err("Supervisor is closing".into());
+	}
 	refresh_capturers(&mut state);
 
 	let is_live = |c: &ManagedCapturer| {
@@ -953,7 +976,11 @@ fn calibrate_capturer_neutral(
 	let profile_id = configured_profile_id
 		.or_else(|| fetch_capturer_active_profile_id(&http_client, bind_addr))
 		.ok_or_else(|| "active profile is unknown".to_string())?;
-	let expected_result = capturer_result_fields(&user_profile_store().load().map_err(|error| error.to_string())?, &profile_id, CapturerProfileResult::NeutralCalibration)?;
+	let expected_result = capturer_result_fields(
+		&user_profile_store().load().map_err(|error| error.to_string())?,
+		&profile_id,
+		CapturerProfileResult::NeutralCalibration,
+	)?;
 	let url = format!("http://{bind_addr}/api/runtime/calibration/neutral");
 	let body = serde_json::json!({
 		"pose": pose.as_deref().unwrap_or("U"),
@@ -970,8 +997,13 @@ fn calibrate_capturer_neutral(
 		return Err(response_error("POST", &url, response));
 	}
 	let envelope: ProfileDocumentEnvelope = response.json().map_err(|error| format!("decode calibration response: {error}"))?;
-	let saved = save_profile_from_capturer_selection(&profile_id, envelope.selection, CapturerProfileResult::NeutralCalibration, &expected_result)
-		.map_err(|error| format!("save profile after calibration: {error}"))?;
+	let saved = save_profile_from_capturer_selection(
+		&profile_id,
+		envelope.selection,
+		CapturerProfileResult::NeutralCalibration,
+		&expected_result,
+	)
+	.map_err(|error| format!("save profile after calibration: {error}"))?;
 	let sync_report = push_document_to_matching_capturers(&state, &saved, &profile_id);
 	saved
 		.profiles
@@ -991,7 +1023,11 @@ fn clear_capturer_neutral_calibration(id: u32, state: State<'_, Mutex<Supervisor
 	let profile_id = configured_profile_id
 		.or_else(|| fetch_capturer_active_profile_id(&http_client, bind_addr))
 		.ok_or_else(|| "active profile is unknown".to_string())?;
-	let expected_result = capturer_result_fields(&user_profile_store().load().map_err(|error| error.to_string())?, &profile_id, CapturerProfileResult::NeutralCalibration)?;
+	let expected_result = capturer_result_fields(
+		&user_profile_store().load().map_err(|error| error.to_string())?,
+		&profile_id,
+		CapturerProfileResult::NeutralCalibration,
+	)?;
 	let url = format!("http://{bind_addr}/api/runtime/calibration/neutral/clear");
 	let response = http_client
 		.post(&url)
@@ -1004,8 +1040,13 @@ fn clear_capturer_neutral_calibration(id: u32, state: State<'_, Mutex<Supervisor
 	let envelope: ProfileDocumentEnvelope = response
 		.json()
 		.map_err(|error| format!("decode calibration clear response: {error}"))?;
-	let saved = save_profile_from_capturer_selection(&profile_id, envelope.selection, CapturerProfileResult::NeutralCalibration, &expected_result)
-		.map_err(|error| format!("save profile after calibration clear: {error}"))?;
+	let saved = save_profile_from_capturer_selection(
+		&profile_id,
+		envelope.selection,
+		CapturerProfileResult::NeutralCalibration,
+		&expected_result,
+	)
+	.map_err(|error| format!("save profile after calibration clear: {error}"))?;
 	let sync_report = push_document_to_matching_capturers(&state, &saved, &profile_id);
 	saved
 		.profiles
@@ -1029,7 +1070,11 @@ fn build_capturer_face_pose_model(
 	let profile_id = configured_profile_id
 		.or_else(|| fetch_capturer_active_profile_id(&http_client, bind_addr))
 		.ok_or_else(|| "active profile is unknown".to_string())?;
-	let expected_result = capturer_result_fields(&user_profile_store().load().map_err(|error| error.to_string())?, &profile_id, CapturerProfileResult::FacePoseModel)?;
+	let expected_result = capturer_result_fields(
+		&user_profile_store().load().map_err(|error| error.to_string())?,
+		&profile_id,
+		CapturerProfileResult::FacePoseModel,
+	)?;
 	let url = format!("http://{bind_addr}/api/runtime/face-pose-model/build");
 	let body = serde_json::json!({
 		"validSampleCount": valid_sample_count.unwrap_or(90).clamp(1, 240),
@@ -1047,8 +1092,13 @@ fn build_capturer_face_pose_model(
 	let envelope: ProfileDocumentEnvelope = response
 		.json()
 		.map_err(|error| format!("decode face pose model response: {error}"))?;
-	let saved = save_profile_from_capturer_selection(&profile_id, envelope.selection, CapturerProfileResult::FacePoseModel, &expected_result)
-		.map_err(|error| format!("save profile after face pose model build: {error}"))?;
+	let saved = save_profile_from_capturer_selection(
+		&profile_id,
+		envelope.selection,
+		CapturerProfileResult::FacePoseModel,
+		&expected_result,
+	)
+	.map_err(|error| format!("save profile after face pose model build: {error}"))?;
 	let sync_report = push_document_to_matching_capturers(&state, &saved, &profile_id);
 	saved
 		.profiles
@@ -1063,24 +1113,48 @@ fn build_capturer_face_pose_model(
 }
 
 #[derive(Clone, Copy)]
-enum CapturerProfileResult { NeutralCalibration, FacePoseModel }
+enum CapturerProfileResult {
+	NeutralCalibration,
+	FacePoseModel,
+}
 
-fn save_profile_from_capturer_selection(profile_id: &str, capturer_document: CoreProfileDocument, result: CapturerProfileResult, expected: &serde_json::Value) -> Result<CoreProfileDocument, String> {
+fn save_profile_from_capturer_selection(
+	profile_id: &str,
+	capturer_document: CoreProfileDocument,
+	result: CapturerProfileResult,
+	expected: &serde_json::Value,
+) -> Result<CoreProfileDocument, String> {
 	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
 	save_capturer_result_in_store(&store, profile_id, capturer_document, result, expected)
 }
 
-fn save_capturer_result_in_store(store: &CoreProfileDocumentStore, profile_id: &str, capturer_document: CoreProfileDocument, result: CapturerProfileResult, expected: &serde_json::Value) -> Result<CoreProfileDocument, String> {
-	store.update(|doc| {
-		*doc = merge_capturer_result_checked(profile_id, doc.clone(), capturer_document, result, expected).map_err(anyhow::Error::msg)?;
-		Ok(())
-	}).map_err(|error| error.to_string())
+fn save_capturer_result_in_store(
+	store: &CoreProfileDocumentStore,
+	profile_id: &str,
+	capturer_document: CoreProfileDocument,
+	result: CapturerProfileResult,
+	expected: &serde_json::Value,
+) -> Result<CoreProfileDocument, String> {
+	store
+		.update(|doc| {
+			*doc =
+				merge_capturer_result_checked(profile_id, doc.clone(), capturer_document, result, expected).map_err(anyhow::Error::msg)?;
+			Ok(())
+		})
+		.map_err(|error| error.to_string())
 }
 
 // Compare only the fields owned by this measurement. A name/note edit is not a conflict.
-fn capturer_result_fields(document: &CoreProfileDocument, profile_id: &str, result: CapturerProfileResult) -> Result<serde_json::Value, String> {
-	let profile = document.profiles.iter().find(|profile| profile.id == profile_id)
+fn capturer_result_fields(
+	document: &CoreProfileDocument,
+	profile_id: &str,
+	result: CapturerProfileResult,
+) -> Result<serde_json::Value, String> {
+	let profile = document
+		.profiles
+		.iter()
+		.find(|profile| profile.id == profile_id)
 		.ok_or_else(|| format!("profile not found in user store: {profile_id}"))?;
 	let modifier = profile.runtime_selection.as_ref().and_then(|runtime| runtime.modifier.as_ref());
 	Ok(match result {
@@ -1093,7 +1167,13 @@ fn capturer_result_fields(document: &CoreProfileDocument, profile_id: &str, resu
 	})
 }
 
-fn merge_capturer_result_checked(profile_id: &str, current: CoreProfileDocument, incoming: CoreProfileDocument, result: CapturerProfileResult, expected: &serde_json::Value) -> Result<CoreProfileDocument, String> {
+fn merge_capturer_result_checked(
+	profile_id: &str,
+	current: CoreProfileDocument,
+	incoming: CoreProfileDocument,
+	result: CapturerProfileResult,
+	expected: &serde_json::Value,
+) -> Result<CoreProfileDocument, String> {
 	if &capturer_result_fields(&current, profile_id, result)? != expected {
 		return Err("profile_conflict: calibration settings changed during measurement; result was not saved. The Capturer may already have applied the measurement; reload settings before retrying.".into());
 	}
@@ -1116,9 +1196,15 @@ fn merge_profile_from_capturer_selection(
 		.iter_mut()
 		.find(|profile| profile.id == profile_id)
 		.ok_or_else(|| format!("profile not found in user store: {profile_id}"))?;
-	let incoming = updated_profile.runtime_selection.and_then(|r| r.modifier)
+	let incoming = updated_profile
+		.runtime_selection
+		.and_then(|r| r.modifier)
 		.ok_or_else(|| "capturer result has no modifier settings".to_string())?;
-	let modifier = profile.runtime_selection.get_or_insert_with(Default::default).modifier.get_or_insert_with(Default::default);
+	let modifier = profile
+		.runtime_selection
+		.get_or_insert_with(Default::default)
+		.modifier
+		.get_or_insert_with(Default::default);
 	match result {
 		CapturerProfileResult::NeutralCalibration => {
 			modifier.neutral_calibration_enabled = incoming.neutral_calibration_enabled;
@@ -1359,12 +1445,20 @@ fn write_snapshot_recording(
 ) -> Result<(), String> {
 	fs::write(path, content.as_bytes()).map_err(|error| format!("write UNMotionFrame JSONL: {error}"))?;
 	if analysis {
-		write_snapshot_analysis_sidecar(path, content)
-			.map_err(|error| format!("Motion recording saved to {}. Analysis sidecar could not be saved: {error}", path.display()))?;
+		write_snapshot_analysis_sidecar(path, content).map_err(|error| {
+			format!(
+				"Motion recording saved to {}. Analysis sidecar could not be saved: {error}",
+				path.display()
+			)
+		})?;
 	}
 	if let Some(parent) = path.parent() {
-		remember_folder(parent)
-			.map_err(|error| format!("Motion recording saved to {}. The last-used save folder could not be remembered: {error}", path.display()))?;
+		remember_folder(parent).map_err(|error| {
+			format!(
+				"Motion recording saved to {}. The last-used save folder could not be remembered: {error}",
+				path.display()
+			)
+		})?;
 	}
 	Ok(())
 }
@@ -1456,9 +1550,18 @@ struct PendingCapturerAnalysisExtras {
 mod analysis_temp_tests;
 
 fn cleanup_analysis_temp(pending: &PendingRuntimeAnalysisExtras) -> Result<(), String> {
-	let root = pending.owned_root.canonicalize().map_err(|e| format!("locate temporary analysis: {e}"))?;
-	let temp = std::env::temp_dir().canonicalize().map_err(|e| format!("locate temporary directory: {e}"))?;
-	if root.parent() != Some(temp.as_path()) || !root.file_name().is_some_and(|n| n.to_string_lossy().starts_with(&format!("un-motion-analysis-extras-{}-", std::process::id()))) {
+	let root = pending
+		.owned_root
+		.canonicalize()
+		.map_err(|e| format!("locate temporary analysis: {e}"))?;
+	let temp = std::env::temp_dir()
+		.canonicalize()
+		.map_err(|e| format!("locate temporary directory: {e}"))?;
+	if root.parent() != Some(temp.as_path())
+		|| !root.file_name().is_some_and(|n| {
+			n.to_string_lossy()
+				.starts_with(&format!("un-motion-analysis-extras-{}-", std::process::id()))
+		}) {
 		return Err("Refusing to remove an unexpected analysis directory".into());
 	}
 	fs::remove_dir_all(&root).map_err(|e| format!("Temporary analysis remains at {}: {e}", root.display()))
@@ -1475,8 +1578,12 @@ fn complete_snapshot_analysis(
 	})?;
 	if let Some(pending) = pending {
 		if let Some(path) = saved.as_deref() {
-			write_runtime_analysis_extras(path, &pending, duration).map_err(|error|
-				format!("Motion recording saved to {path}. Additional runtime analysis could not be saved: {error}. Temporary analysis retained at {}", pending.owned_root.display()))?;
+			write_runtime_analysis_extras(path, &pending, duration).map_err(|error| {
+				format!(
+					"Motion recording saved to {path}. Additional runtime analysis could not be saved: {error}. Temporary analysis retained at {}",
+					pending.owned_root.display()
+				)
+			})?;
 		}
 		cleanup_analysis_temp(&pending).map_err(|error| match &saved {
 			Some(path) => format!("Motion recording saved to {path}. {error}"),
@@ -1512,7 +1619,10 @@ fn capture_runtime_analysis_extras_to_temp(
 			response,
 		});
 	}
-	Ok(PendingRuntimeAnalysisExtras { owned_root: base, capturers })
+	Ok(PendingRuntimeAnalysisExtras {
+		owned_root: base,
+		capturers,
+	})
 }
 
 fn write_runtime_analysis_extras(
@@ -2115,7 +2225,9 @@ fn set_selected_profile_in_store(store: &CoreProfileDocumentStore, profile_id: O
 		.map(|value| value.trim().to_string())
 		.filter(|value| !value.is_empty())
 		.unwrap_or_default();
-	store.set_selected_profile_id(&normalized).map_err(|e| format!("save profile selection: {e}"))?;
+	store
+		.set_selected_profile_id(&normalized)
+		.map_err(|e| format!("save profile selection: {e}"))?;
 	Ok(())
 }
 
@@ -2136,24 +2248,26 @@ fn create_profile_in_store(store: &CoreProfileDocumentStore, name: String) -> Re
 		trimmed.to_string()
 	};
 	let mut id = String::new();
-	let saved = store.update(|doc| {
-	id = next_profile_id(doc, &name);
-	let new_profile = CoreProfileDocumentProfile {
-		id: id.clone(),
-		name,
-		created_at: String::new(),
-		note: String::new(),
-		default_source_enabled: true,
-		default_source_label: "Default".to_string(),
-		icon_path: None,
-		group: String::new(),
-		runtime_selection: Some(new_profile_runtime_defaults()),
-		pipeline_components: None,
-	};
-	doc.profiles.push(new_profile);
-	doc.selected_profile_id = id.clone();
-	Ok(())
-	}).map_err(|e| format!("save profile document: {e}"))?;
+	let saved = store
+		.update(|doc| {
+			id = next_profile_id(doc, &name);
+			let new_profile = CoreProfileDocumentProfile {
+				id: id.clone(),
+				name,
+				created_at: String::new(),
+				note: String::new(),
+				default_source_enabled: true,
+				default_source_label: "Default".to_string(),
+				icon_path: None,
+				group: String::new(),
+				runtime_selection: Some(new_profile_runtime_defaults()),
+				pipeline_components: None,
+			};
+			doc.profiles.push(new_profile);
+			doc.selected_profile_id = id.clone();
+			Ok(())
+		})
+		.map_err(|e| format!("save profile document: {e}"))?;
 	let detail = saved
 		.profiles
 		.iter()
@@ -2207,7 +2321,10 @@ fn new_profile_runtime_defaults() -> ProfileRuntimeSettings {
 
 /// Profile を削除する。最後の 1 件も削除できる。空になったら launch default は空文字にする。
 fn resolve_launch_profile(doc: &CoreProfileDocument, requested: Option<&str>) -> Result<String, String> {
-	let id = requested.map(str::trim).filter(|id| !id.is_empty()).unwrap_or(&doc.selected_profile_id);
+	let id = requested
+		.map(str::trim)
+		.filter(|id| !id.is_empty())
+		.unwrap_or(&doc.selected_profile_id);
 	if !doc.profiles.iter().any(|profile| profile.id == id) {
 		return Err(format!("profile not found for launch: {id}"));
 	}
@@ -2218,8 +2335,10 @@ fn profile_is_in_use(state: &SupervisorState, profile_id: &str) -> bool {
 	state.launching_profiles.contains(&Some(profile_id.to_string()))
 		|| state.launching_profiles.contains(&None)
 		|| state.capturers.values().any(|capturer| {
-			matches!(capturer.info.state, CapturerState::Starting | CapturerState::Running | CapturerState::Stopping)
-				&& (capturer.info.profile_id.as_deref() == Some(profile_id) || capturer.info.profile_id.is_none())
+			matches!(
+				capturer.info.state,
+				CapturerState::Starting | CapturerState::Running | CapturerState::Stopping
+			) && (capturer.info.profile_id.as_deref() == Some(profile_id) || capturer.info.profile_id.is_none())
 		})
 }
 
@@ -2239,7 +2358,11 @@ fn delete_profile(profile_id: String, expected_revision: Option<String>, state: 
 fn list_deleted_profiles() -> Result<Vec<profile_archive::ArchiveSummary>, String> {
 	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
-	let root = store.conf_path().parent().ok_or("profile store has no parent")?.join("deleted_profiles");
+	let root = store
+		.conf_path()
+		.parent()
+		.ok_or("profile store has no parent")?
+		.join("deleted_profiles");
 	profile_archive::list(&root)
 }
 
@@ -2259,10 +2382,12 @@ fn duplicate_profile(profile_id: String, _state: State<'_, Mutex<SupervisorState
 
 fn duplicate_profile_in_store(store: &CoreProfileDocumentStore, profile_id: &str) -> Result<ProfileDetail, String> {
 	let mut new_id = String::new();
-	let saved = store.update(|doc| {
-		new_id = duplicate_profile_document(doc, profile_id).map_err(anyhow::Error::msg)?;
-		Ok(())
-	}).map_err(|e| format!("save profile document: {e}"))?;
+	let saved = store
+		.update(|doc| {
+			new_id = duplicate_profile_document(doc, profile_id).map_err(anyhow::Error::msg)?;
+			Ok(())
+		})
+		.map_err(|e| format!("save profile document: {e}"))?;
 	let detail = saved
 		.profiles
 		.iter()
@@ -2294,7 +2419,9 @@ fn duplicate_profile_document(doc: &mut CoreProfileDocument, profile_id: &str) -
 		let mut index = 1usize;
 		let id = loop {
 			let candidate = format!("{new_id}-source-{index}");
-			if used_ids.insert(candidate.clone()) { break candidate; }
+			if used_ids.insert(candidate.clone()) {
+				break candidate;
+			}
 			index += 1;
 		};
 		source.id = id;
@@ -2307,32 +2434,44 @@ fn duplicate_profile_document(doc: &mut CoreProfileDocument, profile_id: &str) -
 }
 
 #[tauri::command]
-fn reorder_profiles(profile_ids: Vec<String>, expected_ids: Vec<String>, _state: State<'_, Mutex<SupervisorState>>) -> Result<Vec<ProfileSummary>, String> {
+fn reorder_profiles(
+	profile_ids: Vec<String>,
+	expected_ids: Vec<String>,
+	_state: State<'_, Mutex<SupervisorState>>,
+) -> Result<Vec<ProfileSummary>, String> {
 	let _profile_guard = lock_profile_store()?;
 	let store = user_profile_store();
 	reorder_profiles_in_store(&store, &profile_ids, &expected_ids)
 }
 
-fn reorder_profiles_in_store(store: &CoreProfileDocumentStore, profile_ids: &[String], expected_ids: &[String]) -> Result<Vec<ProfileSummary>, String> {
-	let saved = store.update(|doc| {
-	if !doc.profiles.iter().map(|profile| &profile.id).eq(expected_ids.iter()) {
-		anyhow::bail!("Profile list changed. Reload the saved order before rearranging again.");
-	}
-	let requested: std::collections::HashSet<&str> = profile_ids.iter().map(String::as_str).collect();
-	if requested.len() != profile_ids.len() || profile_ids.len() != doc.profiles.len()
-		|| doc.profiles.iter().any(|profile| !requested.contains(profile.id.as_str())) {
-		anyhow::bail!("Profile list changed or contains duplicate IDs. Reload the saved order before rearranging again.");
-	}
-	let mut ordered = Vec::with_capacity(doc.profiles.len());
-	for id in profile_ids {
-		if let Some(index) = doc.profiles.iter().position(|profile| &profile.id == id) {
-			ordered.push(doc.profiles.remove(index));
-		}
-	}
-	ordered.append(&mut doc.profiles);
-	doc.profiles = ordered;
-	Ok(())
-	}).map_err(|e| format!("save profile document: {e}"))?;
+fn reorder_profiles_in_store(
+	store: &CoreProfileDocumentStore,
+	profile_ids: &[String],
+	expected_ids: &[String],
+) -> Result<Vec<ProfileSummary>, String> {
+	let saved = store
+		.update(|doc| {
+			if !doc.profiles.iter().map(|profile| &profile.id).eq(expected_ids.iter()) {
+				anyhow::bail!("Profile list changed. Reload the saved order before rearranging again.");
+			}
+			let requested: std::collections::HashSet<&str> = profile_ids.iter().map(String::as_str).collect();
+			if requested.len() != profile_ids.len()
+				|| profile_ids.len() != doc.profiles.len()
+				|| doc.profiles.iter().any(|profile| !requested.contains(profile.id.as_str()))
+			{
+				anyhow::bail!("Profile list changed or contains duplicate IDs. Reload the saved order before rearranging again.");
+			}
+			let mut ordered = Vec::with_capacity(doc.profiles.len());
+			for id in profile_ids {
+				if let Some(index) = doc.profiles.iter().position(|profile| &profile.id == id) {
+					ordered.push(doc.profiles.remove(index));
+				}
+			}
+			ordered.append(&mut doc.profiles);
+			doc.profiles = ordered;
+			Ok(())
+		})
+		.map_err(|e| format!("save profile document: {e}"))?;
 	Ok(saved.profiles_summary())
 }
 
@@ -2384,31 +2523,47 @@ fn update_profile_fields(
 		.iter()
 		.find(|profile| profile.id == profile_id)
 		.map(|profile| profile_detail_with_deletion_revision(profile, &saved))
-		.map(|mut detail| { detail.sync_report = Some(sync_report); detail })
+		.map(|mut detail| {
+			detail.sync_report = Some(sync_report);
+			detail
+		})
 		.ok_or_else(|| format!("profile vanished after save: {profile_id}"))
 }
 
 /// Caller holds the supervisor profile lock; explicit store keeps tests isolated from user settings.
 #[cfg(test)]
-fn save_profile_updates(store: &CoreProfileDocumentStore, profile_id: &str, updates: Vec<ProfileFieldUpdate>) -> Result<CoreProfileDocument, String> {
+fn save_profile_updates(
+	store: &CoreProfileDocumentStore,
+	profile_id: &str,
+	updates: Vec<ProfileFieldUpdate>,
+) -> Result<CoreProfileDocument, String> {
 	save_profile_updates_checked(store, profile_id, updates, None)
 }
 
-fn save_profile_updates_checked(store: &CoreProfileDocumentStore, profile_id: &str, updates: Vec<ProfileFieldUpdate>, expected_revision: Option<&str>) -> Result<CoreProfileDocument, String> {
+fn save_profile_updates_checked(
+	store: &CoreProfileDocumentStore,
+	profile_id: &str,
+	updates: Vec<ProfileFieldUpdate>,
+	expected_revision: Option<&str>,
+) -> Result<CoreProfileDocument, String> {
 	if updates.is_empty() {
 		return Err("no profile updates supplied".to_string());
 	}
-	store.update(|doc| {
-		let profile = doc
-			.profiles
-			.iter_mut()
-			.find(|profile| profile.id == profile_id)
-			.ok_or_else(|| anyhow::anyhow!("profile not found: {profile_id}"))?;
-		if expected_revision.is_some_and(|expected| expected != profile_revision(profile)) {
-			anyhow::bail!("profile_conflict: profile '{profile_id}' changed since it was read; reload and review the saved values before retrying");
-		}
-		apply_profile_updates(profile, updates).map_err(anyhow::Error::msg)
-	}).map_err(|e| format!("save profile document: {e}"))
+	store
+		.update(|doc| {
+			let profile = doc
+				.profiles
+				.iter_mut()
+				.find(|profile| profile.id == profile_id)
+				.ok_or_else(|| anyhow::anyhow!("profile not found: {profile_id}"))?;
+			if expected_revision.is_some_and(|expected| expected != profile_revision(profile)) {
+				anyhow::bail!(
+					"profile_conflict: profile '{profile_id}' changed since it was read; reload and review the saved values before retrying"
+				);
+			}
+			apply_profile_updates(profile, updates).map_err(anyhow::Error::msg)
+		})
+		.map_err(|e| format!("save profile document: {e}"))
 }
 
 /// `package.json` の version を取りたいが、Phase D 初期は Cargo.toml の version をそのまま返す。
@@ -2435,7 +2590,9 @@ pub struct WebcamDeviceDto {
 /// (空配列 / Error の判別を GUI 側で扱う)。
 #[tauri::command]
 fn enumerate_webcams(backend: String) -> Result<Vec<WebcamDeviceDto>, String> {
-    if cfg!(feature = "isolated-review") { return Err("Camera enumeration disabled in isolated review".into()); }
+	if cfg!(feature = "isolated-review") {
+		return Err("Camera enumeration disabled in isolated review".into());
+	}
 	#[cfg(target_os = "windows")]
 	{
 		match backend.as_str() {
@@ -2474,7 +2631,9 @@ pub struct WebcamFormatDto {
 
 #[tauri::command]
 fn enumerate_webcam_formats(backend: String, device_id_or_name: String) -> Result<Vec<WebcamFormatDto>, String> {
-    if cfg!(feature = "isolated-review") { return Err("Camera format inspection disabled in isolated review".into()); }
+	if cfg!(feature = "isolated-review") {
+		return Err("Camera format inspection disabled in isolated review".into());
+	}
 	#[cfg(target_os = "windows")]
 	{
 		match backend.as_str() {
@@ -2538,7 +2697,11 @@ fn stop_all_in_state(state: &Mutex<SupervisorState>) -> Result<(), String> {
 		}
 	}
 	// Retain handles even on failure so the user can retry the affected item.
-	state.lock().map_err(|e| format!("Capturer state unavailable: {e}"))?.capturers.append(&mut capturers);
+	state
+		.lock()
+		.map_err(|e| format!("Capturer state unavailable: {e}"))?
+		.capturers
+		.append(&mut capturers);
 	if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) }
 }
 
@@ -2580,16 +2743,28 @@ fn sync_app_settings(
 	normalize_app_settings(&mut settings);
 	let mut guard = state.lock().map_err(|_| "app settings state poisoned".to_string())?;
 	save_app_settings_with_effects(
-		&mut guard, settings, write_app_settings,
+		&mut guard,
+		settings,
+		write_app_settings,
 		|old, next| {
 			let created = !old.system_tray_enabled && next.system_tray_enabled && app.tray_by_id(TRAY_ICON_ID).is_none();
-			if created { setup_tray(&app).map_err(|e| format!("setup tray: {e}"))?; }
+			if created {
+				setup_tray(&app).map_err(|e| format!("setup tray: {e}"))?;
+			}
 			Ok(created)
 		},
-		|created| { if created { drop(app.remove_tray_by_id(TRAY_ICON_ID)); } },
+		|created| {
+			if created {
+				drop(app.remove_tray_by_id(TRAY_ICON_ID));
+			}
+		},
 		|old, next| {
-			if old.system_tray_enabled && !next.system_tray_enabled { drop(app.remove_tray_by_id(TRAY_ICON_ID)); }
-			if old.locale != next.locale && !next.locale.is_empty() { crate::i18n::apply_locale(&next.locale); }
+			if old.system_tray_enabled && !next.system_tray_enabled {
+				drop(app.remove_tray_by_id(TRAY_ICON_ID));
+			}
+			if old.locale != next.locale && !next.locale.is_empty() {
+				crate::i18n::apply_locale(&next.locale);
+			}
 		},
 	)
 }
@@ -2618,7 +2793,10 @@ fn save_app_settings_with_effects(
 	let prepared = prepare(&old, &next)?;
 	let saved = match persist_app_settings(state, next, write) {
 		Ok(saved) => saved,
-		Err(error) => { rollback(prepared); return Err(error); }
+		Err(error) => {
+			rollback(prepared);
+			return Err(error);
+		}
 	};
 	apply(&old, &saved);
 	Ok(saved)
@@ -3021,9 +3199,13 @@ fn handle_tray_menu_event(app: &tauri::AppHandle, event: tauri::menu::MenuEvent)
 }
 
 fn request_supervisor_close(app: &tauri::AppHandle, intent: close_gate::CloseIntent) {
-	let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else { return; };
+	let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+		return;
+	};
 	let gate = app.state::<Mutex<close_gate::CloseGate>>();
-	let Some(id) = gate.lock().expect("close gate").request(intent) else { return; };
+	let Some(id) = gate.lock().expect("close gate").request(intent) else {
+		return;
+	};
 	let script = include_str!("close_review.js").replace("__REQUEST_ID__", &id.to_string());
 	if let Err(error) = window.eval(script) {
 		let _ = gate.lock().expect("close gate").resolve(id, false);
@@ -3033,17 +3215,20 @@ fn request_supervisor_close(app: &tauri::AppHandle, intent: close_gate::CloseInt
 }
 
 #[tauri::command]
-async fn resolve_supervisor_close(
-	app: tauri::AppHandle,
-	window: WebviewWindow,
-	request_id: u64,
-	allowed: bool,
-) -> Result<bool, String> {
-	if window.label() != MAIN_WINDOW_LABEL { return Err("Wrong close review window".into()); }
-	let intent = app.state::<Mutex<close_gate::CloseGate>>()
-		.lock().map_err(|e| e.to_string())?.resolve(request_id, allowed)
+async fn resolve_supervisor_close(app: tauri::AppHandle, window: WebviewWindow, request_id: u64, allowed: bool) -> Result<bool, String> {
+	if window.label() != MAIN_WINDOW_LABEL {
+		return Err("Wrong close review window".into());
+	}
+	let intent = app
+		.state::<Mutex<close_gate::CloseGate>>()
+		.lock()
+		.map_err(|e| e.to_string())?
+		.resolve(request_id, allowed)
 		.map_err(str::to_owned)?;
-	let Some(intent) = intent else { show_main_window(&app); return Ok(false); };
+	let Some(intent) = intent else {
+		show_main_window(&app);
+		return Ok(false);
+	};
 	// Only an approved request may stop Capturers. Window-close keeps its old
 	// configured policy; explicit tray Quit keeps its existing stop-all policy.
 	let stop = intent == close_gate::CloseIntent::Quit || should_stop_capturers_on_exit(&app);
@@ -3056,22 +3241,36 @@ async fn resolve_supervisor_close(
 			if let Some(state) = shutdown_app.try_state::<Mutex<SupervisorState>>() {
 				wait_for_capturer_launches(&state)?;
 				if stop { stop_all_in_state(&state) } else { Ok(()) }
-			} else { Err("Capturer state unavailable".into()) }
-		}).await.map_err(|error| error.to_string()).and_then(|result| result);
+			} else {
+				Err("Capturer state unavailable".into())
+			}
+		})
+		.await
+		.map_err(|error| error.to_string())
+		.and_then(|result| result);
 		if let Err(error) = stopped {
-			if let Ok(mut state) = app.state::<Mutex<SupervisorState>>().lock() { state.closing = false; }
-			app.state::<Mutex<close_gate::CloseGate>>().lock()
-				.map_err(|e| e.to_string())?.completion_failed();
+			if let Ok(mut state) = app.state::<Mutex<SupervisorState>>().lock() {
+				state.closing = false;
+			}
+			app.state::<Mutex<close_gate::CloseGate>>()
+				.lock()
+				.map_err(|e| e.to_string())?
+				.completion_failed();
 			show_main_window(&app);
 			return Err(format!("Capturer shutdown did not complete: {error}"));
 		}
 	}
 	persist_console_window_geometry(&app);
-	if intent == close_gate::CloseIntent::Quit { app.exit(0); }
-	else if let Err(error) = window.destroy() {
-		if let Ok(mut state) = app.state::<Mutex<SupervisorState>>().lock() { state.closing = false; }
-		app.state::<Mutex<close_gate::CloseGate>>().lock()
-			.map_err(|e| e.to_string())?.completion_failed();
+	if intent == close_gate::CloseIntent::Quit {
+		app.exit(0);
+	} else if let Err(error) = window.destroy() {
+		if let Ok(mut state) = app.state::<Mutex<SupervisorState>>().lock() {
+			state.closing = false;
+		}
+		app.state::<Mutex<close_gate::CloseGate>>()
+			.lock()
+			.map_err(|e| e.to_string())?
+			.completion_failed();
 		return Err(error.to_string());
 	}
 	Ok(true)
@@ -3086,16 +3285,19 @@ fn stop_all_capturers(state: State<'_, Mutex<SupervisorState>>) -> Result<(), St
 
 /// Tauri アプリのエントリポイント。`main.rs` から呼ばれる。
 pub fn run() {
-    #[cfg(feature = "isolated-review")]
-    {
-        // Review binaries must never fall back to the normal user store.
-        let config = PathBuf::from(env::var_os("UN_MOTION_CONFIG_DIR").expect("isolated config required"));
-        assert!(config.is_absolute(), "isolated config must be absolute");
-        let config = config.canonicalize().expect("isolated config must exist");
-        assert_eq!(config.file_name().and_then(|s|s.to_str()), Some("config"));
-        let marker = config.parent().expect("isolated parent").join(".un-motion-review");
-        assert_eq!(fs::read_to_string(marker).expect("isolated marker required"), "isolated-native-ui-v1");
-    }
+	#[cfg(feature = "isolated-review")]
+	{
+		// Review binaries must never fall back to the normal user store.
+		let config = PathBuf::from(env::var_os("UN_MOTION_CONFIG_DIR").expect("isolated config required"));
+		assert!(config.is_absolute(), "isolated config must be absolute");
+		let config = config.canonicalize().expect("isolated config must exist");
+		assert_eq!(config.file_name().and_then(|s| s.to_str()), Some("config"));
+		let marker = config.parent().expect("isolated parent").join(".un-motion-review");
+		assert_eq!(
+			fs::read_to_string(marker).expect("isolated marker required"),
+			"isolated-native-ui-v1"
+		);
+	}
 	install_panic_log_hook("un-motion-supervisor");
 	// tracing 出力を有効化 (cargo run / 端末から起動したとき stdout に流す)。
 	// すでに別のレイヤが初期化済みなら try_init で握り潰す。
@@ -3121,7 +3323,7 @@ pub fn run() {
 			save_capturer_unmf_pose,
 			save_all_capturers_unmf_pose,
 			list_profiles,
-            resolve_profile_icon,
+			resolve_profile_icon,
 			selected_profile_id,
 			set_selected_profile_id,
 			create_profile,
@@ -3372,9 +3574,11 @@ fn profile_revision(profile: &CoreProfileDocumentProfile) -> String {
 }
 
 fn profile_detail_with_deletion_revision(profile: &CoreProfileDocumentProfile, doc: &CoreProfileDocument) -> ProfileDetail {
-    let mut detail = ProfileDetail::from(profile);
-    detail.deletion_revision = profile_archive::ArchivedProfile::capture(doc, &profile.id).ok().map(|snapshot| snapshot.revision());
-    detail
+	let mut detail = ProfileDetail::from(profile);
+	detail.deletion_revision = profile_archive::ArchivedProfile::capture(doc, &profile.id)
+		.ok()
+		.map(|snapshot| snapshot.revision());
+	detail
 }
 
 impl From<&CoreProfileDocumentProfile> for ProfileDetail {
@@ -3904,7 +4108,10 @@ fn opt_f32(value: &serde_json::Value, field: &str) -> Result<Option<f32>, String
 fn push_document_to_matching_capturers(state: &Mutex<SupervisorState>, doc: &CoreProfileDocument, profile_id: &str) -> ProfileSyncReport {
 	let (http_client, targets) = {
 		let Ok(state) = state.lock() else {
-			return ProfileSyncReport { targets: vec![], discovery_error: Some("capturer registry lock failed".into()) };
+			return ProfileSyncReport {
+				targets: vec![],
+				discovery_error: Some("capturer registry lock failed".into()),
+			};
 		};
 		let targets = state
 			.capturers
@@ -3920,14 +4127,22 @@ fn push_document_to_matching_capturers(state: &Mutex<SupervisorState>, doc: &Cor
 	let mut results = Vec::new();
 	for (id, bind_addr) in targets {
 		let url = format!("http://{bind_addr}/api/profiles/document/sync");
-		let result = http_client.put(&url).json(&body).send().map(|response| response.status()).map_err(|error| error.to_string());
+		let result = http_client
+			.put(&url)
+			.json(&body)
+			.send()
+			.map(|response| response.status())
+			.map_err(|error| error.to_string());
 		let outcome = capturer_sync_result(id, result);
 		if let Some(error) = &outcome.error {
 			tracing::warn!(id, %error, "sync profile document via capturer failed");
 		}
 		results.push(outcome);
 	}
-	ProfileSyncReport { targets: results, discovery_error: None }
+	ProfileSyncReport {
+		targets: results,
+		discovery_error: None,
+	}
 }
 
 fn capturer_sync_result(id: u32, status: Result<reqwest::StatusCode, String>) -> CapturerSyncResult {
@@ -3937,7 +4152,12 @@ fn capturer_sync_result(id: u32, status: Result<reqwest::StatusCode, String>) ->
 		Ok(status) => Some(format!("HTTP {status}")),
 		Err(error) => Some(error),
 	};
-	CapturerSyncResult { capturer_id: id, accepted: error.is_none(), error, status_code }
+	CapturerSyncResult {
+		capturer_id: id,
+		accepted: error.is_none(),
+		error,
+		status_code,
+	}
 }
 
 /// 対象 Capturer から HTTP 経由で active_profile_id を取得する。
@@ -4350,7 +4570,10 @@ fn capturer_command(
 		return Ok(command);
 	}
 	if !cfg!(debug_assertions) {
-		return Err(format!("Capturerが見つかりません（{}）。配布ZIP全体を展開し、un-motion-capturer.exeをSupervisorと同じフォルダーへ戻してください。", exe.display()));
+		return Err(format!(
+			"Capturerが見つかりません（{}）。配布ZIP全体を展開し、un-motion-capturer.exeをSupervisorと同じフォルダーへ戻してください。",
+			exe.display()
+		));
 	}
 	let repo = repo_root();
 	tracing::info!(
@@ -4393,8 +4616,12 @@ fn capturer_working_directory_for(capturer_exe: &Path, development_workspace: Op
 	let dir = capturer_exe.parent().unwrap_or_else(|| Path::new("."));
 	let package = if dir.file_name().is_some_and(|name| name == "runtimes") {
 		dir.parent().unwrap_or(dir)
-	} else { dir };
-	if package.join("models").is_dir() { return package.to_path_buf(); }
+	} else {
+		dir
+	};
+	if package.join("models").is_dir() {
+		return package.to_path_buf();
+	}
 	development_workspace.unwrap_or(package).to_path_buf()
 }
 
@@ -4402,7 +4629,12 @@ fn capturer_executable_path() -> PathBuf {
 	capturer_executable_candidates()
 		.into_iter()
 		.find(|path| path.is_file())
-		.unwrap_or_else(|| env::current_exe().ok().and_then(|exe| exe.parent().map(|dir| dir.join(exe_name("un-motion-capturer")))).unwrap_or_else(|| PathBuf::from(exe_name("un-motion-capturer"))))
+		.unwrap_or_else(|| {
+			env::current_exe()
+				.ok()
+				.and_then(|exe| exe.parent().map(|dir| dir.join(exe_name("un-motion-capturer"))))
+				.unwrap_or_else(|| PathBuf::from(exe_name("un-motion-capturer")))
+		})
 }
 
 fn capturer_executable_candidates() -> Vec<PathBuf> {
@@ -4474,12 +4706,15 @@ fn exe_suffix() -> &'static str {
 }
 
 fn supervisor_logs_dir() -> PathBuf {
-	let development = (cfg!(debug_assertions) && !cfg!(feature = "isolated-review") && env::var_os("UN_MOTION_CONFIG_DIR").is_none()).then(repo_root);
+	let development =
+		(cfg!(debug_assertions) && !cfg!(feature = "isolated-review") && env::var_os("UN_MOTION_CONFIG_DIR").is_none()).then(repo_root);
 	supervisor_logs_dir_for(&app_config_dir(), development.as_deref())
 }
 
 fn supervisor_logs_dir_for(config: &Path, development: Option<&Path>) -> PathBuf {
-	development.map(|repo| repo.join("target/tmp/supervisor-logs")).unwrap_or_else(|| config.join("logs"))
+	development
+		.map(|repo| repo.join("target/tmp/supervisor-logs"))
+		.unwrap_or_else(|| config.join("logs"))
 }
 
 #[tauri::command]
@@ -4496,28 +4731,41 @@ fn save_supervisor_logs(content: String, file_prefix: String) -> Result<String, 
 
 #[tauri::command]
 fn resolve_profile_icon(profile_id: String, app: tauri::AppHandle) -> Result<String, String> {
-    let profile = get_profile_detail(profile_id)?;
-    let raw = profile.icon_path.ok_or("profile has no icon")?;
-    let path = PathBuf::from(raw);
-    let path = if path.is_absolute() { path } else { profile_asset_root().join(path) };
-    let resolved = validated_profile_icon(&path)?;
-    app.asset_protocol_scope().allow_file(&resolved).map_err(|e| format!("allow selected icon: {e}"))?;
-    Ok(resolved.to_string_lossy().to_string())
+	let profile = get_profile_detail(profile_id)?;
+	let raw = profile.icon_path.ok_or("profile has no icon")?;
+	let path = PathBuf::from(raw);
+	let path = if path.is_absolute() {
+		path
+	} else {
+		profile_asset_root().join(path)
+	};
+	let resolved = validated_profile_icon(&path)?;
+	app.asset_protocol_scope()
+		.allow_file(&resolved)
+		.map_err(|e| format!("allow selected icon: {e}"))?;
+	Ok(resolved.to_string_lossy().to_string())
 }
 
 fn validated_profile_icon(path: &Path) -> Result<PathBuf, String> {
-    let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
-    if !["png", "jpg", "jpeg", "ico", "webp"].contains(&extension.as_str()) {
-        return Err("unsupported profile icon format".into());
-    }
-    let resolved = path.canonicalize().map_err(|e| format!("read profile icon: {e}"))?;
-    if !resolved.is_file() { return Err("profile icon is not a file".into()); }
-    Ok(resolved)
+	let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
+	if !["png", "jpg", "jpeg", "ico", "webp"].contains(&extension.as_str()) {
+		return Err("unsupported profile icon format".into());
+	}
+	let resolved = path.canonicalize().map_err(|e| format!("read profile icon: {e}"))?;
+	if !resolved.is_file() {
+		return Err("profile icon is not a file".into());
+	}
+	Ok(resolved)
 }
 
 fn profile_asset_root() -> PathBuf {
-    if cfg!(debug_assertions) { return repo_root(); }
-    env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(app_config_dir)
+	if cfg!(debug_assertions) {
+		return repo_root();
+	}
+	env::current_exe()
+		.ok()
+		.and_then(|p| p.parent().map(Path::to_path_buf))
+		.unwrap_or_else(app_config_dir)
 }
 
 // Native modal dialogs must not block WebView IPC dispatch.
@@ -4622,51 +4870,77 @@ fn exe_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn recording_postsave_failure_preserves_primary_and_reports_its_path() {
-        let root = std::env::temp_dir().join(format!("unm-recording-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        fs::create_dir(&root).unwrap();
-        let path = root.join("pose 日本語.jsonl");
-        let sidecar = root.join("pose 日本語.jsonl.analysis.jsonl");
-        fs::create_dir(&sidecar).unwrap();
-        let content = "{}\n";
-        let error = super::write_snapshot_recording(&path, content, true, |_| panic!("Remember must not run after analysis failure")).unwrap_err();
-        assert_eq!(fs::read_to_string(&path).unwrap(), content);
-        assert!(error.contains(&path.display().to_string()));
-        assert!(error.contains("Analysis sidecar could not be saved"));
-        let error = super::write_snapshot_recording(&path, content, false, |_| Err("settings denied".into())).unwrap_err();
-        assert_eq!(fs::read_to_string(&path).unwrap(), content);
-        assert!(error.contains("Motion recording saved to"));
-        assert!(error.contains("settings denied"));
-        let error = super::write_snapshot_recording(&sidecar, content, false, |_| panic!("Primary write failed")).unwrap_err();
-        assert!(error.starts_with("write UNMotionFrame JSONL:"));
-        assert!(!error.contains("recording saved"));
-        assert!(root.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
-        fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
-    fn selected_profile_icon_requires_existing_supported_file() {
-        let root = std::env::temp_dir().join(format!("unm-icon-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        fs::create_dir(&root).unwrap();
-        let image = root.join("selected image 日本語.PNG");
-        fs::write(&image, b"fixture").unwrap();
-        assert_eq!(super::validated_profile_icon(&image).unwrap(), image.canonicalize().unwrap());
-        assert!(super::validated_profile_icon(&root.join("missing.png")).is_err());
-        let document = root.join("settings.toml");
-        fs::write(&document, b"private configuration").unwrap();
-        assert!(super::validated_profile_icon(&document).is_err());
-        let directory = root.join("folder.png");
-        fs::create_dir(&directory).unwrap();
-        assert!(super::validated_profile_icon(&directory).is_err());
-        assert!(root.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
-        fs::remove_dir_all(&root).unwrap();
-    }
+	#[test]
+	fn recording_postsave_failure_preserves_primary_and_reports_its_path() {
+		let root = std::env::temp_dir().join(format!(
+			"unm-recording-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
+		fs::create_dir(&root).unwrap();
+		let path = root.join("pose 日本語.jsonl");
+		let sidecar = root.join("pose 日本語.jsonl.analysis.jsonl");
+		fs::create_dir(&sidecar).unwrap();
+		let content = "{}\n";
+		let error =
+			super::write_snapshot_recording(&path, content, true, |_| panic!("Remember must not run after analysis failure")).unwrap_err();
+		assert_eq!(fs::read_to_string(&path).unwrap(), content);
+		assert!(error.contains(&path.display().to_string()));
+		assert!(error.contains("Analysis sidecar could not be saved"));
+		let error = super::write_snapshot_recording(&path, content, false, |_| Err("settings denied".into())).unwrap_err();
+		assert_eq!(fs::read_to_string(&path).unwrap(), content);
+		assert!(error.contains("Motion recording saved to"));
+		assert!(error.contains("settings denied"));
+		let error = super::write_snapshot_recording(&sidecar, content, false, |_| panic!("Primary write failed")).unwrap_err();
+		assert!(error.starts_with("write UNMotionFrame JSONL:"));
+		assert!(!error.contains("recording saved"));
+		assert!(
+			root.canonicalize()
+				.unwrap()
+				.starts_with(std::env::temp_dir().canonicalize().unwrap())
+		);
+		fs::remove_dir_all(root).unwrap();
+	}
+	#[test]
+	fn selected_profile_icon_requires_existing_supported_file() {
+		let root = std::env::temp_dir().join(format!(
+			"unm-icon-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
+		fs::create_dir(&root).unwrap();
+		let image = root.join("selected image 日本語.PNG");
+		fs::write(&image, b"fixture").unwrap();
+		assert_eq!(super::validated_profile_icon(&image).unwrap(), image.canonicalize().unwrap());
+		assert!(super::validated_profile_icon(&root.join("missing.png")).is_err());
+		let document = root.join("settings.toml");
+		fs::write(&document, b"private configuration").unwrap();
+		assert!(super::validated_profile_icon(&document).is_err());
+		let directory = root.join("folder.png");
+		fs::create_dir(&directory).unwrap();
+		assert!(super::validated_profile_icon(&directory).is_err());
+		assert!(
+			root.canonicalize()
+				.unwrap()
+				.starts_with(std::env::temp_dir().canonicalize().unwrap())
+		);
+		fs::remove_dir_all(&root).unwrap();
+	}
 
 	#[test]
 	fn distributed_logs_use_the_selected_user_store() {
 		let config = std::path::Path::new("isolated user settings");
 		assert_eq!(super::supervisor_logs_dir_for(config, None), config.join("logs"));
-		assert_eq!(super::supervisor_logs_dir_for(config, Some(std::path::Path::new("workspace"))), std::path::Path::new("workspace/target/tmp/supervisor-logs"));
+		assert_eq!(
+			super::supervisor_logs_dir_for(config, Some(std::path::Path::new("workspace"))),
+			std::path::Path::new("workspace/target/tmp/supervisor-logs")
+		);
 	}
 
 	use super::*;
@@ -4674,7 +4948,14 @@ mod tests {
 
 	#[test]
 	fn distributed_capturer_paths_stay_inside_the_package() {
-		let root = env::temp_dir().join(format!("unm-runtime-paths-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+		let root = env::temp_dir().join(format!(
+			"unm-runtime-paths-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
 		let package = root.join("package");
 		let workspace = root.join("developer");
 		fs::create_dir_all(package.join("runtimes")).unwrap();
@@ -4696,17 +4977,30 @@ mod tests {
 
 	#[test]
 	fn template_lookup_excludes_developer_profiles_from_distribution() {
-		let root = env::temp_dir().join(format!("unm-template-lookup-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+		let root = env::temp_dir().join(format!(
+			"unm-template-lookup-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
 		let binary = root.join("binary");
 		let workspace = root.join("developer");
 		fs::create_dir_all(&binary).unwrap();
 		fs::create_dir_all(workspace.join("profiles")).unwrap();
 		fs::write(workspace.join("profiles/private.toml"), "private developer configuration").unwrap();
 		assert_eq!(find_template_profiles_dir(Some(&binary), None), None);
-		assert_eq!(find_template_profiles_dir(Some(&binary), Some(&workspace)), Some(workspace.join("profiles")));
+		assert_eq!(
+			find_template_profiles_dir(Some(&binary), Some(&workspace)),
+			Some(workspace.join("profiles"))
+		);
 		fs::create_dir(binary.join("profiles")).unwrap();
 		assert_eq!(find_template_profiles_dir(Some(&binary), None), Some(binary.join("profiles")));
-		assert_eq!(find_template_profiles_dir(Some(&binary), Some(&workspace)), Some(binary.join("profiles")));
+		assert_eq!(
+			find_template_profiles_dir(Some(&binary), Some(&workspace)),
+			Some(binary.join("profiles"))
+		);
 		fs::remove_dir_all(&root).unwrap();
 	}
 
@@ -4826,7 +5120,10 @@ mod tests {
 		let state = Mutex::new(SupervisorState::new());
 		state.lock().unwrap().launching_profiles.insert(Some("a".into()));
 		{
-			let _reservation = CapturerLaunchReservation { state: &state, profile_id: Some("a".into()) };
+			let _reservation = CapturerLaunchReservation {
+				state: &state,
+				profile_id: Some("a".into()),
+			};
 			assert!(profile_is_in_use(&state.lock().unwrap(), "a"));
 			assert!(!profile_is_in_use(&state.lock().unwrap(), "b"));
 		}
@@ -4867,15 +5164,25 @@ mod tests {
 
 	#[test]
 	fn duplicate_profile_keeps_owned_sources_independent_through_save_reload() {
-		let root = std::env::temp_dir().join(format!("unm-duplicate-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+		let root = std::env::temp_dir().join(format!(
+			"unm-duplicate-{}-{}",
+			std::process::id(),
+			SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+		));
 		let store = CoreProfileDocumentStore::from_root(&root);
 		let mut doc = CoreProfileDocument::default();
 		doc.profiles = vec![make_profile("a", "Alpha"), make_profile("b", "Beta")];
 		doc.profiles[0].runtime_selection = Some(new_profile_runtime_defaults());
 		doc.selected_profile_id = "b".into();
 		doc.profile_sources = vec![un_motion_profile_schema::CoreProfileDocumentSource {
-			id: "alpha-copy-source-1".into(), profile_id: "a".into(), kind: "vmc-osc".into(), label: "Phone".into(),
-			protocol: Some("udp".into()), host: Some("127.0.0.1".into()), port: Some(39539), mirror_correction_enabled: true,
+			id: "alpha-copy-source-1".into(),
+			profile_id: "a".into(),
+			kind: "vmc-osc".into(),
+			label: "Phone".into(),
+			protocol: Some("udp".into()),
+			host: Some("127.0.0.1".into()),
+			port: Some(39539),
+			mirror_correction_enabled: true,
 		}];
 		store.save(doc).unwrap();
 		let original = store.load().unwrap();
@@ -4884,29 +5191,47 @@ mod tests {
 		assert_eq!(loaded.profile_sources.len(), 2);
 		assert_ne!(loaded.profile_sources[0].id, loaded.profile_sources[1].id);
 		assert_eq!(loaded.selected_profile_id, "b");
-		for profile in &original.profiles { assert_eq!(loaded.profiles.iter().find(|p| p.id == profile.id), Some(profile)); }
+		for profile in &original.profiles {
+			assert_eq!(loaded.profiles.iter().find(|p| p.id == profile.id), Some(profile));
+		}
 		let copied = loaded.profiles.iter().find(|p| p.id == new_id).unwrap();
-		assert_eq!(copied.runtime_selection, original.profiles.iter().find(|p| p.id == "a").unwrap().runtime_selection);
+		assert_eq!(
+			copied.runtime_selection,
+			original.profiles.iter().find(|p| p.id == "a").unwrap().runtime_selection
+		);
 		let source = loaded.profile_sources.iter_mut().find(|s| s.profile_id == new_id).unwrap();
-		let mut comparable = source.clone(); comparable.id = original.profile_sources[0].id.clone(); comparable.profile_id = "a".into();
+		let mut comparable = source.clone();
+		comparable.id = original.profile_sources[0].id.clone();
+		comparable.profile_id = "a".into();
 		assert_eq!(comparable, original.profile_sources[0]);
 		source.label = "Edited copy".into();
 		store.save(loaded).unwrap();
-		assert_eq!(store.load().unwrap().profile_sources.iter().find(|s| s.profile_id == "a"), original.profile_sources.first());
-		let mut loaded = store.load().unwrap(); let before = loaded.clone();
-		assert!(duplicate_profile_document(&mut loaded, "missing").is_err()); assert_eq!(loaded, before);
+		assert_eq!(
+			store.load().unwrap().profile_sources.iter().find(|s| s.profile_id == "a"),
+			original.profile_sources.first()
+		);
+		let mut loaded = store.load().unwrap();
+		let before = loaded.clone();
+		assert!(duplicate_profile_document(&mut loaded, "missing").is_err());
+		assert_eq!(loaded, before);
 		fs::remove_dir_all(root).unwrap();
 	}
 
 	#[test]
 	fn reorder_rejects_changed_membership_without_writing_files() {
-		let root = std::env::temp_dir().join(format!("unm-reorder-conflict-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+		let root = std::env::temp_dir().join(format!(
+			"unm-reorder-conflict-{}-{}",
+			std::process::id(),
+			SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+		));
 		let store = CoreProfileDocumentStore::from_root(&root);
-		store.save(CoreProfileDocument {
-			selected_profile_id: "b".into(),
-			profiles: vec![make_profile("a", "Alpha"), make_profile("b", "Beta")],
-			..Default::default()
-		}).unwrap();
+		store
+			.save(CoreProfileDocument {
+				selected_profile_id: "b".into(),
+				profiles: vec![make_profile("a", "Alpha"), make_profile("b", "Beta")],
+				..Default::default()
+			})
+			.unwrap();
 		let snapshot = || {
 			let mut files = std::collections::BTreeMap::new();
 			files.insert(store.conf_path().to_path_buf(), fs::read(store.conf_path()).unwrap());
@@ -4921,7 +5246,11 @@ mod tests {
 		let before = snapshot();
 		for ids in [vec!["a"], vec!["a", "b", "deleted"], vec!["a", "a"], vec!["a", "unknown"]] {
 			let ids: Vec<String> = ids.into_iter().map(str::to_owned).collect();
-			assert!(reorder_profiles_in_store(&store, &ids, &["a".into(), "b".into()]).unwrap_err().contains("Profile list changed"));
+			assert!(
+				reorder_profiles_in_store(&store, &ids, &["a".into(), "b".into()])
+					.unwrap_err()
+					.contains("Profile list changed")
+			);
 			assert_eq!(snapshot(), before, "Rejected order must leave all profile files unchanged");
 		}
 		let original = store.load().unwrap();
@@ -4931,14 +5260,22 @@ mod tests {
 		assert_eq!(saved.profiles, vec![original.profiles[1].clone(), original.profiles[0].clone()]);
 		assert_eq!(saved.profile_sources, original.profile_sources);
 		let after = snapshot();
-		assert!(reorder_profiles_in_store(&store, &["a".into(), "b".into()], &["a".into(), "b".into()]).unwrap_err().contains("Profile list changed"));
+		assert!(
+			reorder_profiles_in_store(&store, &["a".into(), "b".into()], &["a".into(), "b".into()])
+				.unwrap_err()
+				.contains("Profile list changed")
+		);
 		assert_eq!(snapshot(), after, "Stale order must not overwrite a newer order");
 		fs::remove_dir_all(root).unwrap();
 	}
 
 	#[test]
 	fn concurrent_duplicate_and_reorder_keep_all_profiles() {
-		let root = std::env::temp_dir().join(format!("unm-reorder-race-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+		let root = std::env::temp_dir().join(format!(
+			"unm-reorder-race-{}-{}",
+			std::process::id(),
+			SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+		));
 		let store = CoreProfileDocumentStore::from_root(&root);
 		let mut doc = CoreProfileDocument::default();
 		doc.profiles = vec![make_profile("a", "Alpha"), make_profile("b", "Beta")];
@@ -4971,15 +5308,25 @@ mod tests {
 
 	#[test]
 	fn concurrent_creation_and_selected_profile_validation_preserve_store() {
-		let root = std::env::temp_dir().join(format!("unm-create-race-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+		let root = std::env::temp_dir().join(format!(
+			"unm-create-race-{}-{}",
+			std::process::id(),
+			SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+		));
 		let store = CoreProfileDocumentStore::from_root(&root);
 		store.save(CoreProfileDocument::default()).unwrap();
 		let original_count = store.load().unwrap().profiles.len();
 		let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-		let workers: Vec<_> = (0..2).map(|_| {
-			let store = store.clone(); let barrier = barrier.clone();
-			std::thread::spawn(move || { barrier.wait(); create_profile_in_store(&store, "Same Name".into()).unwrap().id })
-		}).collect();
+		let workers: Vec<_> = (0..2)
+			.map(|_| {
+				let store = store.clone();
+				let barrier = barrier.clone();
+				std::thread::spawn(move || {
+					barrier.wait();
+					create_profile_in_store(&store, "Same Name".into()).unwrap().id
+				})
+			})
+			.collect();
 		let ids: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
 		assert_ne!(ids[0], ids[1]);
 		let saved = store.load().unwrap();
@@ -5022,7 +5369,10 @@ mod tests {
 			let mut profile = make_profile("contract", "New Profile");
 			profile.runtime_selection = Some(new_profile_runtime_defaults());
 			apply_profile_field(&mut profile, case["field"].as_str().unwrap(), case["value"].clone()).unwrap();
-			let doc = un_motion_profile_schema::normalize_profile_document(CoreProfileDocument { profiles: vec![profile], ..CoreProfileDocument::default() });
+			let doc = un_motion_profile_schema::normalize_profile_document(CoreProfileDocument {
+				profiles: vec![profile],
+				..CoreProfileDocument::default()
+			});
 			let profile = &doc.profiles[0];
 			let mut settings = profile.runtime_selection.clone().unwrap_or_default();
 			let lan_enabled = settings.zenoh_lan_enabled;
@@ -5031,7 +5381,11 @@ mod tests {
 			let mut runtime = serde_json::to_value(ProfileRuntimeView::from(&settings)).unwrap();
 			runtime["zenohLanEnabled"] = serde_json::json!(lan_enabled);
 			runtime.as_object_mut().unwrap().remove("zenohLanConnectAddress");
-			let pipeline = profile.pipeline_components.as_ref().map(ProfilePipelineView::from).unwrap_or_default();
+			let pipeline = profile
+				.pipeline_components
+				.as_ref()
+				.map(ProfilePipelineView::from)
+				.unwrap_or_default();
 			results.push(serde_json::json!({"input":case,"expected":{"name":profile.name,"note":profile.note,"group":profile.group,"iconPath":profile.icon_path,"runtime":runtime,"pipeline":pipeline}}));
 		}
 		results
@@ -5040,7 +5394,10 @@ mod tests {
 	#[test]
 	#[ignore = "explicit native save contract export without devices or user store"]
 	fn export_preview_save_contract() {
-		println!("UN_SAVE_CONTRACT:{}", serde_json::to_string(&native_preview_save_contract()).unwrap());
+		println!(
+			"UN_SAVE_CONTRACT:{}",
+			serde_json::to_string(&native_preview_save_contract()).unwrap()
+		);
 	}
 
 	#[test]
@@ -5064,7 +5421,10 @@ mod tests {
 		// Compare the serialized API representation, including its float parsing semantics.
 		let expected: serde_json::Value = serde_json::from_str(&serde_json::to_string(&expected).unwrap()).unwrap();
 		let fixture: serde_json::Value = serde_json::from_str(include_str!("../../src/lib/newProfileDefaults.json")).unwrap();
-		assert_eq!(fixture, expected, "Regenerate the isolated preview defaults from the native implementation");
+		assert_eq!(
+			fixture, expected,
+			"Regenerate the isolated preview defaults from the native implementation"
+		);
 	}
 
 	#[test]
@@ -5118,15 +5478,34 @@ mod tests {
 		let mut capturer_document = user_document.clone();
 		capturer_document.profiles[0].note = "stale global".to_string();
 		capturer_document.profiles[0].runtime_selection = Some(ProfileRuntimeSettings {
-			modifier: Some(ProfileModifierSettings { neutral_calibration_enabled: Some(false), ..Default::default() }),
+			modifier: Some(ProfileModifierSettings {
+				neutral_calibration_enabled: Some(false),
+				..Default::default()
+			}),
 			..Default::default()
 		});
 		capturer_document.profiles[1].note = "stale waidayo from capturer".to_string();
 
-		let merged = merge_profile_from_capturer_selection("global", user_document, capturer_document, CapturerProfileResult::NeutralCalibration).expect("merge");
+		let merged = merge_profile_from_capturer_selection(
+			"global",
+			user_document,
+			capturer_document,
+			CapturerProfileResult::NeutralCalibration,
+		)
+		.expect("merge");
 
 		assert_eq!(merged.profiles[0].note, "");
-		assert_eq!(merged.profiles[0].runtime_selection.as_ref().unwrap().modifier.as_ref().unwrap().neutral_calibration_enabled, Some(false));
+		assert_eq!(
+			merged.profiles[0]
+				.runtime_selection
+				.as_ref()
+				.unwrap()
+				.modifier
+				.as_ref()
+				.unwrap()
+				.neutral_calibration_enabled,
+			Some(false)
+		);
 		assert_eq!(merged.profiles[1].note, "current waidayo");
 	}
 
@@ -5144,7 +5523,9 @@ mod tests {
 		modifier.neutral_calibration_enabled = Some(true);
 		modifier.neutral_calibration_pose = Some("u".into());
 		modifier.face_pose_model = Some(un_motion_profile_schema::profile_settings::ProfileFacePoseModelSettings {
-			enabled: Some(true), sample_count: Some(90), ..Default::default()
+			enabled: Some(true),
+			sample_count: Some(90),
+			..Default::default()
 		});
 		for result in [CapturerProfileResult::NeutralCalibration, CapturerProfileResult::FacePoseModel] {
 			let mut expected = current.clone();
@@ -5155,7 +5536,15 @@ mod tests {
 					target.neutral_calibration_pose = Some("u".into());
 				}
 				CapturerProfileResult::FacePoseModel => {
-					target.face_pose_model = incoming.profiles[0].runtime_selection.as_ref().unwrap().modifier.as_ref().unwrap().face_pose_model.clone();
+					target.face_pose_model = incoming.profiles[0]
+						.runtime_selection
+						.as_ref()
+						.unwrap()
+						.modifier
+						.as_ref()
+						.unwrap()
+						.face_pose_model
+						.clone();
 				}
 			}
 			let merged = merge_profile_from_capturer_selection("a", current.clone(), incoming.clone(), result).unwrap();
@@ -5176,11 +5565,20 @@ mod tests {
 			let modifier = latest.profiles[0].runtime_selection.as_mut().unwrap().modifier.as_mut().unwrap();
 			match result {
 				CapturerProfileResult::NeutralCalibration => modifier.neutral_calibration_pose = Some("newer-choice".into()),
-				CapturerProfileResult::FacePoseModel => modifier.face_pose_model = Some(un_motion_profile_schema::profile_settings::ProfileFacePoseModelSettings { enabled: Some(true), sample_count: Some(37), ..Default::default() }),
+				CapturerProfileResult::FacePoseModel => {
+					modifier.face_pose_model = Some(un_motion_profile_schema::profile_settings::ProfileFacePoseModelSettings {
+						enabled: Some(true),
+						sample_count: Some(37),
+						..Default::default()
+					})
+				}
 			}
 			let expected = capturer_result_fields(&initial, "a", result).unwrap();
 			let outcome = merge_capturer_result_checked("a", latest, incoming, result, &expected);
-			assert!(outcome.is_err(), "A measurement must not replace a newer edit to the same calibration fields");
+			assert!(
+				outcome.is_err(),
+				"A measurement must not replace a newer edit to the same calibration fields"
+			);
 		}
 	}
 
@@ -5202,7 +5600,11 @@ mod tests {
 	#[test]
 	fn capturer_result_store_reopens_after_conflict_and_accepts_unrelated_edits() {
 		for result in [CapturerProfileResult::NeutralCalibration, CapturerProfileResult::FacePoseModel] {
-			let root = std::env::temp_dir().join(format!("unm-calibration-conflict-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+			let root = std::env::temp_dir().join(format!(
+				"unm-calibration-conflict-{}-{}",
+				std::process::id(),
+				SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+			));
 			let store = CoreProfileDocumentStore::from_root(&root);
 			let mut initial = CoreProfileDocument::default();
 			initial.profiles = vec![make_profile("a", "Alpha"), make_profile("b", "Beta")];
@@ -5212,10 +5614,26 @@ mod tests {
 			let initial = store.load().unwrap();
 			let expected = capturer_result_fields(&initial, "a", result).unwrap();
 			let mut measurement = initial.clone();
-			let modifier = measurement.profiles.iter_mut().find(|p| p.id == "a").unwrap().runtime_selection.as_mut().unwrap().modifier.as_mut().unwrap();
+			let modifier = measurement
+				.profiles
+				.iter_mut()
+				.find(|p| p.id == "a")
+				.unwrap()
+				.runtime_selection
+				.as_mut()
+				.unwrap()
+				.modifier
+				.as_mut()
+				.unwrap();
 			match result {
 				CapturerProfileResult::NeutralCalibration => modifier.neutral_calibration_pose = Some("u".into()),
-				CapturerProfileResult::FacePoseModel => modifier.face_pose_model = Some(un_motion_profile_schema::profile_settings::ProfileFacePoseModelSettings { enabled: Some(true), sample_count: Some(37), ..Default::default() }),
+				CapturerProfileResult::FacePoseModel => {
+					modifier.face_pose_model = Some(un_motion_profile_schema::profile_settings::ProfileFacePoseModelSettings {
+						enabled: Some(true),
+						sample_count: Some(37),
+						..Default::default()
+					})
+				}
 			}
 			assert_ne!(capturer_result_fields(&measurement, "a", result).unwrap(), expected);
 			// Another writer commits while this measurement is outstanding.
@@ -5372,10 +5790,19 @@ mod tests {
 	fn apply_profile_updates_rejects_batch_without_partial_changes() {
 		let mut profile = make_profile("alpha", "Alpha");
 		let before = serde_json::to_value(&profile).unwrap();
-		let result = apply_profile_updates(&mut profile, vec![
-			ProfileFieldUpdate { field: "name".into(), value: json!("Changed") },
-			ProfileFieldUpdate { field: "runtime_selection.unknown_knob".into(), value: json!(true) },
-		]);
+		let result = apply_profile_updates(
+			&mut profile,
+			vec![
+				ProfileFieldUpdate {
+					field: "name".into(),
+					value: json!("Changed"),
+				},
+				ProfileFieldUpdate {
+					field: "runtime_selection.unknown_knob".into(),
+					value: json!(true),
+				},
+			],
+		);
 		assert!(result.is_err());
 		assert_eq!(serde_json::to_value(&profile).unwrap(), before);
 	}
@@ -5399,10 +5826,20 @@ mod tests {
 	#[test]
 	fn apply_profile_updates_commits_all_fields_to_same_profile() {
 		let mut profile = make_profile("alpha", "Alpha");
-		apply_profile_updates(&mut profile, vec![
-			ProfileFieldUpdate { field: "name".into(), value: json!("Changed") },
-			ProfileFieldUpdate { field: "note".into(), value: json!("New note") },
-		]).unwrap();
+		apply_profile_updates(
+			&mut profile,
+			vec![
+				ProfileFieldUpdate {
+					field: "name".into(),
+					value: json!("Changed"),
+				},
+				ProfileFieldUpdate {
+					field: "note".into(),
+					value: json!("New note"),
+				},
+			],
+		)
+		.unwrap();
 		assert_eq!(profile.id, "alpha");
 		assert_eq!(profile.name, "Changed");
 		assert_eq!(profile.note, "New note");
@@ -5410,74 +5847,165 @@ mod tests {
 
 	#[test]
 	fn all_audited_profile_fields_survive_disk_reopen_and_optional_reset() {
-        let cases:serde_json::Value=serde_json::from_str(include_str!("profile_field_roundtrip_cases.json")).unwrap();
-        let cases=cases.as_array().unwrap();assert_eq!(cases.len(),91);
-        let root=std::env::temp_dir().join(format!("unm-all-fields-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        fs::create_dir(&root).unwrap();
-        let store=CoreProfileDocumentStore::from_root(&root);
-        store.save(CoreProfileDocument{selected_profile_id:"beta".into(),profiles:vec![make_profile("alpha","Alpha"),make_profile("beta","Beta")],..Default::default()}).unwrap();
-        let before=store.load().unwrap();
-        let other=serde_json::to_value(before.profiles.iter().find(|p|p.id=="beta").unwrap()).unwrap();
-        save_profile_updates(&store,"alpha",cases.iter().map(|row|ProfileFieldUpdate{field:row["field"].as_str().unwrap().into(),value:row["value"].clone()}).collect()).unwrap();
-        let reopened=CoreProfileDocumentStore::from_root(&root).load().unwrap();
-        let saved=serde_json::to_value(reopened.profiles.iter().find(|p|p.id=="alpha").unwrap()).unwrap();
-        let at=|document:&serde_json::Value,row:&serde_json::Value|{
-            let mut value=document;
-            for key in row["serialized_path"].as_array().unwrap(){value=&value[key.as_str().unwrap()];}
-            value.clone()
-        };
-        for row in cases {assert_eq!(at(&saved,row),row["value"],"disk field {}",row["field"]);}
-        // Use the same pure view converters as IPC, without ProfileDetail::from:
-        // that constructor resolves the normal user store to find its path.
-        let profile=reopened.profiles.iter().find(|p|p.id=="alpha").unwrap();
-        let mut view=saved.clone();
-        view["runtime"]=serde_json::to_value(profile.runtime_selection.as_ref().map(ProfileRuntimeView::from).unwrap_or_default()).unwrap();
-        view["pipeline"]=serde_json::to_value(profile.pipeline_components.as_ref().map(ProfilePipelineView::from).unwrap_or_default()).unwrap();
-        let mut checked=0;
-        for row in cases {
-            if let Some(path)=row["view_path"].as_array() {
-                let mut actual=&view;
-                for key in path {actual=&actual[key.as_str().unwrap()];}
-                assert_eq!(actual,&row["value"],"editor view field {}",row["field"]);
-                checked+=1;
-            }else{assert!(row["view_note"].is_string(),"unexplained missing view mapping");}
-        }
-        assert_eq!(checked,89);
-        assert_eq!(reopened.selected_profile_id,"beta");
-        assert_eq!(serde_json::to_value(reopened.profiles.iter().find(|p|p.id=="beta").unwrap()).unwrap(),other);
-        // This command intentionally discards the learned model; it is not a
-        // persisted false override. All other settings must remain untouched.
-        save_profile_updates(&store,"alpha",vec![ProfileFieldUpdate{field:"runtime_selection.modifier.face_pose_model.enabled".into(),value:json!(false)}]).unwrap();
-        let disabled=CoreProfileDocumentStore::from_root(&root).load().unwrap();
-        let disabled=serde_json::to_value(disabled.profiles.iter().find(|p|p.id=="alpha").unwrap()).unwrap();
-        let mut expected_without_model=saved.clone();
-        expected_without_model["runtimeSelection"]["modifier"].as_object_mut().unwrap().remove("facePoseModel");
-        assert_eq!(disabled,expected_without_model);
-        // Optional controls must clear explicit overrides, not replace them with
-        // a display default that becomes permanently saved.
-        save_profile_updates(&store,"alpha",cases.iter().filter(|row|row["optional"]==true).map(|row|ProfileFieldUpdate{field:row["field"].as_str().unwrap().into(),value:serde_json::Value::Null}).collect()).unwrap();
-        let reset=CoreProfileDocumentStore::from_root(&root).load().unwrap();
-        let alpha=reset.profiles.iter().find(|p|p.id=="alpha").unwrap();
-        let serialized=serde_json::to_value(alpha).unwrap();
-        for row in cases {assert_eq!(at(&serialized,row),if row["optional"]==true {serde_json::Value::Null}else{row["value"].clone()},"reset field {}",row["field"]);}
-        assert!(alpha.runtime_selection.is_none());assert!(alpha.pipeline_components.is_none());
-        assert_eq!(serde_json::to_value(reset.profiles.iter().find(|p|p.id=="beta").unwrap()).unwrap(),other);
-        assert_eq!(reset.selected_profile_id,"beta");
-        assert!(root.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
-        fs::remove_dir_all(root).unwrap();
-    }
+		let cases: serde_json::Value = serde_json::from_str(include_str!("profile_field_roundtrip_cases.json")).unwrap();
+		let cases = cases.as_array().unwrap();
+		assert_eq!(cases.len(), 91);
+		let root = std::env::temp_dir().join(format!(
+			"unm-all-fields-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
+		fs::create_dir(&root).unwrap();
+		let store = CoreProfileDocumentStore::from_root(&root);
+		store
+			.save(CoreProfileDocument {
+				selected_profile_id: "beta".into(),
+				profiles: vec![make_profile("alpha", "Alpha"), make_profile("beta", "Beta")],
+				..Default::default()
+			})
+			.unwrap();
+		let before = store.load().unwrap();
+		let other = serde_json::to_value(before.profiles.iter().find(|p| p.id == "beta").unwrap()).unwrap();
+		save_profile_updates(
+			&store,
+			"alpha",
+			cases
+				.iter()
+				.map(|row| ProfileFieldUpdate {
+					field: row["field"].as_str().unwrap().into(),
+					value: row["value"].clone(),
+				})
+				.collect(),
+		)
+		.unwrap();
+		let reopened = CoreProfileDocumentStore::from_root(&root).load().unwrap();
+		let saved = serde_json::to_value(reopened.profiles.iter().find(|p| p.id == "alpha").unwrap()).unwrap();
+		let at = |document: &serde_json::Value, row: &serde_json::Value| {
+			let mut value = document;
+			for key in row["serialized_path"].as_array().unwrap() {
+				value = &value[key.as_str().unwrap()];
+			}
+			value.clone()
+		};
+		for row in cases {
+			assert_eq!(at(&saved, row), row["value"], "disk field {}", row["field"]);
+		}
+		// Use the same pure view converters as IPC, without ProfileDetail::from:
+		// that constructor resolves the normal user store to find its path.
+		let profile = reopened.profiles.iter().find(|p| p.id == "alpha").unwrap();
+		let mut view = saved.clone();
+		view["runtime"] =
+			serde_json::to_value(profile.runtime_selection.as_ref().map(ProfileRuntimeView::from).unwrap_or_default()).unwrap();
+		view["pipeline"] = serde_json::to_value(
+			profile
+				.pipeline_components
+				.as_ref()
+				.map(ProfilePipelineView::from)
+				.unwrap_or_default(),
+		)
+		.unwrap();
+		let mut checked = 0;
+		for row in cases {
+			if let Some(path) = row["view_path"].as_array() {
+				let mut actual = &view;
+				for key in path {
+					actual = &actual[key.as_str().unwrap()];
+				}
+				assert_eq!(actual, &row["value"], "editor view field {}", row["field"]);
+				checked += 1;
+			} else {
+				assert!(row["view_note"].is_string(), "unexplained missing view mapping");
+			}
+		}
+		assert_eq!(checked, 89);
+		assert_eq!(reopened.selected_profile_id, "beta");
+		assert_eq!(
+			serde_json::to_value(reopened.profiles.iter().find(|p| p.id == "beta").unwrap()).unwrap(),
+			other
+		);
+		// This command intentionally discards the learned model; it is not a
+		// persisted false override. All other settings must remain untouched.
+		save_profile_updates(
+			&store,
+			"alpha",
+			vec![ProfileFieldUpdate {
+				field: "runtime_selection.modifier.face_pose_model.enabled".into(),
+				value: json!(false),
+			}],
+		)
+		.unwrap();
+		let disabled = CoreProfileDocumentStore::from_root(&root).load().unwrap();
+		let disabled = serde_json::to_value(disabled.profiles.iter().find(|p| p.id == "alpha").unwrap()).unwrap();
+		let mut expected_without_model = saved.clone();
+		expected_without_model["runtimeSelection"]["modifier"]
+			.as_object_mut()
+			.unwrap()
+			.remove("facePoseModel");
+		assert_eq!(disabled, expected_without_model);
+		// Optional controls must clear explicit overrides, not replace them with
+		// a display default that becomes permanently saved.
+		save_profile_updates(
+			&store,
+			"alpha",
+			cases
+				.iter()
+				.filter(|row| row["optional"] == true)
+				.map(|row| ProfileFieldUpdate {
+					field: row["field"].as_str().unwrap().into(),
+					value: serde_json::Value::Null,
+				})
+				.collect(),
+		)
+		.unwrap();
+		let reset = CoreProfileDocumentStore::from_root(&root).load().unwrap();
+		let alpha = reset.profiles.iter().find(|p| p.id == "alpha").unwrap();
+		let serialized = serde_json::to_value(alpha).unwrap();
+		for row in cases {
+			assert_eq!(
+				at(&serialized, row),
+				if row["optional"] == true {
+					serde_json::Value::Null
+				} else {
+					row["value"].clone()
+				},
+				"reset field {}",
+				row["field"]
+			);
+		}
+		assert!(alpha.runtime_selection.is_none());
+		assert!(alpha.pipeline_components.is_none());
+		assert_eq!(
+			serde_json::to_value(reset.profiles.iter().find(|p| p.id == "beta").unwrap()).unwrap(),
+			other
+		);
+		assert_eq!(reset.selected_profile_id, "beta");
+		assert!(
+			root.canonicalize()
+				.unwrap()
+				.starts_with(std::env::temp_dir().canonicalize().unwrap())
+		);
+		fs::remove_dir_all(root).unwrap();
+	}
 
 	#[test]
 	fn save_profile_updates_real_store_preserves_rejected_batch_and_other_profile() {
-		let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+		let nonce = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_nanos();
 		let root = std::env::temp_dir().join(format!("unm-batch-save-{}-{nonce}", std::process::id()));
 		fs::create_dir(&root).unwrap();
 		let store = CoreProfileDocumentStore::from_root(&root);
-		store.save(CoreProfileDocument {
-			selected_profile_id: "beta".into(),
-			profiles: vec![make_profile("alpha", "Alpha"), make_profile("beta", "Beta")],
-			..Default::default()
-		}).unwrap();
+		store
+			.save(CoreProfileDocument {
+				selected_profile_id: "beta".into(),
+				profiles: vec![make_profile("alpha", "Alpha"), make_profile("beta", "Beta")],
+				..Default::default()
+			})
+			.unwrap();
 		let snapshot = || {
 			let mut files = std::collections::BTreeMap::new();
 			files.insert(store.conf_path().to_path_buf(), fs::read(store.conf_path()).unwrap());
@@ -5491,18 +6019,52 @@ mod tests {
 		};
 		let before = snapshot();
 		let original = store.load().unwrap();
-		assert!(save_profile_updates(&store, "alpha", vec![
-			ProfileFieldUpdate { field: "note".into(), value: json!("must not persist") },
-			ProfileFieldUpdate { field: "runtime_selection.unknown_knob".into(), value: json!(true) },
-		]).is_err());
+		assert!(
+			save_profile_updates(
+				&store,
+				"alpha",
+				vec![
+					ProfileFieldUpdate {
+						field: "note".into(),
+						value: json!("must not persist")
+					},
+					ProfileFieldUpdate {
+						field: "runtime_selection.unknown_knob".into(),
+						value: json!(true)
+					},
+				]
+			)
+			.is_err()
+		);
 		assert_eq!(snapshot(), before, "Rejected batch must not change any stored file");
-		assert!(save_profile_updates(&store, "missing", vec![ProfileFieldUpdate { field: "note".into(), value: json!("wrong target") }]).is_err());
+		assert!(
+			save_profile_updates(
+				&store,
+				"missing",
+				vec![ProfileFieldUpdate {
+					field: "note".into(),
+					value: json!("wrong target")
+				}]
+			)
+			.is_err()
+		);
 		assert!(save_profile_updates(&store, "alpha", vec![]).is_err());
 		assert_eq!(snapshot(), before);
-		save_profile_updates(&store, "alpha", vec![
-			ProfileFieldUpdate { field: "note".into(), value: json!("saved together") },
-			ProfileFieldUpdate { field: "group".into(), value: json!("Streaming") },
-		]).unwrap();
+		save_profile_updates(
+			&store,
+			"alpha",
+			vec![
+				ProfileFieldUpdate {
+					field: "note".into(),
+					value: json!("saved together"),
+				},
+				ProfileFieldUpdate {
+					field: "group".into(),
+					value: json!("Streaming"),
+				},
+			],
+		)
+		.unwrap();
 		let reloaded = CoreProfileDocumentStore::from_root(&root).load().unwrap();
 		let alpha = reloaded.profiles.iter().find(|profile| profile.id == "alpha").unwrap();
 		assert_eq!(alpha.note, "saved together");
@@ -5514,21 +6076,45 @@ mod tests {
 		);
 		let stale_revision = profile_revision(original.profiles.iter().find(|profile| profile.id == "alpha").unwrap());
 		let before_conflict = snapshot();
-		let rejected = save_profile_updates_checked(&store, "alpha", vec![
-			ProfileFieldUpdate { field: "note".into(), value: json!("stale overwrite") },
-		], Some(&stale_revision)).unwrap_err();
+		let rejected = save_profile_updates_checked(
+			&store,
+			"alpha",
+			vec![ProfileFieldUpdate {
+				field: "note".into(),
+				value: json!("stale overwrite"),
+			}],
+			Some(&stale_revision),
+		)
+		.unwrap_err();
 		assert!(rejected.contains("profile_conflict"));
 		assert_eq!(snapshot(), before_conflict, "Conflict must not publish any file");
 		let beta_revision = profile_revision(original.profiles.iter().find(|profile| profile.id == "beta").unwrap());
-		save_profile_updates_checked(&store, "beta", vec![
-			ProfileFieldUpdate { field: "note".into(), value: json!("independent profile edit") },
-		], Some(&beta_revision)).expect("Another profile's edit must not invalidate beta's revision");
+		save_profile_updates_checked(
+			&store,
+			"beta",
+			vec![ProfileFieldUpdate {
+				field: "note".into(),
+				value: json!("independent profile edit"),
+			}],
+			Some(&beta_revision),
+		)
+		.expect("Another profile's edit must not invalidate beta's revision");
 		let latest = store.load().unwrap();
 		let alpha_revision = profile_revision(latest.profiles.iter().find(|profile| profile.id == "alpha").unwrap());
-		let saved = save_profile_updates_checked(&store, "alpha", vec![
-			ProfileFieldUpdate { field: "note".into(), value: json!("reviewed latest") },
-		], Some(&alpha_revision)).expect("Reviewed revision can be updated");
-		assert_eq!(saved.profiles.iter().find(|profile| profile.id == "alpha").unwrap().note, "reviewed latest");
+		let saved = save_profile_updates_checked(
+			&store,
+			"alpha",
+			vec![ProfileFieldUpdate {
+				field: "note".into(),
+				value: json!("reviewed latest"),
+			}],
+			Some(&alpha_revision),
+		)
+		.expect("Reviewed revision can be updated");
+		assert_eq!(
+			saved.profiles.iter().find(|profile| profile.id == "alpha").unwrap().note,
+			"reviewed latest"
+		);
 		// Only the unique directory created by this test is removed.
 		fs::remove_dir_all(&root).unwrap();
 	}
@@ -5542,25 +6128,42 @@ mod tests {
 
 	#[test]
 	fn receiver_profiles_persist_independently_and_reject_stale_source_edits() {
-		let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+		let nonce = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_nanos();
 		let root = std::env::temp_dir().join(format!("unm-receiver-roundtrip-{}-{nonce}", std::process::id()));
 		fs::create_dir(&root).unwrap();
 		let store = CoreProfileDocumentStore::from_root(&root);
-		store.save(CoreProfileDocument {
-			selected_profile_id: "phone".into(),
-			profiles: vec![make_profile("vmc", "VMC"), make_profile("phone", "iFacialMocap")],
-			..Default::default()
-		}).unwrap();
+		store
+			.save(CoreProfileDocument {
+				selected_profile_id: "phone".into(),
+				profiles: vec![make_profile("vmc", "VMC"), make_profile("phone", "iFacialMocap")],
+				..Default::default()
+			})
+			.unwrap();
 		for (id, engine, field, address) in [
 			("vmc", "vmc", "vmc_receive_listen_addr", "127.0.0.1:39549"),
 			("phone", "ifacialmocap", "ifacialmocap_receive_listen_addr", "127.0.0.1:49984"),
 		] {
 			let current = store.load().unwrap();
 			let revision = profile_revision(current.profiles.iter().find(|p| p.id == id).unwrap());
-			save_profile_updates_checked(&store, id, vec![
-				ProfileFieldUpdate { field: "runtime_selection.engine".into(), value: json!(engine) },
-				ProfileFieldUpdate { field: format!("runtime_selection.{field}"), value: json!(address) },
-			], Some(&revision)).unwrap();
+			save_profile_updates_checked(
+				&store,
+				id,
+				vec![
+					ProfileFieldUpdate {
+						field: "runtime_selection.engine".into(),
+						value: json!(engine),
+					},
+					ProfileFieldUpdate {
+						field: format!("runtime_selection.{field}"),
+						value: json!(address),
+					},
+				],
+				Some(&revision),
+			)
+			.unwrap();
 		}
 		let reopened = CoreProfileDocumentStore::from_root(&root);
 		let before = reopened.load().unwrap();
@@ -5568,19 +6171,53 @@ mod tests {
 		let vmc = before.profiles.iter().find(|p| p.id == "vmc").unwrap();
 		let phone = before.profiles.iter().find(|p| p.id == "phone").unwrap();
 		assert_eq!(vmc.runtime_selection.as_ref().unwrap().engine.as_deref(), Some("vmc"));
-		assert_eq!(vmc.runtime_selection.as_ref().unwrap().vmc_receive_listen_addr.as_deref(), Some("127.0.0.1:39549"));
+		assert_eq!(
+			vmc.runtime_selection.as_ref().unwrap().vmc_receive_listen_addr.as_deref(),
+			Some("127.0.0.1:39549")
+		);
 		assert_eq!(phone.runtime_selection.as_ref().unwrap().engine.as_deref(), Some("ifacialmocap"));
-		assert_eq!(phone.runtime_selection.as_ref().unwrap().ifacialmocap_receive_listen_addr.as_deref(), Some("127.0.0.1:49984"));
+		assert_eq!(
+			phone
+				.runtime_selection
+				.as_ref()
+				.unwrap()
+				.ifacialmocap_receive_listen_addr
+				.as_deref(),
+			Some("127.0.0.1:49984")
+		);
 		let stale = profile_revision(vmc);
-		save_profile_updates_checked(&reopened, "vmc", vec![ProfileFieldUpdate {
-			field: "runtime_selection.vmc_receive_listen_addr".into(), value: json!("127.0.0.1:39550")
-		}], Some(&stale)).unwrap();
+		save_profile_updates_checked(
+			&reopened,
+			"vmc",
+			vec![ProfileFieldUpdate {
+				field: "runtime_selection.vmc_receive_listen_addr".into(),
+				value: json!("127.0.0.1:39550"),
+			}],
+			Some(&stale),
+		)
+		.unwrap();
 		let latest = reopened.load().unwrap();
-		assert!(save_profile_updates_checked(&reopened, "vmc", vec![ProfileFieldUpdate {
-			field: "runtime_selection.engine".into(), value: json!("ifacialmocap")
-		}], Some(&stale)).unwrap_err().contains("profile_conflict"));
-		assert_eq!(serde_json::to_value(reopened.load().unwrap()).unwrap(), serde_json::to_value(&latest).unwrap());
-		assert_eq!(serde_json::to_value(latest.profiles.iter().find(|p| p.id == "phone").unwrap()).unwrap(), serde_json::to_value(phone).unwrap());
+		assert!(
+			save_profile_updates_checked(
+				&reopened,
+				"vmc",
+				vec![ProfileFieldUpdate {
+					field: "runtime_selection.engine".into(),
+					value: json!("ifacialmocap")
+				}],
+				Some(&stale)
+			)
+			.unwrap_err()
+			.contains("profile_conflict")
+		);
+		assert_eq!(
+			serde_json::to_value(reopened.load().unwrap()).unwrap(),
+			serde_json::to_value(&latest).unwrap()
+		);
+		assert_eq!(
+			serde_json::to_value(latest.profiles.iter().find(|p| p.id == "phone").unwrap()).unwrap(),
+			serde_json::to_value(phone).unwrap()
+		);
 		assert_eq!(latest.selected_profile_id, "phone");
 		fs::remove_dir_all(&root).unwrap();
 	}
@@ -5594,7 +6231,11 @@ mod app_settings_commit_tests {
 		let root = std::env::temp_dir().join(format!("unm-invalid-settings-{}-{nonce}", std::process::id()));
 		std::fs::create_dir(&root).unwrap();
 		struct Cleanup(PathBuf);
-		impl Drop for Cleanup { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+		impl Drop for Cleanup {
+			fn drop(&mut self) {
+				let _ = fs::remove_dir_all(&self.0);
+			}
+		}
 		let _cleanup = Cleanup(root.clone());
 		let path = root.join("settings.toml");
 		let mut current = super::AppRuntimeSettings::default();
@@ -5618,7 +6259,11 @@ mod app_settings_commit_tests {
 		let root = std::env::temp_dir().join(format!("unm-startup-settings-{}-{nonce}", std::process::id()));
 		std::fs::create_dir(&root).unwrap();
 		struct Cleanup(PathBuf);
-		impl Drop for Cleanup { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+		impl Drop for Cleanup {
+			fn drop(&mut self) {
+				let _ = fs::remove_dir_all(&self.0);
+			}
+		}
 		let _cleanup = Cleanup(root.clone());
 		let path = root.join("settings.toml");
 		assert!(ensure_app_settings_loaded(&load_app_settings_at(&path)).is_ok());
@@ -5635,99 +6280,141 @@ mod app_settings_commit_tests {
 		assert_eq!(fresh.locale, "en-US");
 		assert!(serde_json::to_value(fresh).unwrap().get("startupReadError").is_none());
 	}
-    use super::*;
-    use std::cell::RefCell;
+	use super::*;
+	use std::cell::RefCell;
 
-    #[cfg(windows)]
-    #[test]
-    fn actual_locked_settings_preserve_policy_then_retry_and_reopen() {
-        use std::os::windows::fs::OpenOptionsExt;
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let root = std::env::temp_dir().join(format!("unm-settings-commit-{}-{nonce}", std::process::id()));
-        struct Cleanup(PathBuf);
-        impl Drop for Cleanup { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
-        let _cleanup = Cleanup(root.clone());
-        let path = root.join("target/settings.toml");
-        let other = root.join("other/settings.toml");
-        let mut current = AppRuntimeSettings::default();
-        current.stop_capturers_on_exit = true;
-        current.locale = "ja-JP".into();
-        write_app_settings_at(&path, &current).unwrap();
-        write_app_settings_at(&other, &current).unwrap();
-        let original = fs::read(&path).unwrap();
-        let before = serde_json::to_value(&current).unwrap();
-        let mut next = current.clone();
-        next.stop_capturers_on_exit = false;
-        next.locale = "en-US".into();
-        let locked = fs::OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
-        let rolled_back = std::cell::Cell::new(false);
-        assert!(save_app_settings_with_effects(&mut current, next.clone(),
-            |value| write_app_settings_at(&path, value),
-            |_, _| Ok(true),
-            |created| rolled_back.set(created),
-            |_, _| panic!("must not apply failed disk write")).is_err());
-        assert!(rolled_back.get());
-        assert_eq!(serde_json::to_value(&current).unwrap(), before);
-        assert_eq!(fs::read(&path).unwrap(), original);
-        drop(locked);
-        persist_app_settings(&mut current, next, |value| write_app_settings_at(&path, value)).unwrap();
-        let reopened: AppRuntimeSettings = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(!reopened.stop_capturers_on_exit);
-        assert_eq!(reopened.locale, "en-US");
-        assert_eq!(serde_json::to_value(&reopened).unwrap(), serde_json::to_value(&current).unwrap());
-        assert_eq!(fs::read(&other).unwrap(), original);
-    }
+	#[cfg(windows)]
+	#[test]
+	fn actual_locked_settings_preserve_policy_then_retry_and_reopen() {
+		use std::os::windows::fs::OpenOptionsExt;
+		let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+		let root = std::env::temp_dir().join(format!("unm-settings-commit-{}-{nonce}", std::process::id()));
+		struct Cleanup(PathBuf);
+		impl Drop for Cleanup {
+			fn drop(&mut self) {
+				let _ = fs::remove_dir_all(&self.0);
+			}
+		}
+		let _cleanup = Cleanup(root.clone());
+		let path = root.join("target/settings.toml");
+		let other = root.join("other/settings.toml");
+		let mut current = AppRuntimeSettings::default();
+		current.stop_capturers_on_exit = true;
+		current.locale = "ja-JP".into();
+		write_app_settings_at(&path, &current).unwrap();
+		write_app_settings_at(&other, &current).unwrap();
+		let original = fs::read(&path).unwrap();
+		let before = serde_json::to_value(&current).unwrap();
+		let mut next = current.clone();
+		next.stop_capturers_on_exit = false;
+		next.locale = "en-US".into();
+		let locked = fs::OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
+		let rolled_back = std::cell::Cell::new(false);
+		assert!(
+			save_app_settings_with_effects(
+				&mut current,
+				next.clone(),
+				|value| write_app_settings_at(&path, value),
+				|_, _| Ok(true),
+				|created| rolled_back.set(created),
+				|_, _| panic!("must not apply failed disk write")
+			)
+			.is_err()
+		);
+		assert!(rolled_back.get());
+		assert_eq!(serde_json::to_value(&current).unwrap(), before);
+		assert_eq!(fs::read(&path).unwrap(), original);
+		drop(locked);
+		persist_app_settings(&mut current, next, |value| write_app_settings_at(&path, value)).unwrap();
+		let reopened: AppRuntimeSettings = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+		assert!(!reopened.stop_capturers_on_exit);
+		assert_eq!(reopened.locale, "en-US");
+		assert_eq!(serde_json::to_value(&reopened).unwrap(), serde_json::to_value(&current).unwrap());
+		assert_eq!(fs::read(&other).unwrap(), original);
+	}
 
-    #[test]
-    fn failed_policy_save_keeps_current_shutdown_behavior() {
-        let mut current = AppRuntimeSettings::default();
-        current.stop_capturers_on_exit = true;
-        let mut next = current.clone();
-        next.stop_capturers_on_exit = false;
-        assert!(persist_app_settings(&mut current, next.clone(), |_| Err("disk refused".into())).is_err());
-        assert!(current.stop_capturers_on_exit);
-        let saved = persist_app_settings(&mut current, next, |_| Ok(())).unwrap();
-        assert!(!saved.stop_capturers_on_exit);
-        assert!(!current.stop_capturers_on_exit);
-    }
+	#[test]
+	fn failed_policy_save_keeps_current_shutdown_behavior() {
+		let mut current = AppRuntimeSettings::default();
+		current.stop_capturers_on_exit = true;
+		let mut next = current.clone();
+		next.stop_capturers_on_exit = false;
+		assert!(persist_app_settings(&mut current, next.clone(), |_| Err("disk refused".into())).is_err());
+		assert!(current.stop_capturers_on_exit);
+		let saved = persist_app_settings(&mut current, next, |_| Ok(())).unwrap();
+		assert!(!saved.stop_capturers_on_exit);
+		assert!(!current.stop_capturers_on_exit);
+	}
 
-    #[test]
-    fn failed_save_rolls_back_prepared_tray_without_applying_locale_or_policy() {
-        let mut current = AppRuntimeSettings::default();
-        current.locale = "ja-JP".into();
-        current.system_tray_enabled = false;
-        let mut next = current.clone();
-        next.locale = "en-US".into();
-        next.system_tray_enabled = true;
-        let events = RefCell::new(Vec::new());
-        let result = save_app_settings_with_effects(&mut current, next.clone(),
-            |_| { events.borrow_mut().push("write-failed"); Err("disk refused".into()) },
-            |_, _| { events.borrow_mut().push("prepare"); Ok(true) },
-            |created| { assert!(created); events.borrow_mut().push("rollback"); },
-            |_, _| panic!("failed settings must not apply"));
-        assert!(result.is_err());
-        assert_eq!(current.locale, "ja-JP");
-        assert!(!current.system_tray_enabled);
-        assert_eq!(*events.borrow(), ["prepare", "write-failed", "rollback"]);
-        events.borrow_mut().clear();
-        save_app_settings_with_effects(&mut current, next,
-            |_| { events.borrow_mut().push("write"); Ok(()) },
-            |_, _| { events.borrow_mut().push("prepare"); Ok(true) },
-            |_| panic!("successful write must not roll back"),
-            |old, next| { assert_eq!(old.locale,"ja-JP"); assert_eq!(next.locale,"en-US"); events.borrow_mut().push("apply"); }).unwrap();
-        assert_eq!(*events.borrow(), ["prepare", "write", "apply"]);
-        assert!(current.system_tray_enabled);
-        assert_eq!(current.locale, "en-US");
-    }
+	#[test]
+	fn failed_save_rolls_back_prepared_tray_without_applying_locale_or_policy() {
+		let mut current = AppRuntimeSettings::default();
+		current.locale = "ja-JP".into();
+		current.system_tray_enabled = false;
+		let mut next = current.clone();
+		next.locale = "en-US".into();
+		next.system_tray_enabled = true;
+		let events = RefCell::new(Vec::new());
+		let result = save_app_settings_with_effects(
+			&mut current,
+			next.clone(),
+			|_| {
+				events.borrow_mut().push("write-failed");
+				Err("disk refused".into())
+			},
+			|_, _| {
+				events.borrow_mut().push("prepare");
+				Ok(true)
+			},
+			|created| {
+				assert!(created);
+				events.borrow_mut().push("rollback");
+			},
+			|_, _| panic!("failed settings must not apply"),
+		);
+		assert!(result.is_err());
+		assert_eq!(current.locale, "ja-JP");
+		assert!(!current.system_tray_enabled);
+		assert_eq!(*events.borrow(), ["prepare", "write-failed", "rollback"]);
+		events.borrow_mut().clear();
+		save_app_settings_with_effects(
+			&mut current,
+			next,
+			|_| {
+				events.borrow_mut().push("write");
+				Ok(())
+			},
+			|_, _| {
+				events.borrow_mut().push("prepare");
+				Ok(true)
+			},
+			|_| panic!("successful write must not roll back"),
+			|old, next| {
+				assert_eq!(old.locale, "ja-JP");
+				assert_eq!(next.locale, "en-US");
+				events.borrow_mut().push("apply");
+			},
+		)
+		.unwrap();
+		assert_eq!(*events.borrow(), ["prepare", "write", "apply"]);
+		assert!(current.system_tray_enabled);
+		assert_eq!(current.locale, "en-US");
+	}
 
-    #[test]
-    fn tray_prepare_failure_does_not_write_or_apply_settings() {
-        let mut current = AppRuntimeSettings::default();
-        let next = current.clone();
-        assert!(save_app_settings_with_effects(&mut current, next,
-            |_| panic!("no write after failed preparation"),
-            |_, _| Err("tray unavailable".into()),
-            |_| panic!("no prepared tray"),
-            |_, _| panic!("no apply")).is_err());
-    }
+	#[test]
+	fn tray_prepare_failure_does_not_write_or_apply_settings() {
+		let mut current = AppRuntimeSettings::default();
+		let next = current.clone();
+		assert!(
+			save_app_settings_with_effects(
+				&mut current,
+				next,
+				|_| panic!("no write after failed preparation"),
+				|_, _| Err("tray unavailable".into()),
+				|_| panic!("no prepared tray"),
+				|_, _| panic!("no apply")
+			)
+			.is_err()
+		);
+	}
 }

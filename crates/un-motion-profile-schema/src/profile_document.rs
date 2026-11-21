@@ -359,7 +359,9 @@ impl CoreProfileDocumentStore {
 		let mut document = self.load_unlocked()?;
 		let previous = document.clone();
 		edit(&mut document)?;
-		if document == previous { return Ok(document); }
+		if document == previous {
+			return Ok(document);
+		}
 		self.save_unlocked(document)
 	}
 
@@ -373,9 +375,14 @@ impl CoreProfileDocumentStore {
 		if !selected.is_empty() && !document.profiles.iter().any(|profile| profile.id == selected) {
 			bail!("profile not found: {selected}");
 		}
-		if document.selected_profile_id == selected { return Ok(()); }
-		let raw = format_profile_metadata(&self.conf_path, selected,
-			&document.profiles.iter().map(|profile| profile.id.clone()).collect::<Vec<_>>())?;
+		if document.selected_profile_id == selected {
+			return Ok(());
+		}
+		let raw = format_profile_metadata(
+			&self.conf_path,
+			selected,
+			&document.profiles.iter().map(|profile| profile.id.clone()).collect::<Vec<_>>(),
+		)?;
 		atomic_write(&self.conf_path, raw.as_bytes())
 	}
 
@@ -883,16 +890,26 @@ fn sanitize_profile_file_label(name: &str) -> String {
 	let reserved = matches!(
 		upper.as_str(),
 		"CON"
-			| "PRN" | "AUX"
-			| "NUL" | "COM1"
-			| "COM2" | "COM3"
-			| "COM4" | "COM5"
-			| "COM6" | "COM7"
-			| "COM8" | "COM9"
-			| "LPT1" | "LPT2"
-			| "LPT3" | "LPT4"
-			| "LPT5" | "LPT6"
-			| "LPT7" | "LPT8"
+			| "PRN"
+			| "AUX"
+			| "NUL"
+			| "COM1"
+			| "COM2"
+			| "COM3"
+			| "COM4"
+			| "COM5"
+			| "COM6"
+			| "COM7"
+			| "COM8"
+			| "COM9"
+			| "LPT1"
+			| "LPT2"
+			| "LPT3"
+			| "LPT4"
+			| "LPT5"
+			| "LPT6"
+			| "LPT7"
+			| "LPT8"
 			| "LPT9"
 	);
 	if reserved { format!("{label}-profile") } else { label }
@@ -1054,11 +1071,13 @@ mod tests {
 			std::thread::sleep(std::time::Duration::from_millis(1100));
 			let reopened = CoreProfileDocumentStore::from_root(root.path());
 			assert_eq!(reopened.load().unwrap(), original, "reading must not invent a new creation time");
-			reopened.update(|document| {
-				assert_eq!(document.profiles[0], original.profiles[0], "optimistic save sees the same profile");
-				document.profiles[0].note = "first edit".into();
-				Ok(())
-			}).unwrap();
+			reopened
+				.update(|document| {
+					assert_eq!(document.profiles[0], original.profiles[0], "optimistic save sees the same profile");
+					document.profiles[0].note = "first edit".into();
+					Ok(())
+				})
+				.unwrap();
 			assert_eq!(reopened.load().unwrap().profiles[0].note, "first edit");
 		}
 	}
@@ -1074,22 +1093,33 @@ mod tests {
 		initial.selected_profile_id = "a".into();
 		store.save(initial).unwrap();
 		let original = store.load().unwrap();
-		let profile_bytes: Vec<_> = fs::read_dir(store.profiles_dir()).unwrap().map(|entry| {
-			let path = entry.unwrap().path(); let bytes = fs::read(&path).unwrap(); (path, bytes)
-		}).collect();
+		let profile_bytes: Vec<_> = fs::read_dir(store.profiles_dir())
+			.unwrap()
+			.map(|entry| {
+				let path = entry.unwrap().path();
+				let bytes = fs::read(&path).unwrap();
+				(path, bytes)
+			})
+			.collect();
 		let before = fs::read(store.conf_path()).unwrap();
 		let held = OpenOptions::new().read(true).share_mode(1).open(store.conf_path()).unwrap();
 		assert!(store.set_selected_profile_id("b").is_err());
 		assert_eq!(fs::read(store.conf_path()).unwrap(), before);
 		drop(held);
 		let reopened = CoreProfileDocumentStore::from_root(root.path());
-		assert_eq!(reopened.load().unwrap(), original, "A failed selection save must not silently commit during recovery");
+		assert_eq!(
+			reopened.load().unwrap(),
+			original,
+			"A failed selection save must not silently commit during recovery"
+		);
 		reopened.set_selected_profile_id("b").unwrap();
 		let saved = CoreProfileDocumentStore::from_root(root.path()).load().unwrap();
 		assert_eq!(saved.selected_profile_id, "b");
 		assert_eq!(saved.profiles, original.profiles);
 		assert_eq!(saved.profile_sources, original.profile_sources);
-		for (path, bytes) in profile_bytes { assert_eq!(fs::read(path).unwrap(), bytes); }
+		for (path, bytes) in profile_bytes {
+			assert_eq!(fs::read(path).unwrap(), bytes);
+		}
 		let committed = fs::read(store.conf_path()).unwrap();
 		assert!(reopened.set_selected_profile_id("missing").is_err());
 		assert_eq!(fs::read(store.conf_path()).unwrap(), committed);
@@ -1102,10 +1132,12 @@ mod tests {
 		let worker = std::env::var("UNM_TEST_PROFILE_STORE_WORKER").expect("worker id");
 		let store = CoreProfileDocumentStore::from_root(PathBuf::from(root));
 		for index in 0..12 {
-			store.update(|doc| {
-				doc.profiles[0].note.push_str(&format!("{worker}:{index};"));
-				Ok(())
-			}).expect("atomic process edit");
+			store
+				.update(|doc| {
+					doc.profiles[0].note.push_str(&format!("{worker}:{index};"));
+					Ok(())
+				})
+				.expect("atomic process edit");
 		}
 	}
 
@@ -1117,14 +1149,18 @@ mod tests {
 		initial.profiles[0].note.clear();
 		store.save(initial.clone()).expect("seed store");
 		let executable = std::env::current_exe().expect("test executable");
-		let mut children: Vec<_> = ["a", "b"].into_iter().map(|worker| {
-			std::process::Command::new(&executable)
-				.args(["--exact", "profile_document::tests::profile_store_process_worker", "--ignored"])
-				.env("UNM_TEST_PROFILE_STORE_ROOT", root.path())
-				.env("UNM_TEST_PROFILE_STORE_WORKER", worker)
-				.stdout(std::process::Stdio::null())
-				.spawn().expect("spawn isolated writer")
-		}).collect();
+		let mut children: Vec<_> = ["a", "b"]
+			.into_iter()
+			.map(|worker| {
+				std::process::Command::new(&executable)
+					.args(["--exact", "profile_document::tests::profile_store_process_worker", "--ignored"])
+					.env("UNM_TEST_PROFILE_STORE_ROOT", root.path())
+					.env("UNM_TEST_PROFILE_STORE_WORKER", worker)
+					.stdout(std::process::Stdio::null())
+					.spawn()
+					.expect("spawn isolated writer")
+			})
+			.collect();
 		let statuses: Vec<_> = children.iter_mut().map(|child| child.wait().expect("wait writer")).collect();
 		assert!(statuses.iter().all(|status| status.success()), "writer failed: {statuses:?}");
 		let saved = store.load().expect("reload after both processes exit");
@@ -1146,19 +1182,29 @@ mod tests {
 		let store = CoreProfileDocumentStore::from_root(root.path());
 		store.save(CoreProfileDocument::default()).unwrap();
 		let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-		let workers: Vec<_> = [true, false].into_iter().map(|name| {
-			let store = store.clone();
-			let barrier = barrier.clone();
-			std::thread::spawn(move || {
-				barrier.wait();
-				store.update(|doc| {
-					if name { doc.profiles[0].name = "Renamed".into(); }
-					else { doc.profiles[0].note = "Other editor note".into(); }
-					Ok(())
-				}).unwrap();
+		let workers: Vec<_> = [true, false]
+			.into_iter()
+			.map(|name| {
+				let store = store.clone();
+				let barrier = barrier.clone();
+				std::thread::spawn(move || {
+					barrier.wait();
+					store
+						.update(|doc| {
+							if name {
+								doc.profiles[0].name = "Renamed".into();
+							} else {
+								doc.profiles[0].note = "Other editor note".into();
+							}
+							Ok(())
+						})
+						.unwrap();
+				})
 			})
-		}).collect();
-		for worker in workers { worker.join().unwrap(); }
+			.collect();
+		for worker in workers {
+			worker.join().unwrap();
+		}
 		let saved = store.load().unwrap();
 		assert_eq!(saved.profiles[0].name, "Renamed");
 		assert_eq!(saved.profiles[0].note, "Other editor note");
@@ -1170,10 +1216,14 @@ mod tests {
 		let store = CoreProfileDocumentStore::from_root(root.path());
 		store.save(CoreProfileDocument::default()).unwrap();
 		let before = store.load().unwrap();
-		assert!(store.update(|doc| {
-			doc.profiles[0].name = "Must not persist".into();
-			bail!("invalid later field")
-		}).is_err());
+		assert!(
+			store
+				.update(|doc| {
+					doc.profiles[0].name = "Must not persist".into();
+					bail!("invalid later field")
+				})
+				.is_err()
+		);
 		assert_eq!(store.load().unwrap(), before);
 		assert!(!root.path().join(PROFILE_TRANSACTION_MARKER).exists());
 	}
@@ -1372,14 +1422,28 @@ mirrorCorrectionEnabled = true
 			fs::write(root.join("conf.toml"), old_conf).unwrap();
 			fs::write(root.join("profiles/old.toml"), "id=\"old\"\nname=\"Old\"\ncreated_at=\"1\"\n").unwrap();
 			fs::create_dir(root.join(NEXT_PROFILES_DIR)).unwrap();
-			fs::write(root.join(NEXT_PROFILES_DIR).join("new.toml"), "id=\"new\"\nname=\"New\"\ncreated_at=\"2\"\n").unwrap();
+			fs::write(
+				root.join(NEXT_PROFILES_DIR).join("new.toml"),
+				"id=\"new\"\nname=\"New\"\ncreated_at=\"2\"\n",
+			)
+			.unwrap();
 			fs::write(root.join(NEXT_CONF_FILE), new_conf).unwrap();
 			fs::write(root.join(PROFILE_TRANSACTION_MARKER), "prepared\n").unwrap();
-			if stage >= 1 { fs::rename(root.join("profiles"), root.join(PREVIOUS_PROFILES_DIR)).unwrap(); }
-			if stage >= 2 { fs::rename(root.join(NEXT_PROFILES_DIR), root.join("profiles")).unwrap(); }
-			if stage >= 3 { fs::write(root.join("conf.toml"), new_conf).unwrap(); }
-			if stage >= 4 { fs::remove_dir_all(root.join(PREVIOUS_PROFILES_DIR)).unwrap(); }
-			if stage >= 5 { fs::remove_file(root.join(NEXT_CONF_FILE)).unwrap(); }
+			if stage >= 1 {
+				fs::rename(root.join("profiles"), root.join(PREVIOUS_PROFILES_DIR)).unwrap();
+			}
+			if stage >= 2 {
+				fs::rename(root.join(NEXT_PROFILES_DIR), root.join("profiles")).unwrap();
+			}
+			if stage >= 3 {
+				fs::write(root.join("conf.toml"), new_conf).unwrap();
+			}
+			if stage >= 4 {
+				fs::remove_dir_all(root.join(PREVIOUS_PROFILES_DIR)).unwrap();
+			}
+			if stage >= 5 {
+				fs::remove_file(root.join(NEXT_CONF_FILE)).unwrap();
+			}
 			let expected = if stage == 0 { "old" } else { "new" };
 			let store = CoreProfileDocumentStore::from_root(&root);
 			for _ in 0..2 {
@@ -1387,7 +1451,10 @@ mirrorCorrectionEnabled = true
 				assert_eq!(loaded.selected_profile_id, expected, "stage {stage}");
 				assert_eq!(loaded.profiles.len(), 1, "stage {stage}");
 				assert_eq!(loaded.profiles[0].id, expected, "stage {stage}");
-				assert_eq!(fs::read_to_string(root.join("conf.toml")).unwrap(), if stage == 0 { old_conf } else { new_conf });
+				assert_eq!(
+					fs::read_to_string(root.join("conf.toml")).unwrap(),
+					if stage == 0 { old_conf } else { new_conf }
+				);
 			}
 			for name in [NEXT_PROFILES_DIR, PREVIOUS_PROFILES_DIR, NEXT_CONF_FILE, PROFILE_TRANSACTION_MARKER] {
 				assert!(!root.join(name).exists(), "stage {stage}: leftover {name}");
@@ -1402,7 +1469,11 @@ mirrorCorrectionEnabled = true
 		fs::write(root.join("conf.toml"), old_conf).unwrap();
 		fs::write(root.join("profiles/old.toml"), "id = \"old\"\nname = \"Old\"\ncreated_at = \"1\"\n").unwrap();
 		fs::rename(root.join("profiles"), root.join(PREVIOUS_PROFILES_DIR)).unwrap();
-		fs::write(root.join(NEXT_CONF_FILE), "[desktop]\nactive_profile_id = \"new\"\nprofile_ids = [\"new\"]\n").unwrap();
+		fs::write(
+			root.join(NEXT_CONF_FILE),
+			"[desktop]\nactive_profile_id = \"new\"\nprofile_ids = [\"new\"]\n",
+		)
+		.unwrap();
 		fs::write(root.join(PROFILE_TRANSACTION_MARKER), "prepared\n").unwrap();
 		let loaded = CoreProfileDocumentStore::from_root(&root).load().unwrap();
 		assert_eq!(fs::read_to_string(root.join("conf.toml")).unwrap(), old_conf);

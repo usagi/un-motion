@@ -28,7 +28,11 @@ pub(crate) struct ProfileSyncTargetMissing(pub String);
 
 impl std::fmt::Display for ProfileSyncTargetMissing {
 	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		write!(formatter, "profile sync rejected: active profile '{}' is missing; select a different profile explicitly before replacing it", self.0)
+		write!(
+			formatter,
+			"profile sync rejected: active profile '{}' is missing; select a different profile explicitly before replacing it",
+			self.0
+		)
 	}
 }
 
@@ -39,7 +43,10 @@ pub(crate) struct ProfileSyncTargetChanged;
 
 impl std::fmt::Display for ProfileSyncTargetChanged {
 	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		write!(formatter, "profile sync rejected: the active profile no longer matches the edited target")
+		write!(
+			formatter,
+			"profile sync rejected: the active profile no longer matches the edited target"
+		)
 	}
 }
 
@@ -477,7 +484,7 @@ impl CoreControlState {
 				} else {
 					run_blocking_runtime_operation(move || CoreRuntimeHost::spawn(config, status_callback)).await
 				}
-			},
+			}
 			Err(error) => Err(error),
 		};
 		let host = match host {
@@ -539,16 +546,31 @@ impl CoreControlState {
 		status
 	}
 
-	async fn save_calibration_document_locked(&self, document: CoreProfileDocument, face_model: bool) -> anyhow::Result<CoreProfileDocument> {
+	async fn save_calibration_document_locked(
+		&self,
+		document: CoreProfileDocument,
+		face_model: bool,
+	) -> anyhow::Result<CoreProfileDocument> {
 		let active_id = document.selected_profile_id.clone();
 		let normalized = if let Some(store) = &self.inner.profile_store {
-			let incoming = document.profiles.iter().find(|p| p.id == active_id)
-				.and_then(|p| p.runtime_selection.as_ref()).and_then(|r| r.modifier.as_ref())
+			let incoming = document
+				.profiles
+				.iter()
+				.find(|p| p.id == active_id)
+				.and_then(|p| p.runtime_selection.as_ref())
+				.and_then(|r| r.modifier.as_ref())
 				.context("calibration result has no modifier settings")?;
 			let mut saved = store.update(|latest| {
-				let profile = latest.profiles.iter_mut().find(|p| p.id == active_id)
+				let profile = latest
+					.profiles
+					.iter_mut()
+					.find(|p| p.id == active_id)
 					.context("calibration profile no longer exists")?;
-				let modifier = profile.runtime_selection.get_or_insert_with(Default::default).modifier.get_or_insert_with(Default::default);
+				let modifier = profile
+					.runtime_selection
+					.get_or_insert_with(Default::default)
+					.modifier
+					.get_or_insert_with(Default::default);
 				if face_model {
 					modifier.face_pose_model = incoming.face_pose_model.clone();
 				} else {
@@ -561,7 +583,9 @@ impl CoreControlState {
 			// Keep this Capturer on its own profile, while preserving the shared default on disk.
 			saved.selected_profile_id = active_id;
 			saved
-		} else { normalize_profile_document(document) };
+		} else {
+			normalize_profile_document(document)
+		};
 		self.apply_profile_document_locked(normalized).await
 	}
 
@@ -569,11 +593,20 @@ impl CoreControlState {
 		self.calibrate_neutral_for_profile(valid_sample_count, pose, None).await
 	}
 
-	pub async fn calibrate_neutral_for_profile(&self, valid_sample_count: usize, pose: Option<&str>, expected_profile_id: Option<&str>) -> anyhow::Result<CoreProfileDocument> {
+	pub async fn calibrate_neutral_for_profile(
+		&self,
+		valid_sample_count: usize,
+		pose: Option<&str>,
+		expected_profile_id: Option<&str>,
+	) -> anyhow::Result<CoreProfileDocument> {
 		let _mutation = self.inner.mutation.lock().await;
 		if let Some(expected) = expected_profile_id {
 			let state = self.inner.state.read().await;
-			anyhow::ensure!(state.status.active_profile_id == expected, "calibration_target_conflict: expected profile {expected}, active profile {}", state.status.active_profile_id);
+			anyhow::ensure!(
+				state.status.active_profile_id == expected,
+				"calibration_target_conflict: expected profile {expected}, active profile {}",
+				state.status.active_profile_id
+			);
 		}
 		let pose = NeutralCalibrationPose::parse(pose)?;
 		let handle = self.runtime_handle()?;
@@ -605,7 +638,11 @@ impl CoreControlState {
 		let _mutation = self.inner.mutation.lock().await;
 		if let Some(expected) = expected_profile_id {
 			let state = self.inner.state.read().await;
-			anyhow::ensure!(state.status.active_profile_id == expected, "calibration_target_conflict: expected profile {expected}, active profile {}", state.status.active_profile_id);
+			anyhow::ensure!(
+				state.status.active_profile_id == expected,
+				"calibration_target_conflict: expected profile {expected}, active profile {}",
+				state.status.active_profile_id
+			);
 		}
 		let document = {
 			let state = self.inner.state.read().await;
@@ -630,11 +667,19 @@ impl CoreControlState {
 		self.build_face_pose_model_for_profile(valid_sample_count, None).await
 	}
 
-	pub async fn build_face_pose_model_for_profile(&self, valid_sample_count: usize, expected_profile_id: Option<&str>) -> anyhow::Result<CoreProfileDocument> {
+	pub async fn build_face_pose_model_for_profile(
+		&self,
+		valid_sample_count: usize,
+		expected_profile_id: Option<&str>,
+	) -> anyhow::Result<CoreProfileDocument> {
 		let _mutation = self.inner.mutation.lock().await;
 		if let Some(expected) = expected_profile_id {
 			let state = self.inner.state.read().await;
-			anyhow::ensure!(state.status.active_profile_id == expected, "calibration_target_conflict: expected profile {expected}, active profile {}", state.status.active_profile_id);
+			anyhow::ensure!(
+				state.status.active_profile_id == expected,
+				"calibration_target_conflict: expected profile {expected}, active profile {}",
+				state.status.active_profile_id
+			);
 		}
 		let handle = self.runtime_handle()?;
 		let result = run_blocking_runtime_operation(move || handle.build_face_pose_model(valid_sample_count)).await?;
@@ -1093,17 +1138,26 @@ mod tests {
 
 	#[tokio::test]
 	async fn active_profile_selection_accepts_profile_added_after_initialization() {
-		let root = std::env::temp_dir().join(format!("unm-core-new-selection-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+		let root = std::env::temp_dir().join(format!(
+			"unm-core-new-selection-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
 		let store = CoreProfileDocumentStore::from_root(&root);
 		store.save(two_profile_document("p1")).unwrap();
 		let state = CoreControlState::from_profile_document(store.load().unwrap(), Some(store.clone()));
-		store.update(|doc| {
-			let mut added = doc.profiles[1].clone();
-			added.id = "p3".into();
-			added.name = "Added in Supervisor".into();
-			doc.profiles.push(added);
-			Ok(())
-		}).unwrap();
+		store
+			.update(|doc| {
+				let mut added = doc.profiles[1].clone();
+				added.id = "p3".into();
+				added.name = "Added in Supervisor".into();
+				doc.profiles.push(added);
+				Ok(())
+			})
+			.unwrap();
 		let mut expected = store.load().unwrap();
 		expected.selected_profile_id = "p3".into();
 		let status = state.set_active_profile("p3").await.unwrap();
@@ -1120,15 +1174,24 @@ mod tests {
 
 	#[tokio::test]
 	async fn active_profile_selection_preserves_newer_disk_edits() {
-		let root = std::env::temp_dir().join(format!("unm-core-selection-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+		let root = std::env::temp_dir().join(format!(
+			"unm-core-selection-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
 		let store = CoreProfileDocumentStore::from_root(&root);
 		store.save(two_profile_document("p1")).unwrap();
 		let state = CoreControlState::from_profile_document(store.load().unwrap(), Some(store.clone()));
-		store.update(|doc| {
-			doc.profiles[0].note = "Edited while Capturer was open".into();
-			doc.profiles[1].name = "New display name".into();
-			Ok(())
-		}).unwrap();
+		store
+			.update(|doc| {
+				doc.profiles[0].note = "Edited while Capturer was open".into();
+				doc.profiles[1].name = "New display name".into();
+				Ok(())
+			})
+			.unwrap();
 		let latest = store.load().unwrap();
 		let status = state.set_active_profile("p2").await.unwrap();
 		assert!(!status.running);
@@ -1136,7 +1199,12 @@ mod tests {
 		assert_eq!(saved.selected_profile_id, "p2");
 		assert_eq!(saved.profiles, latest.profiles);
 		assert_eq!(saved.profile_sources, latest.profile_sources);
-		store.update(|doc| { doc.profiles.retain(|p| p.id != "p1"); Ok(()) }).unwrap();
+		store
+			.update(|doc| {
+				doc.profiles.retain(|p| p.id != "p1");
+				Ok(())
+			})
+			.unwrap();
 		let deleted = store.load().unwrap();
 		assert!(state.set_active_profile("p1").await.is_err());
 		assert_eq!(store.load().unwrap(), deleted);
@@ -1165,19 +1233,32 @@ mod tests {
 
 	#[tokio::test]
 	async fn calibration_save_preserves_shared_default_and_newer_settings() {
-		let root = std::env::temp_dir().join(format!("unm-core-calibration-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+		let root = std::env::temp_dir().join(format!(
+			"unm-core-calibration-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
 		let store = CoreProfileDocumentStore::from_root(&root);
 		store.save(two_profile_document("p1")).unwrap();
 		let state = CoreControlState::from_profile_document(store.load().unwrap(), Some(store.clone()));
-		store.update(|doc| {
-			doc.selected_profile_id = "p2".into();
-			doc.profiles[0].name = "New name".into();
-			let modifier = doc.profiles[0].runtime_selection.get_or_insert_with(Default::default).modifier.get_or_insert_with(Default::default);
-			modifier.hands_enabled = Some(false);
-			modifier.neutral_calibration_enabled = Some(true);
-			modifier.neutral_calibration_pose = Some("u".into());
-			Ok(())
-		}).unwrap();
+		store
+			.update(|doc| {
+				doc.selected_profile_id = "p2".into();
+				doc.profiles[0].name = "New name".into();
+				let modifier = doc.profiles[0]
+					.runtime_selection
+					.get_or_insert_with(Default::default)
+					.modifier
+					.get_or_insert_with(Default::default);
+				modifier.hands_enabled = Some(false);
+				modifier.neutral_calibration_enabled = Some(true);
+				modifier.neutral_calibration_pose = Some("u".into());
+				Ok(())
+			})
+			.unwrap();
 		let mut expected = store.load().unwrap();
 		let modifier = expected.profiles[0].runtime_selection.as_mut().unwrap().modifier.as_mut().unwrap();
 		modifier.neutral_calibration_enabled = Some(false);
@@ -1187,11 +1268,29 @@ mod tests {
 		assert_eq!(cleared.selected_profile_id, "p1");
 		assert_eq!(store.load().unwrap(), expected);
 		let mut result = cleared;
-		let model = un_motion_profile_schema::profile_settings::ProfileFacePoseModelSettings { enabled: Some(true), sample_count: Some(90), ..Default::default() };
-		result.profiles[0].runtime_selection.as_mut().unwrap().modifier.as_mut().unwrap().face_pose_model = Some(model.clone());
+		let model = un_motion_profile_schema::profile_settings::ProfileFacePoseModelSettings {
+			enabled: Some(true),
+			sample_count: Some(90),
+			..Default::default()
+		};
+		result.profiles[0]
+			.runtime_selection
+			.as_mut()
+			.unwrap()
+			.modifier
+			.as_mut()
+			.unwrap()
+			.face_pose_model = Some(model.clone());
 		result.profiles[0].name = "Stale result name".into();
 		state.save_calibration_document_locked(result, true).await.unwrap();
-		expected.profiles[0].runtime_selection.as_mut().unwrap().modifier.as_mut().unwrap().face_pose_model = Some(model);
+		expected.profiles[0]
+			.runtime_selection
+			.as_mut()
+			.unwrap()
+			.modifier
+			.as_mut()
+			.unwrap()
+			.face_pose_model = Some(model);
 		assert_eq!(store.load().unwrap(), expected);
 		assert_eq!(state.status().await.active_profile_id, "p1");
 		assert!(!state.status().await.running);
@@ -1201,16 +1300,25 @@ mod tests {
 
 	#[tokio::test]
 	async fn calibration_rejection_preserves_runtime_and_explicit_replace_remains_supported() {
-		let root = std::env::temp_dir().join(format!("unm-core-save-reject-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+		let root = std::env::temp_dir().join(format!(
+			"unm-core-save-reject-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
 		let store = CoreProfileDocumentStore::from_root(&root);
 		store.save(two_profile_document("p1")).unwrap();
 		let state = CoreControlState::from_profile_document(store.load().unwrap(), Some(store.clone()));
 		let before_runtime = state.profile_document().await;
-		store.update(|doc| {
-			doc.profiles.retain(|p| p.id != "p1");
-			doc.selected_profile_id = "p2".into();
-			Ok(())
-		}).unwrap();
+		store
+			.update(|doc| {
+				doc.profiles.retain(|p| p.id != "p1");
+				doc.selected_profile_id = "p2".into();
+				Ok(())
+			})
+			.unwrap();
 		let before_disk = store.load().unwrap();
 		assert!(state.clear_neutral_calibration().await.is_err());
 		assert_eq!(store.load().unwrap(), before_disk);
@@ -1296,7 +1404,14 @@ mod tests {
 			let runtime = original.profiles[1].runtime_selection.get_or_insert_with(Default::default);
 			runtime.vmc_enabled = Some(true);
 			runtime.vmc_target_addr = Some("not-an-address".into());
-			let root = std::env::temp_dir().join(format!("unm-invalid-output-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+			let root = std::env::temp_dir().join(format!(
+				"unm-invalid-output-{}-{}",
+				std::process::id(),
+				std::time::SystemTime::now()
+					.duration_since(std::time::UNIX_EPOCH)
+					.unwrap()
+					.as_nanos()
+			));
 			let store = CoreProfileDocumentStore::from_root(&root);
 			store.save(original).unwrap();
 			let disk_before = store.load().unwrap();
@@ -1319,7 +1434,9 @@ mod tests {
 			assert_eq!(status.active_profile_id, "p1");
 			assert_eq!(store.load().unwrap(), disk_before);
 			drop(state);
-			assert!(root.starts_with(std::env::temp_dir()) && root.file_name().unwrap().to_string_lossy().starts_with("unm-invalid-output-"));
+			assert!(
+				root.starts_with(std::env::temp_dir()) && root.file_name().unwrap().to_string_lossy().starts_with("unm-invalid-output-")
+			);
 			std::fs::remove_dir_all(root).unwrap();
 		}
 	}
@@ -1378,7 +1495,9 @@ mod tests {
 			let mut incoming = two_profile_document("p2");
 			incoming.profiles.retain(|profile| !empty && profile.id == "p2");
 			incoming.profile_sources.clear();
-			let error = state.sync_profile_document_preserving_active(incoming).await
+			let error = state
+				.sync_profile_document_preserving_active(incoming)
+				.await
 				.expect_err("sync must not implicitly change active target");
 			assert!(error.to_string().contains("p1"));
 			assert_eq!(state.profile_document().await, before);

@@ -226,12 +226,23 @@ async fn stop_runtime(state: web::Data<CoreControlState>) -> impl Responder {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CalibrationTargetQuery {
-    expected_profile_id: Option<String>,
+	expected_profile_id: Option<String>,
 }
 
 #[post("/api/runtime/calibration/neutral")]
-async fn calibrate_neutral(state: web::Data<CoreControlState>, request: web::Json<NeutralCalibrationRequest>, target: web::Query<CalibrationTargetQuery>) -> HttpResponse {
-	match state.calibrate_neutral_for_profile(request.valid_sample_count, request.pose.as_deref(), target.expected_profile_id.as_deref()).await {
+async fn calibrate_neutral(
+	state: web::Data<CoreControlState>,
+	request: web::Json<NeutralCalibrationRequest>,
+	target: web::Query<CalibrationTargetQuery>,
+) -> HttpResponse {
+	match state
+		.calibrate_neutral_for_profile(
+			request.valid_sample_count,
+			request.pose.as_deref(),
+			target.expected_profile_id.as_deref(),
+		)
+		.await
+	{
 		Ok(selection) => HttpResponse::Ok().json(ProfileDocumentResponse { selection }),
 		Err(error) => HttpResponse::BadRequest().body(error.to_string()),
 	}
@@ -239,15 +250,25 @@ async fn calibrate_neutral(state: web::Data<CoreControlState>, request: web::Jso
 
 #[post("/api/runtime/calibration/neutral/clear")]
 async fn clear_neutral_calibration(state: web::Data<CoreControlState>, target: web::Query<CalibrationTargetQuery>) -> HttpResponse {
-	match state.clear_neutral_calibration_for_profile(target.expected_profile_id.as_deref()).await {
+	match state
+		.clear_neutral_calibration_for_profile(target.expected_profile_id.as_deref())
+		.await
+	{
 		Ok(selection) => HttpResponse::Ok().json(ProfileDocumentResponse { selection }),
 		Err(error) => HttpResponse::BadRequest().body(error.to_string()),
 	}
 }
 
 #[post("/api/runtime/face-pose-model/build")]
-async fn build_face_pose_model(state: web::Data<CoreControlState>, request: web::Json<FacePoseModelBuildRequest>, target: web::Query<CalibrationTargetQuery>) -> HttpResponse {
-	match state.build_face_pose_model_for_profile(request.valid_sample_count, target.expected_profile_id.as_deref()).await {
+async fn build_face_pose_model(
+	state: web::Data<CoreControlState>,
+	request: web::Json<FacePoseModelBuildRequest>,
+	target: web::Query<CalibrationTargetQuery>,
+) -> HttpResponse {
+	match state
+		.build_face_pose_model_for_profile(request.valid_sample_count, target.expected_profile_id.as_deref())
+		.await
+	{
 		Ok(selection) => HttpResponse::Ok().json(ProfileDocumentResponse { selection }),
 		Err(error) => HttpResponse::BadRequest().body(error.to_string()),
 	}
@@ -298,7 +319,10 @@ async fn set_profile_document(state: web::Data<CoreControlState>, request: web::
 
 #[put("/api/profiles/document/sync")]
 async fn sync_profile_document(state: web::Data<CoreControlState>, request: web::Json<ProfileDocumentSyncRequest>) -> HttpResponse {
-	match state.sync_profile_document_for_target(request.selection.clone(), request.expected_profile_id.as_deref()).await {
+	match state
+		.sync_profile_document_for_target(request.selection.clone(), request.expected_profile_id.as_deref())
+		.await
+	{
 		Ok(selection) => HttpResponse::Ok().json(ProfileDocumentResponse { selection }),
 		Err(error) if error.is::<crate::control::ProfileSyncTargetMissing>() => HttpResponse::Conflict().body(error.to_string()),
 		Err(error) if error.is::<crate::control::ProfileSyncTargetChanged>() => HttpResponse::Conflict().body(error.to_string()),
@@ -490,9 +514,17 @@ mod tests {
 		let state = CoreControlState::default();
 		let before = state.profile_document().await;
 		let app = test::init_service(App::new().app_data(web::Data::new(state.clone())).configure(configure_api)).await;
-		for path in ["/api/runtime/calibration/neutral", "/api/runtime/calibration/neutral/clear", "/api/runtime/face-pose-model/build"] {
+		for path in [
+			"/api/runtime/calibration/neutral",
+			"/api/runtime/calibration/neutral/clear",
+			"/api/runtime/face-pose-model/build",
+		] {
 			let uri = format!("{path}?expectedProfileId=not-the-active-profile");
-			let response = test::call_service(&app, test::TestRequest::post().uri(&uri).set_json(serde_json::json!({})).to_request()).await;
+			let response = test::call_service(
+				&app,
+				test::TestRequest::post().uri(&uri).set_json(serde_json::json!({})).to_request(),
+			)
+			.await;
 			assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 			let body = test::read_body(response).await;
 			assert!(std::str::from_utf8(&body).unwrap().contains("calibration_target_conflict"));
@@ -637,18 +669,26 @@ mod tests {
 		let mut incoming = before.clone();
 		incoming.profiles.iter_mut().find(|profile| profile.id == target).unwrap().name = "reviewed edit".into();
 		let app = test::init_service(App::new().app_data(web::Data::new(state.clone())).configure(configure_api)).await;
-		let response = test::call_service(&app, test::TestRequest::put()
-			.uri("/api/profiles/document/sync")
-			.set_json(serde_json::json!({"selection": incoming, "expectedProfileId": "previous-target"}))
-			.to_request()).await;
+		let response = test::call_service(
+			&app,
+			test::TestRequest::put()
+				.uri("/api/profiles/document/sync")
+				.set_json(serde_json::json!({"selection": incoming, "expectedProfileId": "previous-target"}))
+				.to_request(),
+		)
+		.await;
 		assert_eq!(response.status(), actix_web::http::StatusCode::CONFLICT);
 		assert_eq!(state.profile_document().await, before);
 		assert_eq!(state.status().await.active_profile_id, target);
 		assert!(!state.status().await.running);
-		let response = test::call_service(&app, test::TestRequest::put()
-			.uri("/api/profiles/document/sync")
-			.set_json(serde_json::json!({"selection": incoming, "expectedProfileId": target}))
-			.to_request()).await;
+		let response = test::call_service(
+			&app,
+			test::TestRequest::put()
+				.uri("/api/profiles/document/sync")
+				.set_json(serde_json::json!({"selection": incoming, "expectedProfileId": target}))
+				.to_request(),
+		)
+		.await;
 		assert_eq!(response.status(), actix_web::http::StatusCode::OK);
 		assert_eq!(state.profile_document().await, incoming);
 	}
@@ -698,13 +738,17 @@ mod tests {
 		let mut missing_active = updated.selection;
 		missing_active.profiles.retain(|profile| profile.id == "p2");
 		missing_active.selected_profile_id = "p2".into();
-		let response = test::call_service(&app, test::TestRequest::put()
-			.uri("/api/profiles/document/sync")
-			.set_json(ProfileDocumentRequest { selection: missing_active })
-			.to_request()).await;
+		let response = test::call_service(
+			&app,
+			test::TestRequest::put()
+				.uri("/api/profiles/document/sync")
+				.set_json(ProfileDocumentRequest { selection: missing_active })
+				.to_request(),
+		)
+		.await;
 		assert_eq!(response.status(), actix_web::http::StatusCode::CONFLICT);
-		let unchanged: ProfileDocumentResponse = test::call_and_read_body_json(
-			&app, test::TestRequest::get().uri("/api/profiles/document").to_request()).await;
+		let unchanged: ProfileDocumentResponse =
+			test::call_and_read_body_json(&app, test::TestRequest::get().uri("/api/profiles/document").to_request()).await;
 		assert_eq!(unchanged.selection, before);
 	}
 

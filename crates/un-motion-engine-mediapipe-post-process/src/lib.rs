@@ -620,18 +620,19 @@ impl MotionStabilizer {
 					timestamp_ns.saturating_sub(snapshot.timestamp_ns),
 					Self::HEAD_MAX_ANGULAR_SPEED_RAD_PER_SEC,
 					Self::ROTATION_JUMP_SLACK_RAD,
-				) && let Some(limited) = blend_body_bone(
-				snapshot.bone.as_ref(),
-				body_bone(frame, HumanoidBone::Head),
-				rotation_delta_limit_alpha(
+				)
+				&& let Some(limited) = blend_body_bone(
 					snapshot.bone.as_ref(),
 					body_bone(frame, HumanoidBone::Head),
-					timestamp_ns.saturating_sub(snapshot.timestamp_ns),
-					Self::HEAD_MAX_ANGULAR_SPEED_RAD_PER_SEC,
-					Self::ROTATION_JUMP_SLACK_RAD,
-				)
-				.unwrap_or(1.0),
-			) {
+					rotation_delta_limit_alpha(
+						snapshot.bone.as_ref(),
+						body_bone(frame, HumanoidBone::Head),
+						timestamp_ns.saturating_sub(snapshot.timestamp_ns),
+						Self::HEAD_MAX_ANGULAR_SPEED_RAD_PER_SEC,
+						Self::ROTATION_JUMP_SLACK_RAD,
+					)
+					.unwrap_or(1.0),
+				) {
 				upsert_body_bone(frame, limited);
 				frame.metadata.notes.push("mediapipe.stability head=rotation_limited".to_string());
 			}
