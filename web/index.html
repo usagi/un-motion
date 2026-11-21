@@ -1,0 +1,27 @@
+<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#141721"><title>U.N. Motion | U.N. Apps</title><meta name="description" content="Webカメラから顔・手・全身をトラッキング。U.N. Motionでアバターを動かし、U.N. AvatarやOBSにつなげるWindows向けモーションキャプチャアプリ。"><link rel="canonical" href="https://usagi.github.io/un-motion/"><link rel="icon" href="media/motion.webp"><link rel="stylesheet" href="style.css"></head><body><a class="skip" href="#main">本文へ</a>
+<header class="site-header">
+  <div class="shell nav-shell">
+    <a class="brand" href="https://usagi.network/" aria-label="USAGI.NETWORK ホーム">
+      <img src="media/un-logo.png" width="42" height="42" alt="">
+      <span><strong>U.N. Apps</strong><small>USAGI.NETWORK</small></span>
+    </a>
+    <nav class="product-tabs" aria-label="U.N. Apps">
+      <a href="https://usagi.github.io/un-avatar/" style="--tab:#ff8a64"><span>Avatar</span><small>Renderer</small></a>
+      <a href="https://usagi.github.io/un-motion/" aria-current="page" style="--tab:#4f8dff"><span>Motion</span><small>Tracking</small></a>
+      <a href="https://usagi.github.io/un-virtual-avatar-connect/" style="--tab:#bc9bff"><span>Connect</span><small>Hub</small></a>
+      <a href="https://usagi.github.io/un-vrc-perfectsync/" style="--tab:#67d9b3"><span>PerfectSync</span><small>Unity Tool</small></a>
+    </nav>
+    <nav class="tools" aria-label="U.N. Tools"><a href="https://github.com/usagi/un-virtual-eye-tracker">VET</a></nav>
+  </div>
+</header>
+<main id="main"><section class="hero"><div class="spread"><div class="intro"><p class="platform">Windows x64 <span>／</span> モーションキャプチャ</p><h1>U.N.<br><em>Motion</em></h1><h2>手を振ったら、<br>アバターも手を振る。</h2><p>いつものWebカメラで、顔も、指先も、全身も。<br>あなたの動きを、配信のアバターへ。</p><div class="actions"><a class="download" href="https://github.com/usagi/un-motion/releases/download/1.4.0/un-motion-1.4.0.zip">Windows版をダウンロード <small>1.4.0 ↓</small></a><a href="#start">はじめかた ↓</a></div></div>
+<figure class="pose"><fieldset><legend>キャリブレーションの参考ポーズ</legend>
+<input type="radio" name="pose" id="pose-u" checked><label for="pose-u">U ポーズ</label><input type="radio" name="pose" id="pose-t"><label for="pose-t">T ポーズ</label><input type="radio" name="pose" id="pose-i"><label for="pose-i">I ポーズ</label>
+<div class="portrait"><img class="u" src="media/u.webp" alt="両ひじを曲げ、頭の横に手を上げたUポーズ"><img class="t" src="media/t.webp" alt="手のひらを正面に向け、両腕を水平に伸ばしたTポーズ"><img class="i" src="media/i.webp" alt="腕を自然に下ろして立ったIポーズ"></div></fieldset></figure>
+</div></section>
+<section class="shell series"><h2>動きを拾う。姿を映す。<br>配信が応える。</h2><div class="lineup">
+<article><h3><small>モーションをとる</small>Motion</h3><p>手や体はWebカメラ、顔は別のトラッカーから。入力ごとにプロファイルを作り、必要な部位を組み合わせられます。</p><a href="#start">Motionを使い始める ↓</a></article>
+<article><h3><small>アバターを映す</small>Avatar</h3><p>Motionから動きを受け取ったアバターをOBSに表示。配信中に衣装や小物を切り替えて、そのまま次のシーンへ。</p><a href="https://usagi.github.io/un-avatar/">Avatarでできること ↗</a></article>
+<article><h3><small>配信に反応をつくる</small>Connect</h3><p>声を字幕にして翻訳する。チャネポ交換でカメラを寄せる。ゲーム画面を見たAI共演者が、声と表情で応える。Flowgraphで使いたい反応を組めます。</p><a href="https://usagi.github.io/un-virtual-avatar-connect/">Connectでできること ↗</a></article>
+</div></section>
+<section class="start" id="start"><div class="shell setup"><div><h2>最初のモーションを送る</h2><ol><li>ZIPを展開し、<code>un-motion-supervisor.exe</code> を起動。</li><li>「プロファイルと稼働」で、使いたいカメラと送信先を設定。</li><li>「このプロファイルを起動」。同じPCのU.N. AvatarはUNMF/Zの「Auto（同じPC）」で動きを受け取れます。</li></ol><a href="https://github.com/usagi/un-motion/blob/main/docs/operation-guide.md">接続ガイドと対応環境 ↗</a></div><figure><a href="media/supervisor.webp"><img loading="lazy" src="media/supervisor.webp" alt="U.N. MotionのSupervisor画面の例"></a><figcaption>Supervisorの画面例</figcaption></figure></div></section></main><footer class="shell"><a href="https://usagi.network/">USAGI.NETWORK</a><a href="https://github.com/usagi/un-motion">GitHub</a><a href="https://github.com/usagi/un-motion/releases">リリース一覧</a></footer></body></html>
