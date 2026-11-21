@@ -1,6 +1,4 @@
 <p align="center">
-
-ビルドには **Rust 1.100.0** を使用します。`rust-toolchain.toml` に従って rustup が選択します（最低対応バージョン: 1.100、プロジェクト内コードの Edition: 2024）。依存関係は `Cargo.lock` を維持し、検証時は `cargo check --locked` / `cargo test --locked` を使用してください。 Cargoの中間生成先 `build-dir` を実行ファイルの出力先と分離する場合は、`UN_BUILD_PROFILE_DIR` に実行ファイルを配置するディレクトリの絶対パスを指定してください。
   <img src="assets/brand/un-motion-artwork-supervisor.png" width="160" alt="U.N. Motion">
 </p>
 
@@ -10,6 +8,8 @@ U.N. Motion は Web カメラでアバターを動かしたり、他のアプリ
 
 カメラ映像から体・顔・手を推定し、U.N. Avatar や UNMF/Z 対応アプリや VMC 対応アプリへリアルタイムにモーションを送ります。
 特別なモーションキャプチャスーツや専用トラッカーなしで、Web カメラだけでも始められます。
+
+[Windows版をダウンロード](https://github.com/usagi/un-motion/releases/latest)して、ZIPをすべて展開し、`un-motion-supervisor.exe` を起動してください。カメラの選び方とアバターへの接続は[一般的な使い方](#一般的な使い方)へ。
 
 ## 想定ユーザー
 
@@ -130,6 +130,10 @@ Windows x64版には **Microsoft Visual C++ v14 Redistributable（x64）** も�
 Windowsのカメラ映像入力には **DirectShow** を選んでください。MediaFoundationは機器情報を確認するための選択肢で、現行版ではカメラ映像からの推定に未対応です。MediaFoundationを選んだプロファイルがある場合は、DirectShowへ変更し、使うカメラと対応する解像度・FPSを確認してからCapturerを起動してください。
 
 ## 開発者向け
+
+ビルドには **Rust 1.100.0** を使用します。`rust-toolchain.toml` に従って rustup が選択します（最低対応バージョン: 1.100、プロジェクト内コードの Edition: 2024）。依存関係は `Cargo.lock` を維持し、検証時は `cargo check --locked` / `cargo test --locked` を使用してください。
+
+Cargoの中間生成先 `build-dir` を実行ファイルの出力先と分離する場合は、`UN_BUILD_PROFILE_DIR` に実行ファイルを配置するディレクトリの絶対パスを指定してください。
 
 この repository には Supervisor GUI、Capturer runtime、MediaPipe Native bridge、入力、Modifier、出力、release tooling が含まれています。
 
