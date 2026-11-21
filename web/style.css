@@ -134,3 +134,17 @@ code { font: .91em/1.5 Consolas, "Cascadia Mono", monospace; overflow-wrap: anyw
 .timing th,.timing td { border-bottom:1px solid #43536b; padding: .3rem .1rem; }
 .timing caption { text-align:left; }
 @media(max-width:680px) { .performance { grid-template-columns:1fr; gap:1.2rem; } }
+.capture-stage { min-width:0; padding:1rem; border:1px solid #475972; border-radius:.85rem; background:linear-gradient(125deg,#223146,#172333); }
+.capture-stage legend { padding:0 .5rem; font-weight:700; color:#d9eaff; }
+.capture-stage input { position:absolute; width:1px; height:1px; opacity:0; }
+.capture-stage label { display:inline-block; padding:.4rem .8rem; margin:0 .25rem .8rem 0; border:1px solid #687c94; border-radius:2rem; cursor:pointer; font-size:.87rem; }
+.capture-stage input:checked + label { background:#afd4ff; border-color:#afd4ff; color:#111f31; font-weight:700; }
+.capture-stage input:focus-visible + label { outline:3px solid white; outline-offset:2px; }
+.scene { display:none; position:relative; isolation:isolate; min-height:15rem; background:#878587; border-radius:.45rem; overflow:hidden; }
+#desk-view:checked ~ .desk, #full-view:checked ~ .full { display:flex; align-items:flex-end; }
+.capture .scene img { width:64%; height:100%; object-fit:contain; position:absolute; inset:0 0 0 auto; border:0; border-radius:0; }
+.scene::before { content:""; position:absolute; inset:0; z-index:1; background:linear-gradient(90deg,#101b2cf5,#142135e8 30%,transparent 71%); }
+.scene div { position:relative; z-index:2; width:50%; padding:1rem; }
+.scene h3 { font-size:clamp(1.2rem,2vw,1.65rem); }.scene p { color:#b9daff; margin:.25rem 0; font-weight:700; }.scene small {color:#ecf1fa;}
+.setup-preview {margin:1rem 0;}.setup-preview summary{cursor:pointer;color:#bddbff}.setup-preview figure{max-width:48rem;margin-top:1rem;}
+@media(max-width:400px){.scene div{width:55%;padding:.65rem}.scene small{font-size:.76rem}}
